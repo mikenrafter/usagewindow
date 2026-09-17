@@ -1,2 +1,6 @@
-//! uw-adapters: HarnessAdapter implementations (claude_code, codex, generic_hook).
-//! Placeholder — real adapters land in Phase 4, after the Phase 1 research spikes.
+//! HarnessAdapter implementations for the supported agent harnesses.
+
+pub mod claude_code;
+pub mod codex;
+pub mod generic_hook;
+pub mod process;

@@ -8,6 +8,10 @@ use thiserror::Error;
 pub enum AdapterError {
     #[error("unsupported")]
     Unsupported,
+    #[error("authentication failed")]
+    Auth,
+    #[error("transient adapter failure: {0}")]
+    Transient(String),
     #[error("adapter error: {0}")]
     Other(String),
 }
