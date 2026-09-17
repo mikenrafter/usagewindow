@@ -1683,8 +1683,14 @@ name = "uw-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
  "tokio",
+ "uuid",
  "uw-core",
+ "uw-store",
 ]
 
 [[package]]

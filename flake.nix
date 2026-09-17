@@ -8,6 +8,29 @@
       forAllSystems = f: nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] f;
     in
     {
+      packages = forAllSystems (system:
+        let pkgs = import nixpkgs { inherit system; };
+        in {
+          default = pkgs.rustPlatform.buildRustPackage {
+            pname = "usagewindow";
+            version = "0.1.0";
+            src = ./.;
+            cargoLock.lockFile = ./Cargo.lock;
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs = [ pkgs.openssl pkgs.stdenv.cc ];
+            cargoBuildFlags = [ "--workspace" "--bins" ];
+            installPhase = ''
+              runHook preInstall
+              cargo build --release --workspace --bins --locked
+              install -Dm755 target/release/uw $out/bin/uw
+              install -Dm755 target/release/uw-daemon $out/bin/uw-daemon
+              install -Dm755 target/release/uw-hook $out/bin/uw-hook
+              install -Dm755 target/release/uw-mcp $out/bin/uw-mcp
+              runHook postInstall
+            '';
+          };
+        });
+
       devShells = forAllSystems (system:
         let pkgs = import nixpkgs { inherit system; };
         in {
@@ -24,7 +47,5 @@
           };
         });
 
-      # packages.${system}.default lands once the workspace produces a
-      # meaningful top-level binary set (see docs/architecture.md, Phase 9).
     };
 }

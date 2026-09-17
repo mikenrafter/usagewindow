@@ -1,0 +1,18 @@
+agent:
+  - claude-code
+  - codex
+
+# Kasetto may override this destination when installing the integration files.
+destination: ~/.config/kasetto
+
+skills:
+  - name: usagewindow-status
+    source: ./agent-integration/skills/usagewindow-status
+
+commands:
+  - name: uw-mark-resume
+    source: ./agent-integration/commands/uw-mark-resume
+
+mcp:
+  - name: usagewindow
+    source: ./agent-integration/mcp/usagewindow

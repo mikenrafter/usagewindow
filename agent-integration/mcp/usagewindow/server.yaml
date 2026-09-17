@@ -1,0 +1,4 @@
+name: usagewindow
+transport: stdio
+command: uw-mcp
+source: .
