@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/uw-core",
     "crates/uw-adapters",
@@ -13,7 +13,7 @@ members = [
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 repository = "https://github.com/mikenrafter/usagewindow"
 
@@ -25,10 +25,16 @@ uw-store = { path = "crates/uw-store" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
-thiserror = "1"
+thiserror = "2"
 anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "fs"] }
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

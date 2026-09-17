@@ -19,7 +19,6 @@
               clippy
               pkg-config
               openssl
-              sqlite
               stdenv.cc
             ];
           };

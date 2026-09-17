@@ -212,6 +212,40 @@ The stable value to persist is the UUID from session_meta or threads.id, not the
 
 No Codex config key for a usable context-window size or auto-compaction threshold was found in this installed version. Do not hardcode a context size from codex doctor; record token data only if the runtime emits it in events or the adapter has a separately verified source.
 
+## Stop detection
+
+Codex has better signals for "this session stopped because of a usage limit" than the
+raw process-liveness heuristic sketched for Claude Code. `account/rateLimits/read`'s
+response (see Usage/quota API above) carries `rateLimitReachedType`, which is `null` in
+the normal case shown above — implying it is populated with a reason string/enum when a
+limit has actually been hit (not observed non-null during this investigation session,
+since no rate limit was reached; adapter code should treat any non-null value as
+authoritative). `ordinaryUsageAllowed: false` is a second, coarser signal from the same
+call. Combined with the documented `SessionEnd` and `Interrupt` hook events (see the hook
+table above), `detect_stop` for Codex should: (1) call `account/rateLimits/read` and
+check `rateLimitReachedType`/`ordinaryUsageAllowed` against the window the session was
+last known to be using; (2) cross-reference against the last `SessionEnd`/`Interrupt`
+hook firing recorded for that session id, if any, to distinguish a limit-triggered stop
+from a normal exit or user-initiated interrupt. This is a stronger design than Claude
+Code's (which has no equivalent structured field and must infer from usage-sample
+proximity plus process liveness) — implement Codex's `detect_stop` against these fields
+directly rather than porting Claude Code's inference-based approach.
+
+## Open items (flagged by Fable review 1, unresolved as of this revision)
+
+- **Token counts / context-window size**: no confirmed source. Before Phase 3/4 lets
+  `Capabilities.reports_token_counts` be `true` for the Codex adapter, check whether
+  `codex exec --json`'s event stream or any hook payload actually emits per-turn token
+  usage or the model's context-window size. Until confirmed, treat this as `false` and
+  keep idle-compact/reseed-auto/keepalive skipping (not guessing) for Codex sessions.
+- **State-file convention for checkpointing**: the near-limit policy's fallback action for
+  Codex (since `can_advise_mid_turn` and `can_trigger_compaction` are both false) is
+  "checkpoint state, log projected exhaustion" — but no Codex-side equivalent of a
+  paseo-smart-session-style state file has been designed yet. This needs its own small
+  research/design pass in Phase 4, likely just "usagewindow writes its own state file
+  under its own data dir, independent of Codex" rather than anything Codex-specific,
+  since Codex has no hook-writable working-state convention to hook into.
+
 ## MCP scoping note
 
 codex mcp --help describes MCP as external-server management with list, get, add, remove, login, and logout. codex doctor reported zero MCP servers configured on this machine. codex plugin --help describes plugin installation and marketplace management; it does not expose a session-specific MCP scope flag.

@@ -35,13 +35,23 @@ AccountId(String)
 SessionId(String) // harness-assigned STABLE id — survives compaction, unlike an
                    // internal/ephemeral session id. Sanitized to [A-Za-z0-9_-].
 
-WindowKind = FiveHour | SevenDay | WeeklyModel(ModelId) | WeeklySurface(String) | Custom(String)
+// WindowKind is keyed by duration, not a harness-specific label: Claude Code's
+// "five_hour"/"seven_day" and Codex's windowDurationMins:300/10080 are the SAME
+// underlying concept (a rolling N-minute quota window) and must map to one Rolling
+// variant so a provider-side plan change (a new window length) doesn't silently
+// mis-key samples under a positional primary/secondary guess. Named variants remain
+// for windows that are genuinely not duration-keyed.
+WindowKind = Rolling { minutes: u32 } | WeeklyModel(ModelId) | WeeklySurface(String) | Custom(String)
 WindowKey  = { provider: Provider, kind: WindowKind }
 
+// `severity` is NOT stored — it's policy output (depends on user-editable thresholds),
+// computed at read time by uw-policy from `pct` + the resolved ThresholdProfile. Storing
+// it per-sample would go stale the moment thresholds change. The only provider-reported
+// fact worth persisting is `exceeded`, a plain bool.
 UsageWindowState = { pct: f32 (0-100, normalized at ingestion, never inferred from magnitude),
-                      resets_at: Option<DateTime<Utc>>, severity: Option<Severity>,
+                      resets_at: Option<DateTime<Utc>>, exceeded: bool,
                       active: bool, scope: Option<AccountId> }
-Severity = Notice | Closing | Compact | Exceeded
+Severity = Notice | Closing | Compact | Exceeded  // uw-policy output type, not persisted
 
 UsageSample = { at, fetched_at: Option<DateTime<Utc>>, source: ProviderReported | LocalEstimate,
                  provider, account: Option<AccountId>, windows: HashMap<WindowKey, UsageWindowState>,
@@ -49,21 +59,51 @@ UsageSample = { at, fetched_at: Option<DateTime<Utc>>, source: ProviderReported 
 // effective_at = fetched_at.unwrap_or(at). isStale: 5min tolerance. acceptReading refuses
 // anything older-in-effective-time or a same-window-instance pct that regressed.
 
+// cwd/state_path/context_window_size/launch_mode/pid are load-bearing, not decorative:
+// resume needs a working directory and a launch strategy, idle-compact's tier lookup
+// needs the model's real context size (never hardcode 200k), and liveness needs SOME
+// signal that a session is still running vs. abandoned. `launch_mode` records how THIS
+// session was started (Interactive | Headless) so resume can match it — a systemd unit
+// has no terminal, so an auto-resume of a session the user was driving interactively
+// must default to Headless and let the user `claude attach`/`codex agents` in manually;
+// only a session that was already Headless can be silently re-launched Headless.
 SessionSummary = { id: SessionId, harness: Provider, model: Option<ModelId>,
                     account: Option<AccountId>, first_seen, last_seen,
-                    last_known_token_count: Option<u64>, stopped_reason: Option<StopReason>,
-                    resume_marker: Option<ResumeMarker> }
+                    cwd: String, state_path: Option<String>,
+                    context_window_size: Option<u64>, last_known_token_count: Option<u64>,
+                    launch_mode: LaunchMode, pid: Option<u32>,
+                    stopped_reason: Option<StopReason>, resume_marker: Option<ResumeMarker>,
+                    reseeded_from: Option<SessionId> }
+LaunchMode = Interactive | Headless
 StopReason = UsageLimit { window: WindowKey } | UserQuit | Crashed | Unknown
 
-ResumeMarker = { session_id, reason: AutoDetectedLimit | ManuallyMarked,
+// SessionId "survives compaction" is an assumption carried over from the Paseo reference
+// (which layers its own agent-id above Claude Code's session id specifically to dodge
+// this). For Claude Code, the hook session_id / transcript-filename UUID / `--resume`
+// argument are believed to be the same value, but Phase 2's test suite must verify this
+// empirically (does the id change across a real compaction? does `--resume` mint a new
+// id?) before any code relies on it. If it does change, add a `superseded_by:
+// Option<SessionId>` lineage field rather than assuming stability. Codex is verified
+// clean here: `session_meta.id` == `threads.id`, stable across resume/fork
+// (docs/research-codex.md).
+
+// One resume attempt per (session, quota-window-instance), not one-ever-per-session: a
+// session can legitimately hit its limit, get resumed, and hit it again next window.
+ResumeMarker = { id: Uuid, session_id, reason: AutoDetectedLimit | ManuallyMarked,
                   resume_at: Option<DateTime<Utc>>, created_at, status }
 ResumeStatus = Pending | Scheduled | Fired | Cancelled | Failed(String)
 
+// Only OpportunisticIdle and AltModelReseed go through adapter.compact() and the
+// claim-before-send queue below — they're destructive. AskNearLimit rows are an audit
+// log of adapter.advise() calls (non-destructive, not claimed/queued the same way) so
+// the /compactions UI view has one place to see all three kinds of request, not because
+// all three are delivered identically.
 CompactionRequest = { id: Uuid, session_id, kind: CompactionKind, prompt: String,
                        reason: String, status: CompactionStatus, created_at }
 CompactionKind = AskNearLimit | OpportunisticIdle | AltModelReseed
 CompactionStatus = Pending | Sending | Sent | Failed(String) | Cancelled
-// claim-before-send: UPDATE ... SET status='sending' WHERE id=? AND status='pending';
+// claim-before-send (OpportunisticIdle/AltModelReseed only):
+// UPDATE ... SET status='sending' WHERE id=? AND status='pending';
 // 0 rows affected => already claimed by someone else, fail closed, never retry blindly
 // (compaction delivery is destructive/non-idempotent).
 
@@ -78,21 +118,72 @@ ThresholdScope = { provider: Provider, model: Option<ModelId>, session: Option<S
 
 ## HarnessAdapter trait (Phase 4 target)
 
+Claude Code and Codex diverge enough (Codex's compaction is automatic/opaque — there is
+nothing to ask, per docs/research-codex.md) that a single `ask_compaction` method can't
+honestly represent both. Split into a non-destructive `advise` (inject text, may be
+ignored, never itself changes session state) and a destructive `compact` (goes through
+the claim-before-send queue, only called for adapters that report `can_trigger_compaction`).
+A `Capabilities` struct — returned once per adapter, not per call — lets `uw-policy` (Phase
+3) and `uw-daemon` (Phase 5) decide up front which policies apply to which harness, instead
+of enqueueing `CompactionRequest`s an adapter can only ever fail:
+
 ```
 trait HarnessAdapter {
     fn provider(&self) -> Provider;
+    fn capabilities(&self) -> Capabilities;
     async fn fetch_usage(&self, account: Option<&AccountId>) -> Result<UsageSample>;
     async fn detect_stop(&self, session_id: &SessionId) -> Result<Option<StopReason>>;
     async fn emit_status(&self, session_id: &SessionId, status: StatusEvent) -> Result<DeliveryOutcome>;
-    async fn ask_compaction(&self, session_id: &SessionId, req: &CompactionRequest) -> Result<DeliveryOutcome>;
-    async fn resume_session(&self, session_id: &SessionId) -> Result<()>;
-    fn supports_seed_new_session(&self) -> bool { false }
-    async fn seed_new_session(&self, seed: &SeedContext) -> Result<SessionId> { Err(Unsupported) }
+    /// Non-destructive: inject advisory text (near-limit pressure, a keepalive ping).
+    /// The agent may ignore it entirely. Never queued/claimed — fire-and-forget best effort.
+    async fn advise(&self, session_id: &SessionId, text: &str) -> Result<DeliveryOutcome>;
+    /// Destructive: only called when `capabilities().can_trigger_compaction`. Goes
+    /// through the claim-before-send queue (see CompactionRequest below).
+    async fn compact(&self, session_id: &SessionId, req: &CompactionRequest) -> Result<DeliveryOutcome>;
+    /// Resume using `session.launch_mode` (Interactive sessions resume Headless by
+    /// default — see SessionSummary.launch_mode above — unless explicitly overridden).
+    async fn resume_session(&self, session: &SessionSummary) -> Result<()>;
+    async fn seed_new_session(&self, mode: SeedMode, seed: &SeedContext) -> Result<SessionId> { Err(Unsupported) }
 }
+
+Capabilities = {
+    can_trigger_compaction: bool,   // Claude Code: true (/compact). Codex: false (automatic/opaque).
+    can_advise_mid_turn: bool,      // Claude Code: true (Stop's additionalContext rides the live turn).
+    can_inject_at_session_start: bool, // Claude Code: true (SessionStart:compact). Codex: true (SessionStart, any source).
+    can_observe_compaction: bool,   // both true: PreCompact/PostCompact (Codex) or transcript
+                                     // token-count watch (Claude Code) can detect a compaction landed.
+    reports_token_counts: bool,     // Claude Code: true (transcript usage fields). Codex: UNVERIFIED,
+                                     // see docs/research-codex.md open item — false until confirmed,
+                                     // and idle-compact/reseed-auto/keepalive must degrade gracefully
+                                     // (skip, don't guess) for any adapter reporting false here.
+    headless_resume: bool,          // both true (claude --resume / codex exec resume <id>).
+    seed_modes: &[SeedMode],        // see below.
+}
+SeedMode = InitialPrompt          // fresh session, summary as the literal launch prompt —
+                                    // `claude -p "<summary>"` and `codex exec "<summary>"` are the
+                                    // SAME primitive; no hook workaround needed for a BRAND NEW
+                                    // session (the hook-injection gotchas only apply to injecting
+                                    // into an EXISTING/resumed session's context).
+         | ForkWithHistory          // Codex only: `codex fork <session-id> <prompt>` — carries the
+                                    // ENTIRE prior conversation forward, so this does not shrink
+                                    // context and is not the default reseed strategy; expose it as
+                                    // a distinct capability for a future "continue under a new id"
+                                    // feature, not for the reseed-to-save-tokens flow.
+SeedContext = { from_session: Option<SessionId>, summary: String, model: ModelId, cwd: String }
+
 StatusEvent = WillAutoResumeAt(DateTime<Utc>) | CompactedFromTo{before_tokens,after_tokens}
             | AutoResumeCanceled | Custom(String)
 DeliveryOutcome = Delivered | QueuedForNextIdle | Unsupported
 ```
+
+Policy implication (Phase 3): the near-limit "ask" trigger only calls `advise` when
+`can_advise_mid_turn` (or degrades to `can_inject_at_session_start`, queued for the next
+turn) — for an adapter with neither, or with `can_trigger_compaction: false` and no
+advise channel, the trigger's only remaining action is checkpointing state to
+`state_path` and logging the projected exhaustion time; it must not synthesize a
+`CompactionRequest` the adapter has no way to honor. `uw-mcp`'s `request_compaction` tool
+(Phase 9) needs the same gate — for a `can_trigger_compaction: false` adapter it returns
+an explicit "not supported for this harness" result, not a silently-dropped request.
 
 ### Claude Code adapter (research already complete — see docs/research-claude-code.md)
 
@@ -102,42 +193,99 @@ DeliveryOutcome = Delivered | QueuedForNextIdle | Unsupported
   `five_hour.utilization`/`resets_at` and `seven_day.utilization`/`resets_at` verbatim,
   clamp [0,100]. 120s local cache; stale-tolerant on transient failure (429/5xx/network);
   hard-fail on 401/403 (do not trust stale cache).
-- `emit_status`/`ask_compaction`: `SessionStart:compact` hook injecting `additionalContext`
-  is the ONLY confirmed "inject text into context" channel. `PostCompact` hook output is
-  silently rejected (not in Claude Code's allowed `hookEventName` union). `Stop` never
-  fires after a `/compact` (no model turn runs). Compaction = sending the literal
-  `/compact <instructions>` message when the agent is idle (root-only slash command, no
-  other API). Nothing auto-continues a task after compaction — after grading confirms
-  token count dropped, send a second continuation message (one of only two allowed
-  unsolicited-send call sites in the whole system: the `/compact` itself, and this
-  continuation).
-- `resume_session`: `claude --resume <session_id>` (or `claude -r`) in the session's
-  recorded working directory.
-- Session identity: the harness-assigned id, NOT Claude Code's internal `session_id`
-  (which can change under compaction).
+- `advise` (mid-turn, near-limit ask): `Stop`'s `additionalContext` is the confirmed
+  channel — it rides the agent's own live turn (verified empirically: an echo-marker
+  test showed the model acting on it in the same turn), so this is `can_advise_mid_turn`.
+  Check `stop_hook_active`/`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` to avoid double-asking into
+  a hook-extended turn.
+- `emit_status` for a FRESH or POST-COMPACTION context (no live turn to ride): the
+  `SessionStart:compact` hook injecting `additionalContext` is the confirmed channel here
+  — a different situation from `advise` above, not a contradiction: `Stop` fires only
+  mid-turn on an active session, `SessionStart:compact` fires only at the start of a
+  session Claude Code just compacted. `PostCompact` hook output is silently rejected (not
+  in Claude Code's allowed `hookEventName` union) — this is `can_inject_at_session_start:
+  true` via `SessionStart`, `can_observe_compaction` via watching token count, NOT via
+  `PostCompact`'s own output.
+- `compact`: sending the literal `/compact <instructions>` message when the agent is idle
+  (root-only slash command, no other API) — `can_trigger_compaction: true`. `Stop` never
+  fires after a `/compact` runs (no model turn). Nothing auto-continues a task after
+  compaction — after grading confirms token count dropped, send a second continuation
+  message (one of only two allowed unsolicited-send call sites in the whole adapter: the
+  `/compact` itself, and this continuation).
+- `resume_session`: `claude --resume <session_id>` (or `claude -r`) in `session.cwd`.
+  Launches Headless (`--print`/background) by default per `session.launch_mode`; an
+  `Interactive`-launched session resuming Headless is a known, accepted UX tradeoff for
+  auto-resume (the user reattaches manually) — see `LaunchMode` above.
+- `seed_new_session(InitialPrompt, ...)`: `claude -p "<summary>"` in `seed.cwd` — this is
+  a brand-new session, so none of the hook-injection gotchas above apply; an initial
+  prompt on the command line is the normal, unproblematic path. No `ForkWithHistory` mode
+  (not investigated / no evidence of an equivalent CLI primitive for Claude Code).
+- Session identity: the harness-assigned id, believed stable across compaction — **Phase 2
+  must verify this empirically** (see `SessionId` note in the domain model above) rather
+  than trust it as given.
 
-### Codex adapter (Phase 1 research spike required — no equivalent research done yet)
+### Codex adapter (research complete — see docs/research-codex.md)
 
-Full v1 parity is required (not staged behind Claude Code). Before Phase 4 writes real
-logic, Phase 1 must establish, for Codex (`codex` CLI, confirmed installed:
-`codex-cli 0.154.0`):
-- What usage/quota API or local state exposes rate-limit percentage and reset time
-  (equivalent of Claude Code's `/api/oauth/usage`).
-- Whether Codex has a hook surface analogous to Claude Code's (`codex --help` shows
-  `.codex/hooks.json`-style hook config already in use on this machine — investigate
-  `post_tool_use`/`session_start`/`user_prompt_submit`/`stop` hooks and what each can
-  inject/reject, mirroring the Claude Code gotcha list above).
-- Codex's actual compaction mechanism, if any (is there a `/compact`-equivalent, or is
-  compaction automatic/opaque?).
-- `codex resume <session-id>` / `codex exec resume` — confirm this is the real resume
-  primitive (the `codex --help` output lists a `resume` subcommand: "Resume a previous
-  interactive session (picker by default; use --last to continue the most recent)" and
-  `codex exec resume` too) — document exact invocation shape and whether a specific
-  session id (not just "last") can be targeted headlessly.
-- Whether Codex supports seeding a new session with prior context (`supports_seed_new_session`).
+- `fetch_usage`: via `codex app-server`'s `account/rateLimits/read`, not a raw HTTP
+  endpoint. Response gives `primary`/`secondary` windows with explicit
+  `windowDurationMins` (e.g. 300/10080) — map to `WindowKind::Rolling{minutes}` by that
+  duration field, never by positional primary/secondary guessing (a plan change on
+  OpenAI's side must not silently mis-key samples). Also carries `rateLimitReachedType`
+  and `planType` — feed `rateLimitReachedType` into `StopReason::UsageLimit` detection.
+- `Capabilities`: `can_trigger_compaction: false` — compaction is automatic/opaque, no
+  `/compact`-equivalent exists (confirmed: no compact subcommand/flag in `codex --help`;
+  `remote_compaction_v2` is a stable-but-internal feature). `can_advise_mid_turn: false`
+  — `Stop` has no additional-context field (expects JSON, can only ask Codex to continue
+  via `decision:"block"`, which is a different, more invasive primitive than Claude
+  Code's passive `additionalContext`). `can_inject_at_session_start: true` — `SessionStart`
+  supports `additionalContext`, with a `source` matcher of `startup|resume|clear|compact`;
+  use `source:"compact"` to inject state/status right after Codex's own automatic
+  compaction, mirroring Claude Code's `SessionStart:compact` role. `can_observe_compaction:
+  true` via `PreCompact`/`PostCompact` hooks (their own text output is ignored, but their
+  firing is itself the observable signal, with a `manual|auto` matcher). `reports_token_counts:
+  false` **pending verification** — no confirmed source for token counts or context-window
+  size was found; idle-compact/reseed-auto/keepalive must skip (not guess) for Codex until
+  a real source is confirmed (check `codex exec --json` event stream and hook payloads).
+  `headless_resume: true`. `seed_modes: [InitialPrompt, ForkWithHistory]`.
+- Since `can_advise_mid_turn` and `can_trigger_compaction` are both false, the near-limit
+  policy's only available action for Codex is: checkpoint state (if/when a state-file
+  convention exists for Codex — TBD, no equivalent of Claude Code's paseo-style state
+  file researched yet) and log the projected exhaustion time. This is a real, accepted
+  capability gap, not a bug to route around.
+- `compact`: not implemented — `Capabilities.can_trigger_compaction` is false, so
+  `uw-policy`/`uw-daemon` never call it for this adapter. `emit_status`/general status
+  strings use the `SessionStart(source:"compact")` channel above.
+- `resume_session`: `codex exec resume <session-uuid> "Continue from the saved state."`
+  (headless, targets a specific id directly — no picker). In `session.cwd`.
+- `seed_new_session(InitialPrompt, ...)`: `codex exec "<summary>"` — a blank new session
+  with the summary as its literal initial prompt, the same primitive as Claude Code's
+  `claude -p "<summary>"`.
+- `seed_new_session(ForkWithHistory, ...)`: `codex fork <session-id> "<prompt>"` — carries
+  the ENTIRE prior conversation forward. Available as a capability but NOT wired into the
+  reseed-to-save-tokens flow (defeats its purpose); reserved for a possible future
+  "continue this exact session under a new id" feature.
+- Session identity: `session_meta.id` (rollout JSONL) == `threads.id` (state DB) — a
+  stable UUID, confirmed unchanged across resume/fork. No `SessionId`-stability caveat
+  needed for Codex (unlike Claude Code, see above).
 
-Write findings to `docs/research-codex.md` in the same structure as
-`docs/research-claude-code.md` before Phase 4 begins.
+### Hook ingress — a shim, not yet assigned a crate (Phase 4/5 gap, must be decided before either)
+
+Both harnesses deliver context only by executing a configured hook command and reading
+its stdout/JSON — there is no long-lived "push" channel from a running session to
+`uw-daemon`. This means Phase 4/5 need a small hook-shim binary (harness-invoked,
+short-lived, one process per hook firing) that parses the harness's hook payload and
+either serves it locally (fail-open, hard-timeout — a daemon that's down must never stall
+a user's turn) or forwards to `uw-daemon` over the same local socket the CLI uses. Decide
+in Phase 4 whether this lives as a `[[bin]]` in `uw-adapters` (parsing logic already lives
+there) or a new `uw-hook` crate; `uw-cli` does NOT currently depend on `uw-adapters`, so
+if the shim needs adapter-level parsing, either add that dependency or give it its own
+crate. Installation/trust is a separate, real step for Phase 9 (or earlier, whenever
+hooks first need to be live for manual testing): Claude Code needs a `~/.claude/settings.json`
+hooks entry per the `paseo-smart-session` reconciler pattern (own only what you installed,
+never touch unrelated entries); Codex requires each hook definition to be trust-hashed in
+`~/.codex/config.toml`'s `[hooks.state]` before it runs at all (`--dangerously-bypass-hook-trust`
+only helps processes usagewindow itself spawns, not a user's own interactive sessions —
+not a substitute for real installation).
 
 ## Trigger policies (Phase 3 target)
 
@@ -146,31 +294,58 @@ Write findings to `docs/research-codex.md` in the same structure as
   max(effective_threshold, closing_pct)`. Burn rate: `(last.pct - first.pct) /
   hours_between(first.t, last.t)`, where `first` = the last point at-or-before
   `now - 30min` (anchoring strictly inside the window risks a zero-length span exactly
-  when the answer should be "flat"). Ask-only (never auto-acts) for the compaction
-  decision itself; the resulting projected-exhaustion timing IS allowed to drive the
-  resume-scheduling lead-time math (that's an auto-resume decision, in scope for req 1).
+  when the answer should be "flat"). **Both `first` and `last` must be constrained to the
+  same window instance** (same `resets_at`, within the existing rollover tolerance) —
+  otherwise a window reset inside the 30-minute lookback span produces a nonsensical
+  negative burn rate; treat a reset-spanning pair as no-data (return `None`), same as an
+  insufficient-history case. Gated by `Capabilities` per the trait section above: only
+  calls `adapter.advise()` when possible, degrades to checkpoint-and-log otherwise — never
+  auto-acts on the compaction decision itself. The resulting projected-exhaustion timing
+  IS allowed to drive the resume-scheduling lead-time math (an auto-resume decision, in
+  scope for req 1, independent of whether the adapter can advise/compact at all).
 - **Resume lead-time**: `usable_pct = remaining_pct - cache_write_pct; raw_minutes =
   usable_pct / burn_pct_per_minute; lead = raw_minutes * (1 - overhead_pct/100)`, clamped
   to a configurable `[min_lead_minutes, max_lead_minutes]`. `overhead_pct` (default
   suggestion 30) is a safety margin on the lead time, NOT a usage-percentage trigger —
-  keep it a distinct config field from `compact_pct`/`plan_pressure_pct`.
+  keep it a distinct config field from `compact_pct`/`plan_pressure_pct`. `cache_write_pct`
+  is NOT a free-standing input — it's the output of the cache-write cost model ported from
+  `paseo-smart-session` (`shared/cache-cost.ts`): a per-model $/MTok cache-write price
+  table (longest-matching-prefix model-id lookup) combined with an empirically-learned
+  $/plan-percent ratio (bucket observed plan-% deltas and $ deltas into hourly buckets;
+  needs ≥3 usable buckets or falls back to a configured flat default, e.g. 1%). Add
+  `cache_write_price_table: Vec<{model_prefix, usd_per_mtok}>` and
+  `cache_write_fallback_pct: f32` to `ThresholdProfile` — this is the pricing-input gap
+  the reseed cost-comparison gate below also depends on, so define it once here.
 - **Opportunistic idle-compact** (auto-fires, no asking): tiered table
   `Vec<{window_size_floor: u64, token_threshold: u64}>` sorted ascending, pick the
   highest floor `<=` the session's context window size. Defaults: 100k tokens for the
   ≤200k tier, 200k tokens for the 201k+ tier — open-ended, a 1M-window model gets its
   own tier via config with no code change. Fires when `idle_for >= cache_ttl - margin`
-  (cache_ttl: flat per-provider default, e.g. 300s for Anthropic) AND
-  `last_known_token_count >= tier.token_threshold`.
+  AND `last_known_token_count >= tier.token_threshold`. `cache_ttl` is per-provider AND
+  per-tier, not one flat number: Anthropic's *default* prompt cache is ~5 minutes, but a
+  session using the 1-hour cache beta needs its own `cache_ttl` value or this fires
+  hours early on a cache that's still warm — add `cache_ttl_by_provider:
+  HashMap<Provider, Duration>` (with a documented way to override per-session when a
+  session opted into an extended-TTL cache) rather than a single constant. OpenAI's
+  caching is automatic with no documented user-facing TTL — Codex's `cache_ttl` starts
+  as an explicit "unresearched, treat as unknown, this policy does not fire for Codex
+  until a real value is confirmed" rather than a guessed default.
 - **Reseed auto-trigger** (opt-in, default off, distinct from idle-compact): idleness
   gate (same as above) + a minimum dry-session token floor + a cost-comparison gate
-  (estimated $ cost of reseeding via the cache-cost model vs. estimated cost of waiting
-  for a natural window reset) + a per-session cooldown. Its own explicit enable flag
-  even when auto-triggering is globally on, since it starts a genuinely new session
-  (destructive to continuity in a way idle-compact is not).
+  (estimated $ cost of reseeding, using the SAME cache-write cost model as the resume
+  lead-time formula above, vs. estimated cost of waiting for a natural window reset) + a
+  per-session cooldown. Its own explicit enable flag even when auto-triggering is
+  globally on, since it starts a genuinely new session (destructive to continuity in a
+  way idle-compact is not). Requires `reports_token_counts: true` on the adapter (see
+  `Capabilities`) — skipped entirely for an adapter that can't report token counts, since
+  the cost-comparison gate has no inputs otherwise.
 - **Cache keepalive** (opt-in per session, default off): drip-feed turns near
-  `cache_ttl` (fires before idle-compact/reseed thresholds would), tagged with a literal
-  marker `[[uw-keepalive]]` that reseed's transcript summarization and any cost/analytics
-  view explicitly filter out. Hard per-session daily cap (config) as a cost guard.
+  `cache_ttl` (fires before idle-compact/reseed thresholds would, using the same
+  per-provider/per-tier `cache_ttl` value above), tagged with a literal marker
+  `[[uw-keepalive]]` that reseed's transcript summarization and any cost/analytics view
+  explicitly filter out. Hard per-session daily cap (config) as a cost guard. Delivered
+  via `adapter.advise()` — never claimed/queued (non-destructive, best-effort, like the
+  near-limit ask).
 
 All numbers above are `ThresholdProfile` fields, overridable per provider/model/session.
 
@@ -179,22 +354,45 @@ All numbers above are `ThresholdProfile` fields, overridable per provider/model/
 SQLite via `rusqlite`, WAL mode. Schema sketch:
 
 ```sql
+-- window_kind stores the Rolling{minutes}/WeeklyModel/WeeklySurface/Custom tag;
+-- window_scope_value carries the variant's payload (minutes, model id, label). `severity`
+-- is NOT a column (policy output, computed at read time) — `exceeded` is the only
+-- provider-reported fact persisted per window-sample.
 usage_samples(id, provider, account, window_kind, window_scope_value, pct, resets_at,
-              severity, active, source, at, fetched_at, credits_json)
+              exceeded, active, source, at, fetched_at, credits_json)
   -- one row per (sample, window) — flattened, not JSON-blobbed, so burn-rate queries
   -- are plain range scans: SELECT pct, at FROM usage_samples WHERE provider=? AND
-  -- window_kind=? AND at > ? ORDER BY at
+  -- window_kind=? AND window_scope_value=? AND at > ? ORDER BY at
+  -- (window_scope_value included in the burn-rate query key: two Rolling windows with
+  -- different minute counts, or two WeeklyModel windows for different models, must
+  -- never be scanned together.)
 
-sessions(id PRIMARY KEY, harness, model, account, first_seen, last_seen,
-         last_known_token_count, stopped_reason, stopped_window_kind, reseeded_from)
+-- cwd/state_path/context_window_size/launch_mode/pid: see SessionSummary in the domain
+-- model section above for why each is load-bearing (resume needs cwd+launch_mode,
+-- idle-compact needs context_window_size, liveness needs pid).
+sessions(id PRIMARY KEY, harness, model, account, cwd, state_path,
+         context_window_size, last_known_token_count, launch_mode, pid,
+         first_seen, last_seen, stopped_reason, stopped_window_kind,
+         superseded_by, reseeded_from)
 
-resume_markers(session_id PRIMARY KEY REFERENCES sessions, reason, resume_at,
+-- id PRIMARY KEY (not session_id): a session can be resumed more than once across
+-- separate quota-window instances, so this must support more than one row per session.
+resume_markers(id PRIMARY KEY, session_id REFERENCES sessions, reason, resume_at,
                created_at, status, status_detail)
+-- UNIQUE INDEX on session_id WHERE status IN ('pending','scheduled') — at most one
+-- ACTIVE marker per session at a time, but history of past markers is kept.
 
 compaction_requests(id PRIMARY KEY, session_id REFERENCES sessions, kind, prompt,
                      reason, status, created_at, updated_at)
 
-threshold_overrides(id PRIMARY KEY, scope_kind, scope_value, field, value_json, updated_at)
+-- scope_value alone is ambiguous for a model-scoped row (ModelId is provider-scoped, e.g.
+-- "opus" means nothing without knowing the provider) — provider is always present,
+-- model_value only set when scope_kind = 'model' or 'session'.
+threshold_overrides(id PRIMARY KEY, scope_kind, provider, model_value, session_value,
+                     field, value_json, updated_at)
+-- UNIQUE INDEX on (scope_kind, provider, model_value, session_value, field) — the whole
+-- point of per-field overrides is that setting the same field twice at the same scope
+-- replaces, not duplicates, the row.
 
 idle_reseed_summaries(id PRIMARY KEY, session_id, source_model, summary_text,
                        token_count_before, token_count_after, created_at)
@@ -202,11 +400,29 @@ idle_reseed_summaries(id PRIMARY KEY, session_id, source_model, summary_text,
 keepalive_config(session_id PRIMARY KEY, enabled, last_ping_at)
 ```
 
-Indexes: `(provider, window_kind, at)` on `usage_samples`; `(session_id, status)` on
-`compaction_requests` and `resume_markers`. Retention: prune `usage_samples` past a
-configurable age (default 30 days), keep `sessions`/latest-per-window derived state.
+Indexes: `(provider, window_kind, window_scope_value, at)` on `usage_samples`;
+`(session_id, status)` on `compaction_requests` and `resume_markers`; the partial-unique
+index on `resume_markers` and the compound-unique index on `threshold_overrides` noted
+above. Retention: prune `usage_samples` past a configurable age (default 30 days), keep
+`sessions`/latest-per-window derived state.
+
+`uw-store`'s public API is synchronous (`rusqlite::Connection` is not `Sync`) — a
+dedicated writer thread owns the connection; `uw-daemon` wraps calls in
+`tokio::task::spawn_blocking` rather than trying to share the connection across async
+tasks directly. Readers (CLI direct-DB-read fallback, web UI queries) open their own
+short-lived read connections under WAL, no shared state with the writer thread needed.
 
 ## CLI / API / Web UI (Phases 6-7 targets)
+
+**Dependency direction**: `/api/*` request/response DTOs (plain serde types, distinct
+from the internal domain model where they need to be — e.g. a `SessionListItem` view
+type, not the full `SessionSummary`) live in `uw-core` as an `api` module, so `uw-cli`
+can build requests against them depending only on `uw-core`. `uw-daemon` embeds `uw-web`'s
+axum app directly (one process serves both the CLI-facing API and the browser UI) rather
+than running them as separate processes — simplest option that still matches "CLI writes
+require the daemon running." `uw-daemon`'s `Cargo.toml` gains a dependency on `uw-web`;
+`uw-web`'s route handlers use the `uw-core::api` DTOs and call into `uw-core`'s client API
+functions (§ top of this doc) to do real work.
 
 CLI (`uw`): `status`, `sessions list/show`, `resume <guid> [--at]`, `resume cancel <guid>`,
 `compact ask/status <guid>`, `reseed <guid> --model <m>`, `keepalive enable/disable <guid>`,
@@ -231,10 +447,14 @@ table), `/compactions` (queue view), `/settings`.
    decisions-and-why/approaches-tried; discard raw file contents/tool output already
    acted on.
 4. Persist to `idle_reseed_summaries` with before/after token counts.
-5. Seed the new session: if `adapter.supports_seed_new_session()`, launch directly with
-   the summary as seed context; else (Claude Code today) start a normal new session and
-   inject the summary via its first `SessionStart` hook — same mechanism as compaction
-   delivery, fired at session-start instead of mid-session.
+5. Seed the new session via `adapter.seed_new_session(SeedMode::InitialPrompt, seed)` —
+   both Claude Code (`claude -p "<summary>"`) and Codex (`codex exec "<summary>"`) treat
+   this as a brand-new session with the summary as its literal launch prompt; no hook
+   workaround needed, since the hook-injection gotchas documented in the adapter sections
+   above only apply to injecting into an EXISTING/resumed session's context, not a fresh
+   one. `SeedMode::ForkWithHistory` (Codex only) is available as a capability but
+   deliberately not used here — forking carries the entire prior conversation forward,
+   which defeats the point of a lean reseed.
 6. Link: `sessions.reseeded_from` FK for UI lineage display.
 
 ## Cache keepalive (Phase 8 target)
@@ -262,11 +482,21 @@ Source content lives under `agent-integration/`. `kasetto.lock` committed once a
 
 ## Phases (this repo's own build order — 9 total)
 
-1. Repo scaffolding (done) + Codex research spike (docs/research-codex.md).
-2. `uw-core` domain types + `uw-store` SQLite schema/migrations, TDD.
+1. Repo scaffolding (done) + Codex research spike (done, docs/research-codex.md) +
+   post-review architecture fixes (done — capability-gated adapter trait, corrected
+   Claude Code injection-channel documentation, schema fixes, dependency-version notes;
+   see the Fable review-1 findings this revision incorporates).
+2. `uw-core` domain types + `uw-store` SQLite schema/migrations, TDD. Must include an
+   empirical test/check of the `SessionId`-survives-compaction assumption for Claude Code
+   before other code relies on it (see the domain-model note above); add a stop-detection
+   write-up to docs/research-codex.md (Codex's `rateLimitReachedType`/`SessionEnd`/
+   `Interrupt` signals) before `detect_stop` is implemented for Codex in Phase 4.
 3. `uw-policy`: threshold resolution, burn-rate/projection math, burn-scaled trigger,
-   opportunistic idle-compact, reseed auto-trigger — pure, fully unit-tested.
-4. `uw-adapters`: trait + Claude Code adapter (full) + Codex adapter (full) + generic/stub.
+   opportunistic idle-compact, reseed auto-trigger — pure, fully unit-tested, all gated by
+   the `Capabilities` struct (a policy must never synthesize a request an adapter can't
+   honor).
+4. `uw-adapters`: trait + Claude Code adapter (full) + Codex adapter (full) + generic/stub
+   + the hook-ingress shim (crate placement decided here, see "Hook ingress" above).
 5. `uw-daemon`: polling, compaction queue delivery/claim, hook wiring both harnesses,
    idle auto-compact end-to-end, resume scheduler + respawn both harnesses.
 6. `uw-cli` + the shared `/api/*` JSON surface.
