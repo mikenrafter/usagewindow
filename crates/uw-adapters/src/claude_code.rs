@@ -271,9 +271,9 @@ impl UsageResponse {
         UsageWindowState::new(w.utilization, false, true, w.resets_at, None)
     }
 }
-pub fn compact_instructions(reason: &str, state_path: &str) -> String {
+pub fn compact_instructions(prompt: &str, state_path: &str) -> String {
     format!(
-        "/compact\nPreserve: the current goal, the step in progress and its exact next action, decisions already made and why, and every approach already tried and rejected.\nDiscard: file contents already read, superseded plans, and tool output that has been acted on.\nReason for compacting now: {reason}\n[Authoritative state lives at {state_path}. Re-read that file before acting; where it disagrees with this summary, the file wins.]"
+        "{prompt}\n[Authoritative state lives at {state_path}. Re-read that file before acting; where it disagrees with this summary, the file wins.]"
     )
 }
 
@@ -327,13 +327,16 @@ impl HarnessAdapter for ClaudeCodeAdapter {
     }
     async fn compact(
         &self,
-        session: &SessionId,
+        session: &SessionSummary,
         req: &CompactionRequest,
     ) -> AdapterResult<DeliveryOutcome> {
         self.messenger
             .as_ref()
             .ok_or(AdapterError::Unsupported)?
-            .send(session, &compact_instructions(&req.reason, &req.prompt))
+            .send(
+                &session.id,
+                &compact_instructions(&req.prompt, session_state_path(session)),
+            )
             .await
     }
     async fn resume_session(&self, session: &SessionSummary) -> AdapterResult<()> {
@@ -379,6 +382,10 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         }
         Ok(filter_keepalive_transcript(&matching.join("\n")))
     }
+}
+
+fn session_state_path(session: &SessionSummary) -> &str {
+    session.state_path.as_deref().unwrap_or("<not recorded>")
 }
 #[cfg(test)]
 mod tests {
@@ -573,9 +580,46 @@ mod tests {
     #[test]
     fn compact_message_uses_research_template() {
         assert_eq!(
-            compact_instructions("quota pressure", "/tmp/state"),
-            "/compact\nPreserve: the current goal, the step in progress and its exact next action, decisions already made and why, and every approach already tried and rejected.\nDiscard: file contents already read, superseded plans, and tool output that has been acted on.\nReason for compacting now: quota pressure\n[Authoritative state lives at /tmp/state. Re-read that file before acting; where it disagrees with this summary, the file wins.]"
+            compact_instructions("requested prompt", "/tmp/state"),
+            "requested prompt\n[Authoritative state lives at /tmp/state. Re-read that file before acting; where it disagrees with this summary, the file wins.]"
         );
+    }
+    #[tokio::test]
+    async fn compact_sends_prompt_and_real_session_state_path() {
+        let sent = Arc::new(Mutex::new(None));
+        let adapter = adapter(
+            200,
+            Arc::new(Cache {
+                entry: Mutex::new(None),
+            }),
+            Arc::new(Mutex::new(0)),
+        )
+        .with_delivery(
+            Arc::new(NoHook),
+            Arc::new(RecordingMessenger(sent.clone())),
+            Arc::new(Recorder(Arc::new(Mutex::new(None)))),
+        );
+        let mut session = session(LaunchMode::Headless);
+        session.state_path = Some("/real/state.json".into());
+        adapter
+            .compact(
+                &session,
+                &CompactionRequest {
+                    id: uuid::Uuid::new_v4(),
+                    session_id: session.id.clone(),
+                    kind: CompactionKind::OpportunisticIdle,
+                    prompt: "actual prompt".into(),
+                    reason: "ignored routing metadata".into(),
+                    status: CompactionStatus::Pending,
+                    created_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        let message = sent.lock().unwrap().clone().unwrap();
+        assert!(message.contains("actual prompt"));
+        assert!(message.contains("/real/state.json"));
+        assert!(!message.contains("ignored routing metadata"));
     }
     struct Recorder(Arc<Mutex<Option<ProcessSpec>>>);
     #[async_trait::async_trait]
@@ -661,6 +705,14 @@ mod tests {
     #[async_trait::async_trait]
     impl SessionMessenger for NoMessenger {
         async fn send(&self, _: &SessionId, _: &str) -> AdapterResult<DeliveryOutcome> {
+            Ok(DeliveryOutcome::Delivered)
+        }
+    }
+    struct RecordingMessenger(Arc<Mutex<Option<String>>>);
+    #[async_trait::async_trait]
+    impl SessionMessenger for RecordingMessenger {
+        async fn send(&self, _: &SessionId, text: &str) -> AdapterResult<DeliveryOutcome> {
+            *self.0.lock().unwrap() = Some(text.into());
             Ok(DeliveryOutcome::Delivered)
         }
     }

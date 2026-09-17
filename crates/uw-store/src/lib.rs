@@ -290,6 +290,13 @@ impl Store {
         )?;
         Ok(())
     }
+    /// Claims a due resume marker before spawning the harness process.
+    pub fn claim_resume_marker(&self, id: uuid::Uuid) -> StoreResult<bool> {
+        Ok(self.connection.execute(
+            "UPDATE resume_markers SET status='fired',status_detail=NULL WHERE id=? AND status IN ('pending','scheduled')",
+            [id.to_string()],
+        )? == 1)
+    }
     pub fn insert_compaction_request(&self, request: &CompactionRequest) -> StoreResult<()> {
         self.connection.execute(
             "INSERT INTO compaction_requests(id,session_id,kind,prompt,reason,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -568,6 +575,28 @@ mod tests {
                 ..m
             })
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn claim_resume_marker_is_atomic() {
+        let s = Store::open_memory().unwrap();
+        let sid = SessionId("s".into());
+        s.insert_session(&session(&sid)).unwrap();
+        let marker = ResumeMarker {
+            id: uuid::Uuid::new_v4(),
+            session_id: sid,
+            reason: ResumeReason::ManuallyMarked,
+            resume_at: Some(Utc::now()),
+            created_at: Utc::now(),
+            status: ResumeStatus::Scheduled,
+        };
+        s.insert_resume_marker(&marker).unwrap();
+        assert!(s.claim_resume_marker(marker.id).unwrap());
+        assert!(!s.claim_resume_marker(marker.id).unwrap());
+        assert_eq!(
+            s.resume_markers_for_session(&marker.session_id).unwrap()[0].status,
+            ResumeStatus::Fired
         );
     }
     #[test]

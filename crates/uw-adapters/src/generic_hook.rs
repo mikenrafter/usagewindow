@@ -65,7 +65,7 @@ impl HarnessAdapter for GenericHookAdapter {
     }
     async fn compact(
         &self,
-        _: &SessionId,
+        _: &SessionSummary,
         _: &CompactionRequest,
     ) -> AdapterResult<DeliveryOutcome> {
         Err(AdapterError::Unsupported)

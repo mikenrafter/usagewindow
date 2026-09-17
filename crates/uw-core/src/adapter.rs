@@ -80,7 +80,7 @@ pub trait HarnessAdapter: Send + Sync {
     async fn advise(&self, session_id: &SessionId, text: &str) -> AdapterResult<DeliveryOutcome>;
     async fn compact(
         &self,
-        session_id: &SessionId,
+        session: &SessionSummary,
         req: &CompactionRequest,
     ) -> AdapterResult<DeliveryOutcome>;
     async fn resume_session(&self, session: &SessionSummary) -> AdapterResult<()>;

@@ -84,7 +84,12 @@ async fn status(
             if let Some(model) = &model { sample.windows.retain(|key, _| matches!(&key.kind, WindowKind::WeeklyModel(candidate) if candidate == model)); }
             if sample.windows.is_empty() { continue; }
             let key = format!("{:?}:{:?}", sample.provider, sample.account);
-            if latest.get(&key).is_none_or(|old| old.at < sample.at) { latest.insert(key, sample); }
+            match latest.get_mut(&key) {
+                Some(old) if old.at == sample.at => old.windows.extend(sample.windows),
+                Some(old) if old.at < sample.at => { *old = sample; }
+                None => { latest.insert(key, sample); }
+                _ => {}
+            }
         }
         Ok(StatusResponse { usage: latest.into_values().map(|sample| ProviderUsageSummary { provider: sample.provider, account: sample.account, windows: sample.windows.into_iter().map(|(key, window)| UsageWindowSummary { window: key.kind, pct: window.pct, resets_at: window.resets_at, exceeded: window.exceeded }).collect() }).collect(), last_updated: Utc::now() })
     }).await?;
@@ -419,6 +424,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn status_merges_windows_from_rows_at_the_same_snapshot() {
+        let store = Store::open_memory().unwrap();
+        store.insert_session(&session()).unwrap();
+        let at = Utc::now();
+        for minutes in [300, 10080] {
+            store
+                .insert_usage_sample(&UsageSample {
+                    at,
+                    fetched_at: None,
+                    source: UsageSource::ProviderReported,
+                    provider: Provider::Codex,
+                    account: None,
+                    windows: HashMap::from([(
+                        WindowKey {
+                            provider: Provider::Codex,
+                            kind: WindowKind::Rolling { minutes },
+                        },
+                        UsageWindowState::new(minutes as f32 / 100.0, false, true, None, None),
+                    )]),
+                    credits: None,
+                })
+                .unwrap();
+        }
+        let response = app(store)
+            .oneshot(Request::get("/api/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: StatusResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value.usage.len(), 1);
+        assert_eq!(value.usage[0].windows.len(), 2);
     }
 
     #[tokio::test]

@@ -182,7 +182,7 @@ impl HarnessAdapter for CodexAdapter {
     }
     async fn compact(
         &self,
-        _: &SessionId,
+        _: &SessionSummary,
         _: &CompactionRequest,
     ) -> AdapterResult<DeliveryOutcome> {
         Err(AdapterError::Unsupported)
@@ -338,7 +338,28 @@ mod tests {
             Err(AdapterError::Unsupported)
         ));
         assert!(matches!(
-            a.compact(&id, &test_request()).await,
+            a.compact(
+                &SessionSummary {
+                    id: id.clone(),
+                    harness: Provider::Codex,
+                    model: None,
+                    account: None,
+                    first_seen: Utc::now(),
+                    last_seen: Utc::now(),
+                    cwd: "/tmp".into(),
+                    state_path: None,
+                    context_window_size: None,
+                    last_known_token_count: None,
+                    launch_mode: LaunchMode::Headless,
+                    pid: None,
+                    stopped_reason: None,
+                    resume_marker: None,
+                    superseded_by: None,
+                    reseeded_from: None,
+                },
+                &test_request(),
+            )
+            .await,
             Err(AdapterError::Unsupported)
         ));
     }

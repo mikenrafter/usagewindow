@@ -63,6 +63,9 @@ pub trait DaemonStore: Send + Sync {
     async fn has_active_resume_marker(&self, session_id: &SessionId) -> anyhow::Result<bool>;
     async fn insert_resume_marker(&self, marker: ResumeMarker) -> anyhow::Result<()>;
     async fn due_resume_markers(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<ResumeMarker>>;
+    async fn claim_resume_marker(&self, _id: uuid::Uuid) -> anyhow::Result<bool> {
+        Ok(false)
+    }
     async fn resume_owner(&self, session_id: &SessionId) -> anyhow::Result<SessionSummary>;
     async fn update_resume(&self, id: uuid::Uuid, status: ResumeStatus) -> anyhow::Result<()>;
 }
@@ -165,6 +168,9 @@ impl DaemonStore for SqliteDaemonStore {
     async fn update_resume(&self, id: uuid::Uuid, status: ResumeStatus) -> anyhow::Result<()> {
         self.blocking(move |s| Ok(s.update_resume_status(id, status)?))
             .await
+    }
+    async fn claim_resume_marker(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
+        self.blocking(move |s| Ok(s.claim_resume_marker(id)?)).await
     }
 }
 
@@ -344,6 +350,12 @@ pub async fn run_compaction_tick(
     liveness: &dyn SessionLivenessChecker,
 ) -> anyhow::Result<()> {
     for request in store.pending_compactions().await? {
+        if !matches!(
+            request.kind,
+            CompactionKind::OpportunisticIdle | CompactionKind::AltModelReseed
+        ) {
+            continue;
+        }
         let session = store.compaction_owner(&request.session_id).await?;
         let Some(adapter) = adapters.get(&session.harness) else {
             store
@@ -366,7 +378,7 @@ pub async fn run_compaction_tick(
                 if !store.claim_compaction(request.id).await? {
                     continue;
                 }
-                let result = adapter.compact(&session.id, &request).await;
+                let result = adapter.compact(&session, &request).await;
                 let status = match result {
                     Ok(DeliveryOutcome::Delivered | DeliveryOutcome::QueuedForNextIdle) => {
                         CompactionStatus::Sent
@@ -555,6 +567,9 @@ pub async fn run_resume_tick(
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     for marker in store.due_resume_markers(now).await? {
+        if !store.claim_resume_marker(marker.id).await? {
+            continue;
+        }
         let session = store.resume_owner(&marker.session_id).await?;
         let Some(adapter) = adapters.get(&session.harness) else {
             store
@@ -583,6 +598,18 @@ pub async fn run_polling_loop(
     liveness: &dyn SessionLivenessChecker,
     interval: std::time::Duration,
 ) -> anyhow::Result<()> {
+    run_scheduling_ticks(store, adapters, liveness, interval).await
+}
+
+/// Runs the daemon's destructive scheduling work on its configured cadence.
+/// This is kept separate from the HTTP server so the production entry point and
+/// integration tests use the same scheduling code.
+pub async fn run_scheduling_ticks(
+    store: &dyn DaemonStore,
+    adapters: &HashMap<Provider, Arc<dyn HarnessAdapter>>,
+    liveness: &dyn SessionLivenessChecker,
+    interval: std::time::Duration,
+) -> anyhow::Result<()> {
     let mut ticker = tokio::time::interval(interval);
     loop {
         ticker.tick().await;
@@ -597,18 +624,26 @@ pub async fn run_polling_loop(
 pub async fn run_daemon_loop() -> anyhow::Result<()> {
     let path = std::env::var("UW_DB_PATH").unwrap_or_else(|_| "usagewindow.db".into());
     let store = Store::open(&path)?;
-    let app = uw_web::app(store);
+    let daemon_store = Arc::new(SqliteDaemonStore::new(store));
+    let app = uw_web::app(Store::open(&path)?);
+    let adapters: HashMap<Provider, Arc<dyn HarnessAdapter>> = HashMap::from([(
+        Provider::Codex,
+        Arc::new(uw_adapters::codex::CodexAdapter::real()) as Arc<dyn HarnessAdapter>,
+    )]);
+    let liveness = SystemSessionLivenessChecker;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:7878").await?; // TODO: make the API port configurable.
     let server = async move { axum::serve(listener, app).await };
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
     tokio::select! {
         result = server => result.map_err(Into::into),
-        _ = async {
-            loop {
-                ticker.tick().await;
-                tracing::debug!("uw-daemon poll tick");
-            }
-        } => Ok(()),
+        result = run_scheduling_ticks(daemon_store.as_ref(), &adapters, &liveness, std::time::Duration::from_secs(5)) => result,
+    }
+}
+
+struct SystemSessionLivenessChecker;
+#[async_trait]
+impl SessionLivenessChecker for SystemSessionLivenessChecker {
+    async fn is_idle(&self, session: &SessionSummary) -> bool {
+        session.pid.is_none()
     }
 }
 
@@ -642,7 +677,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex as StdMutex;
+    use std::sync::{
+        Mutex as StdMutex,
+        atomic::{AtomicUsize, Ordering},
+    };
     use uw_core::adapter::{AdapterError, AdapterResult};
 
     fn request() -> CompactionRequest {
@@ -743,6 +781,7 @@ mod tests {
         compacted: Arc<StdMutex<u32>>,
         advised: Arc<StdMutex<u32>>,
     }
+    static RESUME_CALLS: AtomicUsize = AtomicUsize::new(0);
     #[async_trait]
     impl HarnessAdapter for FakeAdapter {
         fn provider(&self) -> Provider {
@@ -770,13 +809,14 @@ mod tests {
         }
         async fn compact(
             &self,
-            _: &SessionId,
+            _: &SessionSummary,
             _: &CompactionRequest,
         ) -> AdapterResult<DeliveryOutcome> {
             *self.compacted.lock().unwrap() += 1;
             Ok(DeliveryOutcome::Delivered)
         }
         async fn resume_session(&self, _: &SessionSummary) -> AdapterResult<()> {
+            RESUME_CALLS.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -843,6 +883,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ask_near_limit_is_never_sent_to_destructive_compact() {
+        let compacted = Arc::new(StdMutex::new(0));
+        let adapter = Arc::new(FakeAdapter {
+            capabilities: caps(true, true, false),
+            compacted: compacted.clone(),
+            advised: Arc::new(StdMutex::new(0)),
+        });
+        let mut ask = request();
+        ask.kind = CompactionKind::AskNearLimit;
+        let store = FakeStore {
+            request: StdMutex::new(Some(ask)),
+            owner: session(),
+            claim: true,
+            status: StdMutex::new(vec![]),
+            samples: vec![],
+            enqueues: Arc::new(StdMutex::new(0)),
+        };
+        run_compaction_tick(
+            &store,
+            &HashMap::from([(Provider::ClaudeCode, adapter as Arc<dyn HarnessAdapter>)]),
+            &AlwaysIdle,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*compacted.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn claim_race_skips_second_delivery_and_success_is_sent() {
         let compacted = Arc::new(StdMutex::new(0));
         let adapter = Arc::new(FakeAdapter {
@@ -889,6 +957,37 @@ mod tests {
             sent.status.lock().unwrap()[0],
             CompactionStatus::Sent
         ));
+    }
+
+    #[tokio::test]
+    async fn scheduling_entry_point_runs_ticks_on_its_cadence() {
+        let compacted = Arc::new(StdMutex::new(0));
+        let adapter = Arc::new(FakeAdapter {
+            capabilities: caps(true, false, false),
+            compacted: compacted.clone(),
+            advised: Arc::new(StdMutex::new(0)),
+        });
+        let store = FakeStore {
+            request: StdMutex::new(Some(request())),
+            owner: session(),
+            claim: true,
+            status: StdMutex::new(vec![]),
+            samples: vec![],
+            enqueues: Arc::new(StdMutex::new(0)),
+        };
+        let adapters = HashMap::from([(Provider::ClaudeCode, adapter as Arc<dyn HarnessAdapter>)]);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            run_scheduling_ticks(
+                &store,
+                &adapters,
+                &AlwaysIdle,
+                std::time::Duration::from_millis(1),
+            ),
+        )
+        .await;
+        assert!(result.is_err(), "the scheduler should keep running");
+        assert!(*compacted.lock().unwrap() > 0);
     }
 
     #[tokio::test]
@@ -1020,6 +1119,8 @@ mod tests {
         active: bool,
         inserts: StdMutex<u32>,
         owner: SessionSummary,
+        due: Vec<ResumeMarker>,
+        claim: Arc<StdMutex<bool>>,
     }
     #[async_trait]
     impl DaemonStore for ResumeFake {
@@ -1053,7 +1154,10 @@ mod tests {
             Ok(())
         }
         async fn due_resume_markers(&self, _: DateTime<Utc>) -> anyhow::Result<Vec<ResumeMarker>> {
-            Ok(vec![])
+            Ok(self.due.clone())
+        }
+        async fn claim_resume_marker(&self, _: uuid::Uuid) -> anyhow::Result<bool> {
+            Ok(std::mem::replace(&mut *self.claim.lock().unwrap(), false))
         }
         async fn resume_owner(&self, _: &SessionId) -> anyhow::Result<SessionSummary> {
             Ok(self.owner.clone())
@@ -1088,6 +1192,8 @@ mod tests {
             active: true,
             inserts: StdMutex::new(0),
             owner: stopped.clone(),
+            due: vec![],
+            claim: Arc::new(StdMutex::new(false)),
         };
         assert!(
             !schedule_resume_if_needed(
@@ -1103,6 +1209,42 @@ mod tests {
             .unwrap()
         );
         assert_eq!(*store.inserts.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_resume_ticks_only_spawn_after_winning_claim() {
+        RESUME_CALLS.store(0, Ordering::SeqCst);
+        let marker = ResumeMarker {
+            id: uuid::Uuid::new_v4(),
+            session_id: SessionId("s".into()),
+            reason: ResumeReason::AutoDetectedLimit,
+            resume_at: Some(Utc::now() - Duration::seconds(1)),
+            created_at: Utc::now() - Duration::minutes(1),
+            status: ResumeStatus::Scheduled,
+        };
+        let store = Arc::new(ResumeFake {
+            active: false,
+            inserts: StdMutex::new(0),
+            owner: session(),
+            due: vec![marker],
+            claim: Arc::new(StdMutex::new(true)),
+        });
+        let adapter = Arc::new(FakeAdapter {
+            capabilities: caps(true, false, false),
+            compacted: Arc::new(StdMutex::new(0)),
+            advised: Arc::new(StdMutex::new(0)),
+        });
+        let adapters = Arc::new(HashMap::from([(
+            Provider::ClaudeCode,
+            adapter as Arc<dyn HarnessAdapter>,
+        )]));
+        let (first, second) = tokio::join!(
+            run_resume_tick(store.as_ref(), adapters.as_ref(), Utc::now()),
+            run_resume_tick(store.as_ref(), adapters.as_ref(), Utc::now()),
+        );
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(RESUME_CALLS.load(Ordering::SeqCst), 1);
     }
 
     #[test]
