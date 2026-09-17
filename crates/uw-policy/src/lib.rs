@@ -1,1 +1,227 @@
-//! uw-policy: pure threshold/trigger logic, no I/O. Placeholder — lands in Phase 3.
+//! Pure threshold and trigger logic for usage-window policies.
+
+use chrono::{DateTime, Duration, Utc};
+use uw_core::adapter::Capabilities;
+use uw_core::model::{
+    AccountId, IdleCompactConfig, ReseedAutoConfig, Severity, ThresholdProfile,
+    UsageSample, WindowKey,
+};
+
+const ROLLOVER_TOLERANCE: Duration = Duration::minutes(2);
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowBlock {
+    pub key: WindowKey,
+    pub account: Option<AccountId>,
+    pub started_at: DateTime<Utc>,
+    pub resets_at: Option<DateTime<Utc>>,
+    pub points: Vec<(DateTime<Utc>, f32)>,
+    /// The reset value observed with each point. Kept separately so callers can
+    /// construct derived blocks while burn-rate math can still reject a reset
+    /// spanning pair.
+    pub point_resets_at: Vec<Option<DateTime<Utc>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdviseChannel { MidTurn, QueuedAtSessionStart, None }
+
+pub fn segment_blocks(samples: &[UsageSample], key: &WindowKey) -> Vec<WindowBlock> {
+    let mut blocks = Vec::new();
+    for sample in samples {
+        let Some(state) = sample.windows.get(key) else { continue };
+        let reset = state.resets_at;
+        let new_block = blocks.last().is_none_or(|block: &WindowBlock| {
+            !same_window_instance(block.resets_at, reset)
+        });
+        if new_block {
+            blocks.push(WindowBlock {
+                key: key.clone(), account: sample.account.clone(), started_at: sample.at,
+                resets_at: reset, points: Vec::new(), point_resets_at: Vec::new(),
+            });
+        }
+        let block = blocks.last_mut().expect("block was just created or already exists");
+        block.points.push((sample.at, state.pct));
+        block.point_resets_at.push(reset);
+    }
+    blocks
+}
+
+fn same_window_instance(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => (a - b).abs() <= ROLLOVER_TOLERANCE,
+        _ => false,
+    }
+}
+
+pub fn burn_rate_pct_per_hour(block: &WindowBlock, lookback: Duration) -> Option<f32> {
+    let &(last_at, last_pct) = block.points.last()?;
+    let cutoff = last_at - lookback;
+    let (first_index, &(first_at, first_pct)) = block.points.iter().enumerate()
+        .rev().find(|(_, (at, _))| *at <= cutoff)?;
+    if first_at >= last_at || !same_window_instance(
+        block.point_resets_at.get(first_index).copied().flatten().or(block.resets_at),
+        block.point_resets_at.last().copied().flatten().or(block.resets_at),
+    ) { return None; }
+    let hours = (last_at - first_at).num_seconds() as f32 / 3600.0;
+    (hours > 0.0).then_some((last_pct - first_pct) / hours)
+}
+
+pub fn projected_exhaustion(block: &WindowBlock, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let rate = burn_rate_pct_per_hour(block, Duration::minutes(30))?;
+    if rate <= 0.0 { return None; }
+    let (_, current_pct) = *block.points.last()?;
+    let seconds = ((100.0 - current_pct) / rate * 3600.0).ceil() as i64;
+    let projected = now + Duration::seconds(seconds);
+    block.resets_at.filter(|reset| projected < *reset).map_or_else(
+        || if block.resets_at.is_none() { Some(projected) } else { None },
+        |_| Some(projected),
+    )
+}
+
+pub fn should_trigger_near_limit(current_pct: f32, burn_pct_per_hour: f32, profile: &ThresholdProfile) -> bool {
+    let effective = 100.0 - burn_pct_per_hour * profile.burn_multiplier;
+    current_pct >= effective.max(profile.closing_pct)
+}
+
+pub fn resume_lead_minutes(remaining_pct: f32, cache_write_pct: f32, burn_pct_per_minute: f32, profile: &ThresholdProfile) -> Option<f32> {
+    let usable = remaining_pct - cache_write_pct;
+    if burn_pct_per_minute <= 0.0 || usable <= 0.0 { return None; }
+    let raw = usable / burn_pct_per_minute;
+    Some((raw * (1.0 - profile.overhead_pct / 100.0)).clamp(profile.min_lead_minutes, profile.max_lead_minutes))
+}
+
+pub fn should_idle_compact(idle_for: Duration, cache_ttl: Duration, margin: Duration, last_known_token_count: u64, context_window_size: u64, config: &IdleCompactConfig) -> bool {
+    idle_for >= cache_ttl - margin && config.tiers.iter()
+        .filter(|tier| tier.window_size_floor <= context_window_size)
+        .max_by_key(|tier| tier.window_size_floor)
+        .is_some_and(|tier| last_known_token_count >= tier.token_threshold)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn should_auto_reseed(idle_for: Duration, cache_ttl: Duration, margin: Duration, last_known_token_count: u64, min_tokens: u64, estimated_reseed_cost_usd: f64, estimated_wait_for_reset_cost_usd: f64, cooldown_elapsed: bool, config: &ReseedAutoConfig) -> bool {
+    config.enabled && idle_for >= cache_ttl - margin && last_known_token_count >= min_tokens
+        && estimated_reseed_cost_usd < estimated_wait_for_reset_cost_usd && cooldown_elapsed
+}
+
+pub fn advise_channel_for(caps: &Capabilities) -> AdviseChannel {
+    if caps.can_advise_mid_turn { AdviseChannel::MidTurn }
+    else if caps.can_inject_at_session_start { AdviseChannel::QueuedAtSessionStart }
+    else { AdviseChannel::None }
+}
+
+pub fn severity_for(pct: f32, profile: &ThresholdProfile) -> Severity {
+    if pct >= profile.plan_pressure_pct { Severity::Exceeded }
+    else if pct >= profile.compact_pct { Severity::Compact }
+    else if pct >= profile.closing_pct { Severity::Closing }
+    else { Severity::Notice }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use std::collections::HashMap;
+    use uw_core::model::{Provider, TokenTier, UsageSource, UsageWindowState, WindowKind};
+
+    fn key() -> WindowKey {
+        WindowKey { provider: Provider::ClaudeCode, kind: WindowKind::Rolling { minutes: 300 } }
+    }
+    fn sample(at: DateTime<Utc>, pct: f32, reset: Option<DateTime<Utc>>) -> UsageSample {
+        UsageSample {
+            at, fetched_at: None, source: UsageSource::ProviderReported,
+            provider: Provider::ClaudeCode, account: Some(AccountId("a".into())),
+            windows: HashMap::from([(key(), UsageWindowState::new(pct, false, true, reset, None))]),
+            credits: None,
+        }
+    }
+    fn at(minutes: i64) -> DateTime<Utc> { Utc.timestamp_opt(1_700_000_000 + minutes * 60, 0).unwrap() }
+    fn block(points: Vec<(DateTime<Utc>, f32)>, reset: Option<DateTime<Utc>>) -> WindowBlock {
+        WindowBlock { key: key(), account: Some(AccountId("a".into())), started_at: points[0].0, resets_at: reset, point_resets_at: vec![reset; points.len()], points }
+    }
+    fn profile() -> ThresholdProfile { ThresholdProfile::default() }
+
+    #[test]
+    fn segments_rollovers_but_absorbs_earlier_jitter() {
+        let reset = Some(at(60));
+        let samples = vec![sample(at(0), 10., reset), sample(at(10), 20., Some(at(59))), sample(at(20), 30., Some(at(61))), sample(at(30), 5., Some(at(200)))];
+        let blocks = segment_blocks(&samples, &key());
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].points.len(), 3);
+    }
+
+    #[test]
+    fn burn_rate_needs_an_anchor_and_same_window_instance() {
+        let b = block(vec![(at(20), 10.), (at(40), 20.)], Some(at(100)));
+        assert_eq!(burn_rate_pct_per_hour(&b, Duration::minutes(30)), None);
+        let reset = WindowBlock { key: key(), account: None, started_at: at(0), resets_at: Some(at(100)),
+            points: vec![(at(0), 90.), (at(20), 10.)],
+            point_resets_at: vec![Some(at(100)), Some(at(200))] };
+        assert_eq!(burn_rate_pct_per_hour(&reset, Duration::minutes(15)), None);
+    }
+
+    #[test]
+    fn projects_only_positive_exhaustion_before_reset() {
+        let b = block(vec![(at(0), 50.), (at(30), 75.)], Some(at(120)));
+        assert_eq!(projected_exhaustion(&b, at(30)), Some(at(60)));
+        assert_eq!(projected_exhaustion(&block(vec![(at(0), 50.), (at(30), 50.)], Some(at(120))), at(30)), None);
+        assert_eq!(projected_exhaustion(&block(vec![(at(0), 75.), (at(30), 50.)], Some(at(120))), at(30)), None);
+        assert_eq!(projected_exhaustion(&block(vec![(at(0), 50.), (at(30), 75.)], Some(at(40))), at(30)), None);
+    }
+
+    #[test]
+    fn fast_burn_triggers_earlier_and_closing_is_a_floor() {
+        let p = profile();
+        assert!(should_trigger_near_limit(90., 20., &p));
+        assert!(!should_trigger_near_limit(90., 1., &p));
+        assert!(should_trigger_near_limit(85., 15., &p));
+    }
+
+    #[test]
+    fn lead_time_clamps_and_rejects_unusable_inputs() {
+        let mut p = profile(); p.min_lead_minutes = 10.; p.max_lead_minutes = 30.;
+        assert_eq!(resume_lead_minutes(90., 10., 1., &p), Some(30.));
+        assert_eq!(resume_lead_minutes(20., 0., 1., &p), Some(14.));
+        assert_eq!(resume_lead_minutes(0., 0., 1., &p), None);
+        assert_eq!(resume_lead_minutes(20., 21., 1., &p), None);
+        assert_eq!(resume_lead_minutes(20., 0., 0., &p), None);
+    }
+
+    #[test]
+    fn idle_compact_uses_highest_fitting_tier() {
+        let c = IdleCompactConfig { tiers: vec![TokenTier { window_size_floor: 0, token_threshold: 100_000 }, TokenTier { window_size_floor: 201_000, token_threshold: 200_000 }], margin: Duration::minutes(1) };
+        assert!(should_idle_compact(Duration::minutes(4), Duration::minutes(5), Duration::minutes(1), 200_000, 210_000, &c));
+        assert!(!should_idle_compact(Duration::minutes(4), Duration::minutes(5), Duration::minutes(1), 99_999, 200_000, &c));
+    }
+
+    #[test]
+    fn reseed_requires_every_gate() {
+        let c = ReseedAutoConfig { enabled: true, min_tokens: 100, cooldown: Duration::hours(1) };
+        let args = (Duration::minutes(5), Duration::minutes(5), Duration::minutes(1), 100, 100, 1., 2., true, &c);
+        assert!(should_auto_reseed(args.0,args.1,args.2,args.3,args.4,args.5,args.6,args.7,args.8));
+        for args in [
+            (Duration::minutes(1), Duration::minutes(5), Duration::minutes(1), 100, 100, 1., 2., true, &c),
+            (Duration::minutes(5), Duration::minutes(5), Duration::minutes(1), 99, 100, 1., 2., true, &c),
+            (Duration::minutes(5), Duration::minutes(5), Duration::minutes(1), 100, 100, 2., 1., true, &c),
+            (Duration::minutes(5), Duration::minutes(5), Duration::minutes(1), 100, 100, 1., 2., false, &c),
+        ] { assert!(!should_auto_reseed(args.0,args.1,args.2,args.3,args.4,args.5,args.6,args.7,args.8)); }
+    }
+
+    #[test]
+    fn advise_channel_follows_capabilities() {
+        let mut c = caps(); assert_eq!(advise_channel_for(&c), AdviseChannel::MidTurn);
+        c.can_advise_mid_turn = false; assert_eq!(advise_channel_for(&c), AdviseChannel::QueuedAtSessionStart);
+        c.can_inject_at_session_start = false; assert_eq!(advise_channel_for(&c), AdviseChannel::None);
+    }
+
+    #[test]
+    fn severity_thresholds_are_inclusive() {
+        let p = profile();
+        assert_eq!(severity_for(70., &p), Severity::Notice);
+        assert_eq!(severity_for(85., &p), Severity::Closing);
+        assert_eq!(severity_for(90., &p), Severity::Compact);
+        assert_eq!(severity_for(95., &p), Severity::Exceeded);
+    }
+
+    fn caps() -> Capabilities { Capabilities { can_trigger_compaction: true, can_advise_mid_turn: true, can_inject_at_session_start: true, can_observe_compaction: true, reports_token_counts: true, headless_resume: true, seed_modes: vec![] } }
+}
