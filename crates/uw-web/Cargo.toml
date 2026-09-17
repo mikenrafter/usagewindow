@@ -1,0 +1,10 @@
+[package]
+name = "uw-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+uw-core.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

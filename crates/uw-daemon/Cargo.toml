@@ -1,0 +1,19 @@
+[package]
+name = "uw-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "uw-daemon"
+path = "src/main.rs"
+
+[dependencies]
+uw-core.workspace = true
+uw-adapters.workspace = true
+uw-policy.workspace = true
+uw-store.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
