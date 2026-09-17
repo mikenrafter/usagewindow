@@ -10,7 +10,7 @@ fn main() -> anyhow::Result<()> {
         execute(
             cli,
             ReadFallback {
-                api: HttpApiClient,
+                api: HttpApiClient::default(),
                 direct
             }
         )?

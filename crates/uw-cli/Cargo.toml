@@ -21,3 +21,7 @@ serde_json.workspace = true
 chrono.workspace = true
 uw-store.workspace = true
 uw-daemon.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+axum.workspace = true

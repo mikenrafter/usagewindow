@@ -9,5 +9,13 @@ workspace = true
 
 [dependencies]
 uw-core.workspace = true
+uw-store.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+axum.workspace = true
+rust-embed.workspace = true
+tower.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true

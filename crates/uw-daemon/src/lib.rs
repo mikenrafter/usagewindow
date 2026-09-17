@@ -405,10 +405,20 @@ pub async fn run_polling_loop(
 /// configuration (SQLite path and adapter registry) is intentionally still a later
 /// wiring concern; this preserves the same cadence/ownership point for Phase 7.
 pub async fn run_daemon_loop() -> anyhow::Result<()> {
+    let path = std::env::var("UW_DB_PATH").unwrap_or_else(|_| "usagewindow.db".into());
+    let store = Store::open(&path)?;
+    let app = uw_web::app(store);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:7878").await?; // TODO: make the API port configurable.
+    let server = async move { axum::serve(listener, app).await };
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
-    loop {
-        ticker.tick().await;
-        tracing::debug!("uw-daemon poll tick");
+    tokio::select! {
+        result = server => result.map_err(Into::into),
+        _ = async {
+            loop {
+                ticker.tick().await;
+                tracing::debug!("uw-daemon poll tick");
+            }
+        } => Ok(()),
     }
 }
 

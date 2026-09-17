@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::BTreeMap;
 use thiserror::Error;
 use uw_core::model::*;
 
@@ -217,7 +218,7 @@ impl Store {
         Ok(())
     }
     pub fn insert_resume_marker(&self, m: &ResumeMarker) -> StoreResult<()> {
-        self.connection.execute("INSERT INTO resume_markers(id,session_id,reason,resume_at,created_at,status,status_detail) VALUES(?,?,?,?,?,?,?)",params![m.id,m.session_id.0,json(&m.reason)?,m.resume_at,m.created_at,status_name(&m.status),status_detail(&m.status)])?;
+        self.connection.execute("INSERT INTO resume_markers(id,session_id,reason,resume_at,created_at,status,status_detail) VALUES(?,?,?,?,?,?,?)",params![m.id.to_string(),m.session_id.0,json(&m.reason)?,m.resume_at,m.created_at,status_name(&m.status),status_detail(&m.status)])?;
         Ok(())
     }
     pub fn has_active_resume_marker(&self, session_id: &SessionId) -> StoreResult<bool> {
@@ -230,14 +231,14 @@ impl Store {
     pub fn update_resume_status(&self, id: uuid::Uuid, status: ResumeStatus) -> StoreResult<()> {
         self.connection.execute(
             "UPDATE resume_markers SET status=?,status_detail=? WHERE id=?",
-            params![status_name(&status), status_detail(&status), id],
+            params![status_name(&status), status_detail(&status), id.to_string()],
         )?;
         Ok(())
     }
     pub fn insert_compaction_request(&self, request: &CompactionRequest) -> StoreResult<()> {
         self.connection.execute(
             "INSERT INTO compaction_requests(id,session_id,kind,prompt,reason,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-            params![request.id, request.session_id.0, json(&request.kind)?, request.prompt, request.reason, compaction_status_name(&request.status), request.created_at, request.created_at],
+            params![request.id.to_string(), request.session_id.0, json(&request.kind)?, request.prompt, request.reason, compaction_status_name(&request.status), request.created_at, request.created_at],
         )?;
         Ok(())
     }
@@ -275,7 +276,7 @@ impl Store {
     pub fn claim_compaction(&self, id: uuid::Uuid) -> StoreResult<bool> {
         Ok(self.connection.execute(
             "UPDATE compaction_requests SET status='sending',updated_at=? WHERE id=? AND status='pending'",
-            params![Utc::now(), id],
+            params![Utc::now(), id.to_string()],
         )? == 1)
     }
     pub fn update_compaction_status(
@@ -285,12 +286,35 @@ impl Store {
     ) -> StoreResult<()> {
         self.connection.execute(
             "UPDATE compaction_requests SET status=?,updated_at=? WHERE id=?",
-            params![compaction_status_name(&status), Utc::now(), id],
+            params![compaction_status_name(&status), Utc::now(), id.to_string()],
         )?;
         Ok(())
     }
     pub fn insert_threshold_override(&self, r: &ThresholdOverride) -> StoreResult<()> {
-        self.connection.execute("INSERT INTO threshold_overrides(id,scope_kind,provider,model_value,session_value,field,value_json,updated_at) VALUES(?,?,?,?,?,?,?,?)",params![r.id,r.scope_kind.as_str(),json(&r.provider)?,r.model_value.as_ref().map(|x|&x.0),r.session_value.as_ref().map(|x|&x.0),r.field,r.value_json,r.updated_at])?;
+        self.connection.execute("INSERT INTO threshold_overrides(id,scope_kind,provider,model_value,session_value,field,value_json,updated_at) VALUES(?,?,?,?,?,?,?,?)",params![r.id.to_string(),r.scope_kind.as_str(),json(&r.provider)?,r.model_value.as_ref().map(|x|&x.0),r.session_value.as_ref().map(|x|&x.0),r.field,r.value_json,r.updated_at])?;
+        Ok(())
+    }
+    pub fn set_threshold_override(&self, r: &ThresholdOverride) -> StoreResult<()> {
+        self.connection.execute("INSERT INTO threshold_overrides(id,scope_kind,provider,model_value,session_value,field,value_json,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at", params![r.id.to_string(),r.scope_kind.as_str(),json(&r.provider)?,r.model_value.as_ref().map(|x|&x.0),r.session_value.as_ref().map(|x|&x.0),r.field,r.value_json,r.updated_at])?;
+        Ok(())
+    }
+    pub fn threshold_values(&self, scope: Option<&uw_core::model::ThresholdScope>) -> StoreResult<BTreeMap<String, String>> {
+        let mut statement = self.connection.prepare("SELECT scope_kind,provider,model_value,session_value,field,value_json FROM threshold_overrides ORDER BY field")?;
+        let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?)))?;
+        let mut values = BTreeMap::new();
+        for row in rows {
+            let (kind, provider, model, session, field, value) = row?;
+            let provider: Provider = serde_json::from_str(&provider)?;
+            let matches = match scope {
+                None => kind == "global",
+                Some(s) => provider == s.provider && model.as_deref() == s.model.as_ref().map(|x| x.0.as_str()) && session.as_deref() == s.session.as_ref().map(|x| x.0.as_str()),
+            };
+            if matches { values.insert(field, value); }
+        }
+        Ok(values)
+    }
+    pub fn cancel_resume_markers(&self, session_id: &SessionId) -> StoreResult<()> {
+        self.connection.execute("UPDATE resume_markers SET status='cancelled',status_detail=NULL WHERE session_id=? AND status IN ('pending','scheduled')", [session_id.0.as_str()])?;
         Ok(())
     }
 }
