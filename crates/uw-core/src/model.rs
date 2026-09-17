@@ -196,6 +196,7 @@ pub struct ReseedAutoConfig {
     pub enabled: bool,
     pub min_tokens: u64,
     pub cooldown: Duration,
+    pub margin: Duration,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct KeepaliveConfig {
@@ -236,7 +237,19 @@ impl Default for ThresholdProfile {
             plan_pressure_pct: 95.0,
             plan_pressure_min_tokens: 0,
             burn_multiplier: 1.0,
-            idle_compact: Default::default(),
+            idle_compact: IdleCompactConfig {
+                tiers: vec![
+                    TokenTier {
+                        window_size_floor: 0,
+                        token_threshold: 100_000,
+                    },
+                    TokenTier {
+                        window_size_floor: 201_000,
+                        token_threshold: 200_000,
+                    },
+                ],
+                margin: Duration::minutes(1),
+            },
             reseed_auto: Default::default(),
             keepalive: None,
             overhead_pct: 30.0,

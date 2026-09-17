@@ -63,7 +63,7 @@ pub enum DeliveryOutcome {
 }
 
 #[async_trait]
-pub trait HarnessAdapter {
+pub trait HarnessAdapter: Send + Sync {
     fn provider(&self) -> Provider;
     fn capabilities(&self) -> Capabilities;
     async fn fetch_usage(&self, account: Option<&AccountId>) -> AdapterResult<UsageSample>;

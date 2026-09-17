@@ -9,7 +9,6 @@ workspace = true
 
 [dependencies]
 uw-core.workspace = true
-serde.workspace = true
 chrono.workspace = true
 
 [dev-dependencies]
