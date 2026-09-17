@@ -4,4 +4,6 @@
 //! it to query resume state and usage without pulling in harness-specific
 //! adapter code or a storage backend. See docs/architecture.md.
 
+pub mod adapter;
 pub mod model;
+pub mod threshold;

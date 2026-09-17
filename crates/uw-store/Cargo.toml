@@ -13,5 +13,8 @@ rusqlite = { version = "0.40", features = ["bundled", "chrono", "uuid"] }
 chrono.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
