@@ -231,6 +231,15 @@ impl HarnessAdapter for CodexAdapter {
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         ))
     }
+
+    async fn export_transcript(
+        &self,
+        _: &SessionSummary,
+    ) -> uw_core::adapter::AdapterResult<String> {
+        // Codex rollout JSONL is not a stable transcript-export interface; this is a
+        // documented research gap, so failing closed is safer than exporting wrong data.
+        Err(uw_core::adapter::AdapterError::Unsupported)
+    }
 }
 
 #[cfg(test)]

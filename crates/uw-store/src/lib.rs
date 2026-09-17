@@ -217,6 +217,61 @@ impl Store {
         self.connection.execute("INSERT INTO sessions(id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,stopped_window_kind,superseded_by,reseeded_from) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![s.id.0,json(&s.harness)?,opt_json(&s.model)?,opt_json(&s.account)?,s.cwd,s.state_path,s.context_window_size.map(|x|x as i64),s.last_known_token_count.map(|x|x as i64),json(&s.launch_mode)?,s.pid.map(|x|x as i64),s.first_seen,s.last_seen,opt_json(&s.stopped_reason)?,Option::<String>::None,s.superseded_by.as_ref().map(|x|&x.0),s.reseeded_from.as_ref().map(|x|&x.0)])?;
         Ok(())
     }
+    pub fn insert_reseed_summary(&self, summary: &ReseedSummary) -> StoreResult<()> {
+        self.connection.execute("INSERT INTO idle_reseed_summaries(id,session_id,source_model,summary_text,token_count_before,token_count_after,created_at) VALUES(?,?,?,?,?,?,?)", params![summary.id.to_string(), summary.session_id.0, summary.source_model.0, summary.summary_text, summary.token_count_before as i64, summary.token_count_after as i64, summary.created_at])?;
+        Ok(())
+    }
+    pub fn reseed_summaries_for_session(&self, id: &SessionId) -> StoreResult<Vec<ReseedSummary>> {
+        let mut stmt = self.connection.prepare("SELECT id,session_id,source_model,summary_text,token_count_before,token_count_after,created_at FROM idle_reseed_summaries WHERE session_id=? ORDER BY created_at,id")?;
+        let rows = stmt.query_map([id.0.as_str()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get(6)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, session_id, model, text, before, after, created_at) = row?;
+            Ok(ReseedSummary {
+                id: uuid::Uuid::parse_str(&id)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                session_id: SessionId(session_id),
+                source_model: ModelId(model),
+                summary_text: text,
+                token_count_before: before as u64,
+                token_count_after: after as u64,
+                created_at,
+            })
+        })
+        .collect()
+    }
+    pub fn link_reseeded_session(
+        &self,
+        new_id: &SessionId,
+        source_id: &SessionId,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            "UPDATE sessions SET reseeded_from=? WHERE id=?",
+            params![source_id.0, new_id.0],
+        )?;
+        Ok(())
+    }
+    pub fn keepalive_config(&self, id: &SessionId) -> StoreResult<KeepaliveState> {
+        self.connection.query_row("SELECT session_id,enabled,last_ping_at,ping_day,ping_count FROM keepalive_config WHERE session_id=?", [id.0.as_str()], |r| Ok(KeepaliveState { session_id: SessionId(r.get(0)?), enabled: r.get::<_, i64>(1)? != 0, last_ping_at: r.get(2)?, ping_day: r.get(3)?, ping_count: r.get::<_, i64>(4)? as u32 })).optional()?.ok_or(StoreError::NotFound)
+    }
+    pub fn set_keepalive(&self, id: &SessionId, enabled: bool) -> StoreResult<()> {
+        self.connection.execute("INSERT INTO keepalive_config(session_id,enabled,last_ping_at,ping_day,ping_count) VALUES(?,?,NULL,NULL,0) ON CONFLICT(session_id) DO UPDATE SET enabled=excluded.enabled", params![id.0, boolean(enabled)])?;
+        Ok(())
+    }
+    pub fn record_keepalive_ping(&self, id: &SessionId, at: DateTime<Utc>) -> StoreResult<()> {
+        let day = at.date_naive().to_string();
+        self.connection.execute("UPDATE keepalive_config SET last_ping_at=?,ping_day=?,ping_count=CASE WHEN ping_day=? THEN ping_count+1 ELSE 1 END WHERE session_id=?", params![at, day, day, id.0])?;
+        Ok(())
+    }
     pub fn insert_resume_marker(&self, m: &ResumeMarker) -> StoreResult<()> {
         self.connection.execute("INSERT INTO resume_markers(id,session_id,reason,resume_at,created_at,status,status_detail) VALUES(?,?,?,?,?,?,?)",params![m.id.to_string(),m.session_id.0,json(&m.reason)?,m.resume_at,m.created_at,status_name(&m.status),status_detail(&m.status)])?;
         Ok(())
@@ -298,18 +353,36 @@ impl Store {
         self.connection.execute("INSERT INTO threshold_overrides(id,scope_kind,provider,model_value,session_value,field,value_json,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at", params![r.id.to_string(),r.scope_kind.as_str(),json(&r.provider)?,r.model_value.as_ref().map(|x|&x.0),r.session_value.as_ref().map(|x|&x.0),r.field,r.value_json,r.updated_at])?;
         Ok(())
     }
-    pub fn threshold_values(&self, scope: Option<&uw_core::model::ThresholdScope>) -> StoreResult<BTreeMap<String, String>> {
+    pub fn threshold_values(
+        &self,
+        scope: Option<&uw_core::model::ThresholdScope>,
+    ) -> StoreResult<BTreeMap<String, String>> {
         let mut statement = self.connection.prepare("SELECT scope_kind,provider,model_value,session_value,field,value_json FROM threshold_overrides ORDER BY field")?;
-        let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?)))?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
         let mut values = BTreeMap::new();
         for row in rows {
             let (kind, provider, model, session, field, value) = row?;
             let provider: Provider = serde_json::from_str(&provider)?;
             let matches = match scope {
                 None => kind == "global",
-                Some(s) => provider == s.provider && model.as_deref() == s.model.as_ref().map(|x| x.0.as_str()) && session.as_deref() == s.session.as_ref().map(|x| x.0.as_str()),
+                Some(s) => {
+                    provider == s.provider
+                        && model.as_deref() == s.model.as_ref().map(|x| x.0.as_str())
+                        && session.as_deref() == s.session.as_ref().map(|x| x.0.as_str())
+                }
             };
-            if matches { values.insert(field, value); }
+            if matches {
+                values.insert(field, value);
+            }
         }
         Ok(values)
     }
@@ -416,7 +489,7 @@ fn decode_compaction_status(status: &str, detail: Option<String>) -> CompactionS
         _ => CompactionStatus::Failed(detail.unwrap_or_else(|| "unknown failure".into())),
     }
 }
-const SCHEMA: &str = r#"PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS usage_samples(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,account TEXT,window_kind TEXT NOT NULL,window_scope_value TEXT NOT NULL,pct REAL NOT NULL,resets_at TEXT,exceeded INTEGER NOT NULL,active INTEGER NOT NULL,source TEXT NOT NULL,at TEXT NOT NULL,fetched_at TEXT,credits_json TEXT);CREATE INDEX IF NOT EXISTS usage_samples_window_at ON usage_samples(provider,window_kind,window_scope_value,at);CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,harness TEXT NOT NULL,model TEXT,account TEXT,cwd TEXT NOT NULL,state_path TEXT,context_window_size INTEGER,last_known_token_count INTEGER,launch_mode TEXT NOT NULL,pid INTEGER,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,stopped_reason TEXT,stopped_window_kind TEXT,superseded_by TEXT,reseeded_from TEXT);CREATE TABLE IF NOT EXISTS resume_markers(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),reason TEXT NOT NULL,resume_at TEXT,created_at TEXT NOT NULL,status TEXT NOT NULL,status_detail TEXT);CREATE INDEX IF NOT EXISTS resume_markers_session_status ON resume_markers(session_id,status);CREATE UNIQUE INDEX IF NOT EXISTS resume_markers_active ON resume_markers(session_id) WHERE status IN ('pending','scheduled');CREATE TABLE IF NOT EXISTS compaction_requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL,prompt TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS compaction_requests_session_status ON compaction_requests(session_id,status);CREATE TABLE IF NOT EXISTS threshold_overrides(id TEXT PRIMARY KEY,scope_kind TEXT NOT NULL,provider TEXT NOT NULL,model_value TEXT,session_value TEXT,field TEXT NOT NULL,value_json TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS threshold_overrides_key ON threshold_overrides(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field);CREATE TABLE IF NOT EXISTS idle_reseed_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,source_model TEXT NOT NULL,summary_text TEXT NOT NULL,token_count_before INTEGER NOT NULL,token_count_after INTEGER NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS keepalive_config(session_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL,last_ping_at TEXT);"#;
+const SCHEMA: &str = r#"PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS usage_samples(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,account TEXT,window_kind TEXT NOT NULL,window_scope_value TEXT NOT NULL,pct REAL NOT NULL,resets_at TEXT,exceeded INTEGER NOT NULL,active INTEGER NOT NULL,source TEXT NOT NULL,at TEXT NOT NULL,fetched_at TEXT,credits_json TEXT);CREATE INDEX IF NOT EXISTS usage_samples_window_at ON usage_samples(provider,window_kind,window_scope_value,at);CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,harness TEXT NOT NULL,model TEXT,account TEXT,cwd TEXT NOT NULL,state_path TEXT,context_window_size INTEGER,last_known_token_count INTEGER,launch_mode TEXT NOT NULL,pid INTEGER,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,stopped_reason TEXT,stopped_window_kind TEXT,superseded_by TEXT,reseeded_from TEXT);CREATE TABLE IF NOT EXISTS resume_markers(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),reason TEXT NOT NULL,resume_at TEXT,created_at TEXT NOT NULL,status TEXT NOT NULL,status_detail TEXT);CREATE INDEX IF NOT EXISTS resume_markers_session_status ON resume_markers(session_id,status);CREATE UNIQUE INDEX IF NOT EXISTS resume_markers_active ON resume_markers(session_id) WHERE status IN ('pending','scheduled');CREATE TABLE IF NOT EXISTS compaction_requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL,prompt TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS compaction_requests_session_status ON compaction_requests(session_id,status);CREATE TABLE IF NOT EXISTS threshold_overrides(id TEXT PRIMARY KEY,scope_kind TEXT NOT NULL,provider TEXT NOT NULL,model_value TEXT,session_value TEXT,field TEXT NOT NULL,value_json TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS threshold_overrides_key ON threshold_overrides(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field);CREATE TABLE IF NOT EXISTS idle_reseed_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,source_model TEXT NOT NULL,summary_text TEXT NOT NULL,token_count_before INTEGER NOT NULL,token_count_after INTEGER NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS keepalive_config(session_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL,last_ping_at TEXT,ping_day TEXT,ping_count INTEGER NOT NULL DEFAULT 0);"#;
 
 #[cfg(test)]
 mod tests {

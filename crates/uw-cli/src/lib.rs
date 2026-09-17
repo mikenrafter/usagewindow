@@ -311,47 +311,103 @@ pub struct HttpApiClient {
 }
 impl HttpApiClient {
     pub fn new(base_url: impl Into<String>) -> Result<Self> {
-        Ok(Self { base_url: base_url.into().trim_end_matches('/').into(), client: reqwest::blocking::Client::builder().build()? })
+        Ok(Self {
+            base_url: base_url.into().trim_end_matches('/').into(),
+            client: reqwest::blocking::Client::builder().build()?,
+        })
     }
     fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let response = self.client.get(format!("{}{}", self.base_url, path)).send()?.error_for_status()?;
+        let response = self
+            .client
+            .get(format!("{}{}", self.base_url, path))
+            .send()?
+            .error_for_status()?;
         Ok(response.json()?)
     }
-    fn post<B: serde::Serialize, T: serde::de::DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
-        let response = self.client.post(format!("{}{}", self.base_url, path)).json(body).send()?.error_for_status()?;
+    fn post<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let response = self
+            .client
+            .post(format!("{}{}", self.base_url, path))
+            .json(body)
+            .send()?
+            .error_for_status()?;
         Ok(response.json()?)
     }
 }
 impl Default for HttpApiClient {
-    fn default() -> Self { Self::new(std::env::var("UW_API_URL").unwrap_or_else(|_| "http://127.0.0.1:7878".into())).expect("valid default daemon URL") }
+    fn default() -> Self {
+        Self::new(std::env::var("UW_API_URL").unwrap_or_else(|_| "http://127.0.0.1:7878".into()))
+            .expect("valid default daemon URL")
+    }
 }
 impl ApiClient for HttpApiClient {
     fn status(&mut self, args: &StatusArgs) -> Result<StatusResponse> {
         let mut request = self.client.get(format!("{}/api/status", self.base_url));
         let mut query = Vec::new();
-        if let Some(provider) = &args.provider { query.push(("provider", serde_json::to_string(provider)?.trim_matches('"').to_string())); }
-        if let Some(model) = &args.model { query.push(("model", model.0.clone())); }
-        if let Some(account) = &args.account { query.push(("account", account.0.clone())); }
+        if let Some(provider) = &args.provider {
+            query.push((
+                "provider",
+                serde_json::to_string(provider)?
+                    .trim_matches('"')
+                    .to_string(),
+            ));
+        }
+        if let Some(model) = &args.model {
+            query.push(("model", model.0.clone()));
+        }
+        if let Some(account) = &args.account {
+            query.push(("account", account.0.clone()));
+        }
         request = request.query(&query);
         Ok(request.send()?.error_for_status()?.json()?)
     }
-    fn sessions_list(&mut self, stopped: bool, harness: Option<&Provider>) -> Result<Vec<SessionListItem>> {
+    fn sessions_list(
+        &mut self,
+        stopped: bool,
+        harness: Option<&Provider>,
+    ) -> Result<Vec<SessionListItem>> {
         let mut query = vec![("stopped", stopped.to_string())];
-        if let Some(harness) = harness { query.push(("harness", serde_json::to_string(harness)?.trim_matches('"').to_string())); }
-        Ok(self.client.get(format!("{}/api/sessions", self.base_url)).query(&query).send()?.error_for_status()?.json()?)
+        if let Some(harness) = harness {
+            query.push((
+                "harness",
+                serde_json::to_string(harness)?
+                    .trim_matches('"')
+                    .to_string(),
+            ));
+        }
+        Ok(self
+            .client
+            .get(format!("{}/api/sessions", self.base_url))
+            .query(&query)
+            .send()?
+            .error_for_status()?
+            .json()?)
     }
     fn sessions_show(&mut self, id: &SessionId) -> Result<SessionDetail> {
         self.get(&format!("/api/sessions/{}", id.0))
     }
     fn resume(&mut self, request: ResumeRequest) -> Result<ResumeResponse> {
-        self.post(&format!("/api/sessions/{}/resume", request.session_id.0), &request)
+        self.post(
+            &format!("/api/sessions/{}/resume", request.session_id.0),
+            &request,
+        )
     }
     fn cancel_resume(&mut self, request: CancelResumeRequest) -> Result<()> {
-        let _: serde_json::Value = self.post(&format!("/api/sessions/{}/resume/cancel", request.session_id.0), &request)?;
+        let _: serde_json::Value = self.post(
+            &format!("/api/sessions/{}/resume/cancel", request.session_id.0),
+            &request,
+        )?;
         Ok(())
     }
     fn compact_ask(&mut self, request: CompactAskRequest) -> Result<CompactStatusResponse> {
-        self.post(&format!("/api/sessions/{}/compact/ask", request.session_id.0), &request)
+        self.post(
+            &format!("/api/sessions/{}/compact/ask", request.session_id.0),
+            &request,
+        )
     }
     fn compact_status(&mut self, id: &SessionId) -> Result<CompactStatusResponse> {
         self.get(&format!("/api/sessions/{}/compact/status", id.0))
@@ -359,13 +415,25 @@ impl ApiClient for HttpApiClient {
     fn reseed(&mut self, _: &SessionId, _: &ModelId, _: bool) -> Result<serde_json::Value> {
         Err(anyhow!("reseed is a Phase 8 operation"))
     }
-    fn keepalive(&mut self, _: &SessionId, _: bool) -> Result<serde_json::Value> {
-        Err(anyhow!("keepalive is a Phase 8 operation"))
+    fn keepalive(&mut self, id: &SessionId, enabled: bool) -> Result<serde_json::Value> {
+        self.post(
+            &format!("/api/sessions/{}/keepalive", id.0),
+            &serde_json::json!({"enabled": enabled}),
+        )
     }
     fn thresholds_get(&mut self, request: ThresholdGetRequest) -> Result<ThresholdResponse> {
-        let scope = request.scope.map(|s| format!("{:?}:{}:{}", s.provider, s.model.map(|m| m.0).unwrap_or_default(), s.session.map(|s| s.0).unwrap_or_default()));
+        let scope = request.scope.map(|s| {
+            format!(
+                "{:?}:{}:{}",
+                s.provider,
+                s.model.map(|m| m.0).unwrap_or_default(),
+                s.session.map(|s| s.0).unwrap_or_default()
+            )
+        });
         let mut query = self.client.get(format!("{}/api/thresholds", self.base_url));
-        if let Some(scope) = scope { query = query.query(&[("scope", scope)]); }
+        if let Some(scope) = scope {
+            query = query.query(&[("scope", scope)]);
+        }
         Ok(query.send()?.error_for_status()?.json()?)
     }
     fn thresholds_set(&mut self, request: ThresholdSetRequest) -> Result<ThresholdResponse> {
@@ -636,22 +704,34 @@ mod tests {
 
     #[tokio::test]
     async fn http_client_deserializes_status_from_mock_server() {
-        let router = axum::Router::new().route("/api/status", axum::routing::get(|| async {
-            axum::Json(StatusResponse { usage: vec![], last_updated: Utc::now() })
-        }));
+        let router = axum::Router::new().route(
+            "/api/status",
+            axum::routing::get(|| async {
+                axum::Json(StatusResponse {
+                    usage: vec![],
+                    last_updated: Utc::now(),
+                })
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let result = tokio::task::spawn_blocking(move || {
             HttpApiClient::new(format!("http://{address}"))?.status(&StatusArgs::default())
-        }).await.unwrap().unwrap();
+        })
+        .await
+        .unwrap()
+        .unwrap();
         assert!(result.usage.is_empty());
         task.abort();
     }
 
     #[test]
     fn refused_http_read_uses_direct_fallback() {
-        let mut fallback = ReadFallback { api: HttpApiClient::new("http://127.0.0.1:9").unwrap(), direct: Direct };
+        let mut fallback = ReadFallback {
+            api: HttpApiClient::new("http://127.0.0.1:9").unwrap(),
+            direct: Direct,
+        };
         fallback.status(&StatusArgs::default()).unwrap();
     }
 }

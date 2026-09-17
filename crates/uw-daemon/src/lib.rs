@@ -7,8 +7,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use uw_core::adapter::{Capabilities, DeliveryOutcome, HarnessAdapter, StatusEvent};
+use uw_core::adapter::{
+    Capabilities, DeliveryOutcome, HarnessAdapter, SeedContext, SeedMode, StatusEvent,
+};
 use uw_core::model::*;
+use uw_core::summarizer::{SummarizeTemplate, Summarizer};
 use uw_policy::{AdviseChannel, CacheCostObservation, WindowBlock};
 use uw_store::Store;
 
@@ -62,6 +65,23 @@ pub trait DaemonStore: Send + Sync {
     async fn due_resume_markers(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<ResumeMarker>>;
     async fn resume_owner(&self, session_id: &SessionId) -> anyhow::Result<SessionSummary>;
     async fn update_resume(&self, id: uuid::Uuid, status: ResumeStatus) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+pub trait ReseedStore: Send + Sync {
+    async fn insert_reseed_summary(&self, summary: ReseedSummary) -> anyhow::Result<()>;
+    async fn link_reseeded_session(
+        &self,
+        new_id: &SessionId,
+        source_id: &SessionId,
+    ) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+pub trait KeepaliveStore: Send + Sync {
+    async fn keepalive_sessions(&self) -> anyhow::Result<Vec<SessionSummary>>;
+    async fn keepalive_state(&self, id: &SessionId) -> anyhow::Result<KeepaliveState>;
+    async fn record_keepalive_ping(&self, id: &SessionId, at: DateTime<Utc>) -> anyhow::Result<()>;
 }
 
 /// Async facade for uw-store's `rusqlite::Connection` owner. Every operation
@@ -146,6 +166,176 @@ impl DaemonStore for SqliteDaemonStore {
         self.blocking(move |s| Ok(s.update_resume_status(id, status)?))
             .await
     }
+}
+
+#[async_trait]
+impl ReseedStore for SqliteDaemonStore {
+    async fn insert_reseed_summary(&self, summary: ReseedSummary) -> anyhow::Result<()> {
+        self.blocking(move |s| Ok(s.insert_reseed_summary(&summary)?))
+            .await
+    }
+    async fn link_reseeded_session(
+        &self,
+        new_id: &SessionId,
+        source_id: &SessionId,
+    ) -> anyhow::Result<()> {
+        let new_id = new_id.clone();
+        let source_id = source_id.clone();
+        self.blocking(move |s| Ok(s.link_reseeded_session(&new_id, &source_id)?))
+            .await
+    }
+}
+#[async_trait]
+impl KeepaliveStore for SqliteDaemonStore {
+    async fn keepalive_sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
+        self.blocking(|s| Ok(s.list_sessions()?)).await
+    }
+    async fn keepalive_state(&self, id: &SessionId) -> anyhow::Result<KeepaliveState> {
+        let id = id.clone();
+        self.blocking(move |s| Ok(s.keepalive_config(&id)?)).await
+    }
+    async fn record_keepalive_ping(&self, id: &SessionId, at: DateTime<Utc>) -> anyhow::Result<()> {
+        let id = id.clone();
+        self.blocking(move |s| Ok(s.record_keepalive_ping(&id, at)?))
+            .await
+    }
+}
+
+pub async fn run_reseed(
+    session: &SessionSummary,
+    cheap_model: ModelId,
+    adapter: &dyn HarnessAdapter,
+    summarizer: &dyn Summarizer,
+    store: &dyn ReseedStore,
+) -> anyhow::Result<SessionId> {
+    let transcript = adapter.export_transcript(session).await?;
+    let before = transcript.split_whitespace().count() as u64;
+    let summary = summarizer
+        .summarize(&transcript, &SummarizeTemplate::default())
+        .await?;
+    let after = summary.split_whitespace().count() as u64;
+    store
+        .insert_reseed_summary(ReseedSummary {
+            id: uuid::Uuid::new_v4(),
+            session_id: session.id.clone(),
+            source_model: cheap_model.clone(),
+            summary_text: summary.clone(),
+            token_count_before: before,
+            token_count_after: after,
+            created_at: Utc::now(),
+        })
+        .await?;
+    let new_id = adapter
+        .seed_new_session(
+            SeedMode::InitialPrompt,
+            &SeedContext {
+                from_session: Some(session.id.clone()),
+                summary,
+                model: cheap_model,
+                cwd: session.cwd.clone(),
+            },
+        )
+        .await?;
+    store.link_reseeded_session(&new_id, &session.id).await?;
+    Ok(new_id)
+}
+
+/// Policy-gated reseed entry point. The caller supplies the already-resolved profile
+/// and cost estimates; all orchestration remains in `run_reseed`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_reseed_auto_tick(
+    session: &SessionSummary,
+    cheap_model: ModelId,
+    adapter: &dyn HarnessAdapter,
+    summarizer: &dyn Summarizer,
+    store: &dyn ReseedStore,
+    now: DateTime<Utc>,
+    cache_ttl: Duration,
+    estimated_reseed_cost_usd: f64,
+    estimated_wait_for_reset_cost_usd: f64,
+    time_since_last_reseed: Duration,
+    profile: &ThresholdProfile,
+) -> anyhow::Result<Option<SessionId>> {
+    let should = uw_policy::should_auto_reseed(
+        now - session.last_seen,
+        cache_ttl,
+        session.last_known_token_count.unwrap_or_default(),
+        estimated_reseed_cost_usd,
+        estimated_wait_for_reset_cost_usd,
+        time_since_last_reseed,
+        &profile.reseed_auto,
+        &adapter.capabilities(),
+    );
+    if should {
+        Ok(Some(
+            run_reseed(session, cheap_model, adapter, summarizer, store).await?,
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+pub const KEEPALIVE_MARKER: &str = "[[uw-keepalive]] no action needed, acknowledge briefly";
+
+pub fn should_fire_keepalive(
+    now: DateTime<Utc>,
+    session: &SessionSummary,
+    state: &KeepaliveState,
+    profile: &ThresholdProfile,
+) -> bool {
+    let Some(config) = profile.keepalive.as_ref() else {
+        return false;
+    };
+    if !config.enabled {
+        return false;
+    }
+    let Some(ttl) = profile.cache_ttl_by_provider.get(&session.harness) else {
+        return false;
+    };
+    let keepalive_margin = profile.idle_compact.margin + Duration::minutes(1);
+    if !state.enabled
+        || session.last_seen >= now
+        || now - session.last_seen < *ttl - keepalive_margin
+    {
+        return false;
+    }
+    let today = now.date_naive().to_string();
+    state.ping_day.as_deref() != Some(today.as_str()) || state.ping_count < config.daily_cap
+}
+
+pub async fn run_keepalive_tick(
+    store: &dyn KeepaliveStore,
+    adapters: &HashMap<Provider, Arc<dyn HarnessAdapter>>,
+    now: DateTime<Utc>,
+    profiles: &HashMap<SessionId, ThresholdProfile>,
+) -> anyhow::Result<u32> {
+    let mut sent = 0;
+    for session in store.keepalive_sessions().await? {
+        let Some(profile) = profiles.get(&session.id) else {
+            continue;
+        };
+        let Some(adapter) = adapters.get(&session.harness) else {
+            continue;
+        };
+        if !adapter.capabilities().reports_token_counts {
+            continue;
+        }
+        let state = match store.keepalive_state(&session.id).await {
+            Ok(x) => x,
+            Err(_) => continue,
+        };
+        if !should_fire_keepalive(now, &session, &state, profile) {
+            continue;
+        }
+        if matches!(
+            adapter.advise(&session.id, KEEPALIVE_MARKER).await,
+            Ok(DeliveryOutcome::Delivered | DeliveryOutcome::QueuedForNextIdle)
+        ) {
+            store.record_keepalive_ping(&session.id, now).await?;
+            sent += 1;
+        }
+    }
+    Ok(sent)
 }
 
 pub async fn run_compaction_tick(
@@ -913,5 +1103,129 @@ mod tests {
             .unwrap()
         );
         assert_eq!(*store.inserts.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn disabled_reseed_auto_never_passes_policy_gate() {
+        let profile = ThresholdProfile::default();
+        assert!(!uw_policy::should_auto_reseed(
+            Duration::hours(2),
+            Duration::minutes(5),
+            200_000,
+            1.0,
+            10.0,
+            Duration::hours(2),
+            &profile.reseed_auto,
+            &caps(true, true, true)
+        ));
+    }
+
+    #[test]
+    fn keepalive_requires_enabled_and_daily_cap() {
+        let now = Utc::now();
+        let mut profile = ThresholdProfile {
+            keepalive: Some(KeepaliveConfig {
+                enabled: true,
+                daily_cap: 1,
+            }),
+            ..Default::default()
+        };
+        profile
+            .cache_ttl_by_provider
+            .insert(Provider::ClaudeCode, Duration::minutes(5));
+        let session = SessionSummary {
+            last_seen: now - Duration::minutes(10),
+            ..session()
+        };
+        let disabled = KeepaliveState {
+            session_id: session.id.clone(),
+            enabled: false,
+            last_ping_at: None,
+            ping_day: None,
+            ping_count: 0,
+        };
+        assert!(!should_fire_keepalive(now, &session, &disabled, &profile));
+        let capped = KeepaliveState {
+            session_id: session.id.clone(),
+            enabled: true,
+            last_ping_at: Some(now),
+            ping_day: Some(now.date_naive().to_string()),
+            ping_count: 1,
+        };
+        assert!(!should_fire_keepalive(now, &session, &capped, &profile));
+    }
+
+    #[tokio::test]
+    async fn keepalive_uses_advise_and_exact_marker() {
+        struct KStore {
+            session: SessionSummary,
+            state: KeepaliveState,
+            recorded: StdMutex<u32>,
+        }
+        #[async_trait]
+        impl KeepaliveStore for KStore {
+            async fn keepalive_sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
+                Ok(vec![self.session.clone()])
+            }
+            async fn keepalive_state(&self, _: &SessionId) -> anyhow::Result<KeepaliveState> {
+                Ok(self.state.clone())
+            }
+            async fn record_keepalive_ping(
+                &self,
+                _: &SessionId,
+                _: DateTime<Utc>,
+            ) -> anyhow::Result<()> {
+                *self.recorded.lock().unwrap() += 1;
+                Ok(())
+            }
+        }
+        let now = Utc::now();
+        let session = SessionSummary {
+            last_seen: now - Duration::minutes(10),
+            ..session()
+        };
+        let mut profile = ThresholdProfile {
+            keepalive: Some(KeepaliveConfig {
+                enabled: true,
+                daily_cap: 2,
+            }),
+            ..Default::default()
+        };
+        profile
+            .cache_ttl_by_provider
+            .insert(Provider::ClaudeCode, Duration::minutes(5));
+        let advised = Arc::new(StdMutex::new(0));
+        let adapter = Arc::new(FakeAdapter {
+            capabilities: caps(false, true, false),
+            compacted: Arc::new(StdMutex::new(0)),
+            advised: advised.clone(),
+        });
+        let store = KStore {
+            session: session.clone(),
+            state: KeepaliveState {
+                session_id: session.id.clone(),
+                enabled: true,
+                last_ping_at: None,
+                ping_day: None,
+                ping_count: 0,
+            },
+            recorded: StdMutex::new(0),
+        };
+        assert_eq!(
+            run_keepalive_tick(
+                &store,
+                &HashMap::from([(Provider::ClaudeCode, adapter as Arc<dyn HarnessAdapter>)]),
+                now,
+                &HashMap::from([(session.id.clone(), profile)])
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(*advised.lock().unwrap(), 1);
+        assert_eq!(
+            KEEPALIVE_MARKER,
+            "[[uw-keepalive]] no action needed, acknowledge briefly"
+        );
     }
 }

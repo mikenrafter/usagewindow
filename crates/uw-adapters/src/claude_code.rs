@@ -12,6 +12,53 @@ use uw_core::adapter::{
 use uw_core::model::*;
 
 #[async_trait]
+pub trait TranscriptFileSystem: Send + Sync {
+    async fn jsonl_files(&self) -> AdapterResult<Vec<String>>;
+    async fn read_to_string(&self, path: &str) -> AdapterResult<String>;
+}
+
+pub struct ClaudeTranscriptFileSystem;
+pub fn filter_keepalive_transcript(content: &str) -> String {
+    content
+        .lines()
+        .filter(|line| !line.contains("[[uw-keepalive]]"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+#[async_trait]
+impl TranscriptFileSystem for ClaudeTranscriptFileSystem {
+    async fn jsonl_files(&self) -> AdapterResult<Vec<String>> {
+        let root = std::env::var("HOME").map_err(|e| AdapterError::Other(e.to_string()))?
+            + "/.claude/projects";
+        let mut out = Vec::new();
+        let mut dirs = vec![root];
+        while let Some(dir) = dirs.pop() {
+            let mut entries = tokio::fs::read_dir(&dir)
+                .await
+                .map_err(|e| AdapterError::Other(e.to_string()))?;
+            while let Some(entry) = entries
+                .next_entry()
+                .await
+                .map_err(|e| AdapterError::Other(e.to_string()))?
+            {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path.to_string_lossy().into_owned());
+                } else if path.extension().is_some_and(|x| x == "jsonl") {
+                    out.push(path.to_string_lossy().into_owned());
+                }
+            }
+        }
+        Ok(out)
+    }
+    async fn read_to_string(&self, path: &str) -> AdapterResult<String> {
+        tokio::fs::read_to_string(path)
+            .await
+            .map_err(|e| AdapterError::Other(e.to_string()))
+    }
+}
+
+#[async_trait]
 pub trait CredentialsReader: Send + Sync {
     async fn read(&self) -> AdapterResult<String>;
 }
@@ -98,6 +145,7 @@ pub struct ClaudeCodeAdapter {
     hook: Option<Arc<dyn HookChannel>>,
     messenger: Option<Arc<dyn SessionMessenger>>,
     spawner: Arc<dyn ProcessSpawner>,
+    transcript_fs: Arc<dyn TranscriptFileSystem>,
 }
 impl ClaudeCodeAdapter {
     pub fn with_dependencies(
@@ -116,6 +164,7 @@ impl ClaudeCodeAdapter {
             hook: None,
             messenger: None,
             spawner: Arc::new(crate::process::TokioProcessSpawner),
+            transcript_fs: Arc::new(ClaudeTranscriptFileSystem),
         }
     }
     pub fn capabilities_static() -> Capabilities {
@@ -138,6 +187,10 @@ impl ClaudeCodeAdapter {
         self.hook = Some(hook);
         self.messenger = Some(messenger);
         self.spawner = spawner;
+        self
+    }
+    pub fn with_transcript_fs(mut self, fs: Arc<dyn TranscriptFileSystem>) -> Self {
+        self.transcript_fs = fs;
         self
     }
     async fn fetch_live(&self) -> AdapterResult<UsageSample> {
@@ -315,6 +368,17 @@ impl HarnessAdapter for ClaudeCodeAdapter {
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         ))
     }
+
+    async fn export_transcript(&self, session: &SessionSummary) -> AdapterResult<String> {
+        let mut matching = Vec::new();
+        for path in self.transcript_fs.jsonl_files().await? {
+            let content = self.transcript_fs.read_to_string(&path).await?;
+            if path.contains(&session.id.0) || content.contains(&session.id.0) {
+                matching.push(content);
+            }
+        }
+        Ok(filter_keepalive_transcript(&matching.join("\n")))
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -322,6 +386,14 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use std::sync::{Arc, Mutex};
     use uw_core::adapter::{Capabilities, HarnessAdapter};
+
+    #[test]
+    fn transcript_export_filter_removes_keepalive_turns() {
+        let result = filter_keepalive_transcript(
+            "goal\n[[uw-keepalive]] no action needed, acknowledge briefly\nnext step",
+        );
+        assert_eq!(result, "goal\nnext step");
+    }
 
     #[test]
     fn capabilities_match_claude_contract() {

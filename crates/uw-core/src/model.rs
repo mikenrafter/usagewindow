@@ -235,6 +235,24 @@ pub struct KeepaliveConfig {
     pub enabled: bool,
     pub daily_cap: u32,
 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeepaliveState {
+    pub session_id: SessionId,
+    pub enabled: bool,
+    pub last_ping_at: Option<DateTime<Utc>>,
+    pub ping_day: Option<String>,
+    pub ping_count: u32,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReseedSummary {
+    pub id: Uuid,
+    pub session_id: SessionId,
+    pub source_model: ModelId,
+    pub summary_text: String,
+    pub token_count_before: u64,
+    pub token_count_after: u64,
+    pub created_at: DateTime<Utc>,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CacheWritePrice {
     pub model_prefix: String,

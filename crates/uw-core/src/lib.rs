@@ -7,4 +7,5 @@
 pub mod adapter;
 pub mod api;
 pub mod model;
+pub mod summarizer;
 pub mod threshold;

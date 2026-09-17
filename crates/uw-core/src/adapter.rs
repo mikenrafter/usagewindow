@@ -84,6 +84,11 @@ pub trait HarnessAdapter: Send + Sync {
         req: &CompactionRequest,
     ) -> AdapterResult<DeliveryOutcome>;
     async fn resume_session(&self, session: &SessionSummary) -> AdapterResult<()>;
+    /// Export a read-only transcript. Implementations may support this even when the
+    /// harness session is stopped; adapters must omit usagewindow keepalive turns.
+    async fn export_transcript(&self, _session: &SessionSummary) -> AdapterResult<String> {
+        Err(AdapterError::Unsupported)
+    }
     async fn seed_new_session(
         &self,
         mode: SeedMode,
