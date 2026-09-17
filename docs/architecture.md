@@ -268,19 +268,19 @@ an explicit "not supported for this harness" result, not a silently-dropped requ
   stable UUID, confirmed unchanged across resume/fork. No `SessionId`-stability caveat
   needed for Codex (unlike Claude Code, see above).
 
-### Hook ingress — a shim, not yet assigned a crate (Phase 4/5 gap, must be decided before either)
+### Hook ingress — `uw-daemon`'s `uw-hook` shim
 
 Both harnesses deliver context only by executing a configured hook command and reading
 its stdout/JSON — there is no long-lived "push" channel from a running session to
 `uw-daemon`. This means Phase 4/5 need a small hook-shim binary (harness-invoked,
 short-lived, one process per hook firing) that parses the harness's hook payload and
 either serves it locally (fail-open, hard-timeout — a daemon that's down must never stall
-a user's turn) or forwards to `uw-daemon` over the same local socket the CLI uses. Decide
-in Phase 4 whether this lives as a `[[bin]]` in `uw-adapters` (parsing logic already lives
-there) or a new `uw-hook` crate; `uw-cli` does NOT currently depend on `uw-adapters`, so
-if the shim needs adapter-level parsing, either add that dependency or give it its own
-crate. Installation/trust is a separate, real step for Phase 9 (or earlier, whenever
-hooks first need to be live for manual testing): Claude Code needs a `~/.claude/settings.json`
+a user's turn) or forwards to `uw-daemon` over the same local socket the CLI uses. The
+phase-5 implementation lives as a `[[bin]]` in `uw-daemon` because it already depends on
+`uw-adapters`; it logs JSON and returns a bounded-timeout fail-open response, with
+event-specific routing deferred to a later phase. Installation/trust is a separate, real
+step for Phase 9 (or earlier, whenever hooks first need to be live for manual testing):
+Claude Code needs a `~/.claude/settings.json`
 hooks entry per the `paseo-smart-session` reconciler pattern (own only what you installed,
 never touch unrelated entries); Codex requires each hook definition to be trust-hashed in
 `~/.codex/config.toml`'s `[hooks.state]` before it runs at all (`--dangerously-bypass-hook-trust`

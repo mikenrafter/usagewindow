@@ -1,6 +1,7 @@
 //! Pure threshold and trigger logic for usage-window policies.
 
 use chrono::{DateTime, Duration, Utc};
+use std::collections::BTreeMap;
 use uw_core::adapter::Capabilities;
 use uw_core::model::{
     AccountId, IdleCompactConfig, ReseedAutoConfig, Severity, ThresholdProfile, UsageSample,
@@ -8,6 +9,70 @@ use uw_core::model::{
 };
 
 const ROLLOVER_TOLERANCE: Duration = Duration::minutes(2);
+const CACHE_WRITE_MIN_PCT: f32 = 0.1;
+const CACHE_WRITE_MAX_PCT: f32 = 20.0;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CacheCostObservation {
+    pub at: DateTime<Utc>,
+    pub plan_pct_delta: f32,
+    pub usd_delta: f64,
+}
+
+/// Returns the price for the longest model prefix, if the table has a match.
+pub fn cache_write_price_for_model(model: &str, profile: &ThresholdProfile) -> Option<f64> {
+    profile
+        .cache_write_price_table
+        .iter()
+        .filter(|price| model.starts_with(&price.model_prefix))
+        .max_by_key(|price| price.model_prefix.len())
+        .map(|price| price.usd_per_mtok)
+}
+
+/// Learns dollars per plan-percent from usable hourly buckets. A bucket is usable
+/// only when its aggregate deltas are positive; three buckets are required to avoid
+/// making a pricing decision from a single noisy observation.
+pub fn learned_usd_per_plan_percent(history: &[CacheCostObservation]) -> Option<f64> {
+    let mut buckets: BTreeMap<i64, (f32, f64)> = BTreeMap::new();
+    for observation in history {
+        if observation.plan_pct_delta > 0.0 && observation.usd_delta > 0.0 {
+            let hour = observation.at.timestamp().div_euclid(3600);
+            let entry = buckets.entry(hour).or_default();
+            entry.0 += observation.plan_pct_delta;
+            entry.1 += observation.usd_delta;
+        }
+    }
+    let usable: Vec<(f32, f64)> = buckets
+        .into_values()
+        .filter(|(pct, usd)| *pct > 0.0 && *usd > 0.0)
+        .collect();
+    if usable.len() < 3 {
+        return None;
+    }
+    let pct: f32 = usable.iter().map(|(pct, _)| *pct).sum();
+    let usd: f64 = usable.iter().map(|(_, usd)| *usd).sum();
+    (pct > 0.0).then_some(usd / f64::from(pct))
+}
+
+/// Estimates the quota percentage consumed by writing `tokens` into the cache.
+/// The learned historical ratio is preferred; the configured flat percentage is
+/// the fallback when history is insufficient or pricing is unavailable.
+pub fn estimate_cache_write_pct(
+    tokens: u64,
+    model: &str,
+    profile: &ThresholdProfile,
+    history: &[CacheCostObservation],
+) -> f32 {
+    let fallback = profile.cache_write_fallback_pct;
+    let Some(price) = cache_write_price_for_model(model, profile) else {
+        return fallback.clamp(CACHE_WRITE_MIN_PCT, CACHE_WRITE_MAX_PCT);
+    };
+    let Some(usd_per_pct) = learned_usd_per_plan_percent(history) else {
+        return fallback.clamp(CACHE_WRITE_MIN_PCT, CACHE_WRITE_MAX_PCT);
+    };
+    let estimate = (tokens as f64 / 1_000_000.0) * price / usd_per_pct;
+    (estimate as f32).clamp(CACHE_WRITE_MIN_PCT, CACHE_WRITE_MAX_PCT)
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowBlock {
@@ -239,6 +304,71 @@ mod tests {
     use chrono::TimeZone;
     use std::collections::HashMap;
     use uw_core::model::{Provider, TokenTier, UsageSource, UsageWindowState, WindowKind};
+
+    #[test]
+    fn cache_cost_falls_back_with_fewer_than_three_buckets() {
+        let profile = ThresholdProfile {
+            cache_write_fallback_pct: 1.25,
+            cache_write_price_table: vec![uw_core::model::CacheWritePrice {
+                model_prefix: "claude".into(),
+                usd_per_mtok: 3.0,
+            }],
+            ..Default::default()
+        };
+        let history = vec![CacheCostObservation {
+            at: at(0),
+            plan_pct_delta: 1.0,
+            usd_delta: 0.5,
+        }];
+        assert_eq!(
+            estimate_cache_write_pct(1_000_000, "claude-sonnet", &profile, &history),
+            1.25
+        );
+    }
+
+    #[test]
+    fn cache_cost_learns_ratio_across_three_hour_buckets() {
+        let profile = ThresholdProfile {
+            cache_write_price_table: vec![uw_core::model::CacheWritePrice {
+                model_prefix: "claude".into(),
+                usd_per_mtok: 3.0,
+            }],
+            ..Default::default()
+        };
+        let history = (0..3)
+            .map(|hour| CacheCostObservation {
+                at: at(hour * 60),
+                plan_pct_delta: 2.0,
+                usd_delta: 1.0,
+            })
+            .collect::<Vec<_>>();
+        // $3 / ($1 / 2 plan-percent) = 6 plan-percent.
+        assert_eq!(
+            estimate_cache_write_pct(1_000_000, "claude-sonnet", &profile, &history),
+            6.0
+        );
+    }
+
+    #[test]
+    fn cache_cost_uses_the_longest_matching_model_prefix() {
+        let profile = ThresholdProfile {
+            cache_write_price_table: vec![
+                uw_core::model::CacheWritePrice {
+                    model_prefix: "claude".into(),
+                    usd_per_mtok: 1.0,
+                },
+                uw_core::model::CacheWritePrice {
+                    model_prefix: "claude-sonnet-4-6".into(),
+                    usd_per_mtok: 4.0,
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            cache_write_price_for_model("claude-sonnet-4-6", &profile),
+            Some(4.0)
+        );
+    }
 
     fn key() -> WindowKey {
         WindowKey {
