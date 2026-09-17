@@ -1,6 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::str::FromStr;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -10,6 +11,37 @@ pub enum Provider {
     Cursor,
     Gemini,
     Other(String),
+}
+impl FromStr for Provider {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value {
+            "claude-code" | "ClaudeCode" => Self::ClaudeCode,
+            "codex" | "Codex" => Self::Codex,
+            "cursor" | "Cursor" => Self::Cursor,
+            "gemini" | "Gemini" => Self::Gemini,
+            other if !other.is_empty() => Self::Other(other.into()),
+            _ => return Err("provider cannot be empty".into()),
+        })
+    }
+}
+impl FromStr for ModelId {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(value.into()))
+    }
+}
+impl FromStr for AccountId {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(value.into()))
+    }
+}
+impl FromStr for SessionId {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(value.into()))
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModelId(pub String);

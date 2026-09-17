@@ -5,5 +5,6 @@
 //! adapter code or a storage backend. See docs/architecture.md.
 
 pub mod adapter;
+pub mod api;
 pub mod model;
 pub mod threshold;

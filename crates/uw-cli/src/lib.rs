@@ -1,0 +1,627 @@
+use anyhow::{Result, anyhow};
+use chrono::{DateTime, Utc};
+use clap::{Args, Parser, Subcommand};
+use std::collections::BTreeMap;
+use uw_core::{api::*, model::*};
+use uw_store::Store;
+
+#[derive(Debug, Parser)]
+#[command(name = "uw", version, about = "usagewindow command line client")]
+pub struct Cli {
+    #[arg(long, global = true)]
+    pub json: bool,
+    #[command(subcommand)]
+    pub command: Command,
+}
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    Status(StatusArgs),
+    Sessions {
+        #[command(subcommand)]
+        command: SessionsCommand,
+    },
+    Resume {
+        session_id: Option<SessionId>,
+        #[arg(long)]
+        at: Option<DateTime<Utc>>,
+        #[command(subcommand)]
+        command: Option<ResumeCommand>,
+    },
+    Compact {
+        #[command(subcommand)]
+        command: CompactCommand,
+    },
+    Reseed(ReseedArgs),
+    Keepalive {
+        #[command(subcommand)]
+        command: KeepaliveCommand,
+    },
+    Thresholds {
+        #[command(subcommand)]
+        command: ThresholdCommand,
+    },
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
+}
+#[derive(Debug, Args, Default, Clone)]
+pub struct StatusArgs {
+    #[arg(long)]
+    pub provider: Option<Provider>,
+    #[arg(long)]
+    pub model: Option<ModelId>,
+    #[arg(long)]
+    pub account: Option<AccountId>,
+}
+#[derive(Debug, Subcommand)]
+pub enum SessionsCommand {
+    List {
+        #[arg(long)]
+        stopped: bool,
+        #[arg(long)]
+        harness: Option<Provider>,
+    },
+    Show {
+        session_id: SessionId,
+    },
+}
+#[derive(Debug, Subcommand)]
+pub enum ResumeCommand {
+    Cancel { session_id: SessionId },
+}
+#[derive(Debug, Subcommand)]
+pub enum CompactCommand {
+    Ask {
+        session_id: SessionId,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    Status {
+        session_id: SessionId,
+    },
+}
+#[derive(Debug, Args)]
+pub struct ReseedArgs {
+    pub session_id: SessionId,
+    #[arg(long)]
+    pub model: ModelId,
+    #[arg(long)]
+    pub dry_run: bool,
+}
+#[derive(Debug, Subcommand)]
+pub enum KeepaliveCommand {
+    Enable { session_id: SessionId },
+    Disable { session_id: SessionId },
+}
+#[derive(Debug, Subcommand)]
+pub enum ThresholdCommand {
+    Get {
+        #[arg(long)]
+        scope: Option<String>,
+    },
+    Set {
+        scope: String,
+        field: String,
+        value: String,
+    },
+}
+#[derive(Debug, Subcommand)]
+pub enum DaemonCommand {
+    Status,
+    Run,
+}
+
+pub trait ApiClient {
+    fn status(&mut self, args: &StatusArgs) -> Result<StatusResponse>;
+    fn sessions_list(
+        &mut self,
+        stopped: bool,
+        harness: Option<&Provider>,
+    ) -> Result<Vec<SessionListItem>>;
+    fn sessions_show(&mut self, id: &SessionId) -> Result<SessionDetail>;
+    fn resume(&mut self, request: ResumeRequest) -> Result<ResumeResponse>;
+    fn cancel_resume(&mut self, request: CancelResumeRequest) -> Result<()>;
+    fn compact_ask(&mut self, request: CompactAskRequest) -> Result<CompactStatusResponse>;
+    fn compact_status(&mut self, id: &SessionId) -> Result<CompactStatusResponse>;
+    fn reseed(
+        &mut self,
+        id: &SessionId,
+        model: &ModelId,
+        dry_run: bool,
+    ) -> Result<serde_json::Value>;
+    fn keepalive(&mut self, id: &SessionId, enabled: bool) -> Result<serde_json::Value>;
+    fn thresholds_get(&mut self, request: ThresholdGetRequest) -> Result<ThresholdResponse>;
+    fn thresholds_set(&mut self, request: ThresholdSetRequest) -> Result<ThresholdResponse>;
+    fn daemon_status(&mut self) -> Result<serde_json::Value>;
+    fn daemon_run(&mut self) -> Result<serde_json::Value>;
+}
+
+pub trait DirectReader {
+    fn status(&mut self, args: &StatusArgs) -> Result<StatusResponse>;
+    fn sessions_list(
+        &mut self,
+        stopped: bool,
+        harness: Option<&Provider>,
+    ) -> Result<Vec<SessionListItem>>;
+    fn sessions_show(&mut self, id: &SessionId) -> Result<SessionDetail>;
+    fn thresholds_get(&mut self, request: ThresholdGetRequest) -> Result<ThresholdResponse>;
+}
+
+/// Read operations use the daemon first and fall back only on an unreachable/read error.
+/// Writes never fall back: the daemon is the owner of destructive state transitions.
+pub struct ReadFallback<A, D> {
+    pub api: A,
+    pub direct: D,
+}
+impl<A, D> ReadFallback<A, D>
+where
+    A: ApiClient,
+    D: DirectReader,
+{
+    pub fn status(&mut self, args: &StatusArgs) -> Result<StatusResponse> {
+        self.api.status(args).or_else(|_| self.direct.status(args))
+    }
+    pub fn sessions_list(
+        &mut self,
+        stopped: bool,
+        harness: Option<&Provider>,
+    ) -> Result<Vec<SessionListItem>> {
+        self.api
+            .sessions_list(stopped, harness)
+            .or_else(|_| self.direct.sessions_list(stopped, harness))
+    }
+    pub fn sessions_show(&mut self, id: &SessionId) -> Result<SessionDetail> {
+        self.api
+            .sessions_show(id)
+            .or_else(|_| self.direct.sessions_show(id))
+    }
+    pub fn thresholds_get(&mut self, req: ThresholdGetRequest) -> Result<ThresholdResponse> {
+        self.api
+            .thresholds_get(req.clone())
+            .or_else(|_| self.direct.thresholds_get(req))
+    }
+}
+
+pub fn execute<A: ApiClient, D: DirectReader>(
+    cli: Cli,
+    mut client: ReadFallback<A, D>,
+) -> Result<String> {
+    let json = cli.json;
+    let value = match cli.command {
+        Command::Status(args) => serde_json::to_value(client.status(&args)?)?,
+        Command::Sessions {
+            command: SessionsCommand::List { stopped, harness },
+        } => serde_json::to_value(client.sessions_list(stopped, harness.as_ref())?)?,
+        Command::Sessions {
+            command: SessionsCommand::Show { session_id },
+        } => serde_json::to_value(client.sessions_show(&session_id)?)?,
+        Command::Resume {
+            session_id: Some(session_id),
+            at,
+            command: None,
+        } => serde_json::to_value(client.api.resume(ResumeRequest { session_id, at })?)?,
+        Command::Resume {
+            command: Some(ResumeCommand::Cancel { session_id }),
+            ..
+        } => {
+            client
+                .api
+                .cancel_resume(CancelResumeRequest { session_id })?;
+            serde_json::json!({"ok":true})
+        }
+        Command::Resume { .. } => {
+            return Err(anyhow!(
+                "resume requires a session id or `cancel <session-id>`"
+            ));
+        }
+        Command::Compact {
+            command: CompactCommand::Ask { session_id, reason },
+        } => serde_json::to_value(
+            client
+                .api
+                .compact_ask(CompactAskRequest { session_id, reason })?,
+        )?,
+        Command::Compact {
+            command: CompactCommand::Status { session_id },
+        } => serde_json::to_value(client.api.compact_status(&session_id)?)?,
+        Command::Reseed(ReseedArgs {
+            session_id,
+            model,
+            dry_run,
+        }) => client.api.reseed(&session_id, &model, dry_run)?,
+        Command::Keepalive {
+            command: KeepaliveCommand::Enable { session_id },
+        } => client.api.keepalive(&session_id, true)?,
+        Command::Keepalive {
+            command: KeepaliveCommand::Disable { session_id },
+        } => client.api.keepalive(&session_id, false)?,
+        Command::Thresholds {
+            command: ThresholdCommand::Get { scope },
+        } => serde_json::to_value(client.thresholds_get(ThresholdGetRequest {
+            scope: parse_scope(scope.as_deref())?,
+        })?)?,
+        Command::Thresholds {
+            command:
+                ThresholdCommand::Set {
+                    scope,
+                    field,
+                    value,
+                },
+        } => serde_json::to_value(client.api.thresholds_set(ThresholdSetRequest {
+            scope: parse_scope(Some(&scope))?.ok_or_else(|| anyhow!("scope is required"))?,
+            field,
+            value,
+        })?)?,
+        Command::Daemon {
+            command: DaemonCommand::Status,
+        } => client.api.daemon_status()?,
+        Command::Daemon {
+            command: DaemonCommand::Run,
+        } => client.api.daemon_run()?,
+    };
+    if json {
+        Ok(serde_json::to_string_pretty(&value)?)
+    } else {
+        Ok(human(&value))
+    }
+}
+
+fn parse_scope(value: Option<&str>) -> Result<Option<ThresholdScope>> {
+    let Some(value) = value else { return Ok(None) };
+    let mut parts = value.split(':');
+    let provider = match parts.next().unwrap_or_default() {
+        "claude-code" => Provider::ClaudeCode,
+        "codex" => Provider::Codex,
+        "cursor" => Provider::Cursor,
+        "gemini" => Provider::Gemini,
+        other if !other.is_empty() => Provider::Other(other.into()),
+        _ => return Err(anyhow!("invalid threshold scope")),
+    };
+    let model = parts
+        .next()
+        .filter(|x| !x.is_empty())
+        .map(|x| ModelId(x.into()));
+    let session = parts
+        .next()
+        .filter(|x| !x.is_empty())
+        .map(|x| SessionId(x.into()));
+    Ok(Some(ThresholdScope {
+        provider,
+        model,
+        session,
+    }))
+}
+fn human(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Array(items) => items.iter().map(human).collect::<Vec<_>>().join("\n"),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| format!("{k}: {}", human(v)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        serde_json::Value::Null => "-".into(),
+        _ => value.to_string().trim_matches('"').into(),
+    }
+}
+
+/// Phase 7 will replace this with the local HTTP transport. Keeping it typed to the
+/// DTO/client seam prevents Phase 6 from inventing a wire format the server must copy.
+pub struct HttpApiClient;
+impl ApiClient for HttpApiClient {
+    fn status(&mut self, _: &StatusArgs) -> Result<StatusResponse> {
+        Err(anyhow!(
+            "daemon HTTP API is not available until uw-web Phase 7"
+        ))
+    }
+    fn sessions_list(&mut self, _: bool, _: Option<&Provider>) -> Result<Vec<SessionListItem>> {
+        Err(anyhow!(
+            "daemon HTTP API is not available until uw-web Phase 7"
+        ))
+    }
+    fn sessions_show(&mut self, _: &SessionId) -> Result<SessionDetail> {
+        Err(anyhow!(
+            "daemon HTTP API is not available until uw-web Phase 7"
+        ))
+    }
+    fn resume(&mut self, _: ResumeRequest) -> Result<ResumeResponse> {
+        Err(anyhow!(
+            "daemon HTTP API is not available until uw-web Phase 7"
+        ))
+    }
+    fn cancel_resume(&mut self, _: CancelResumeRequest) -> Result<()> {
+        Err(anyhow!(
+            "daemon HTTP API is not available until uw-web Phase 7"
+        ))
+    }
+    fn compact_ask(&mut self, _: CompactAskRequest) -> Result<CompactStatusResponse> {
+        Err(anyhow!(
+            "daemon HTTP API is not available until uw-web Phase 7"
+        ))
+    }
+    fn compact_status(&mut self, _: &SessionId) -> Result<CompactStatusResponse> {
+        Err(anyhow!(
+            "daemon HTTP API is not available until uw-web Phase 7"
+        ))
+    }
+    fn reseed(&mut self, _: &SessionId, _: &ModelId, _: bool) -> Result<serde_json::Value> {
+        Err(anyhow!("reseed is a Phase 8 operation"))
+    }
+    fn keepalive(&mut self, _: &SessionId, _: bool) -> Result<serde_json::Value> {
+        Err(anyhow!("keepalive is a Phase 8 operation"))
+    }
+    fn thresholds_get(&mut self, _: ThresholdGetRequest) -> Result<ThresholdResponse> {
+        Err(anyhow!(
+            "daemon HTTP API is not available until uw-web Phase 7"
+        ))
+    }
+    fn thresholds_set(&mut self, _: ThresholdSetRequest) -> Result<ThresholdResponse> {
+        Err(anyhow!(
+            "daemon HTTP API is not available until uw-web Phase 7"
+        ))
+    }
+    fn daemon_status(&mut self) -> Result<serde_json::Value> {
+        Err(anyhow!(
+            "daemon HTTP API is not available until uw-web Phase 7"
+        ))
+    }
+    fn daemon_run(&mut self) -> Result<serde_json::Value> {
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(uw_daemon::run_daemon_loop())?;
+        Ok(serde_json::json!({"ok": true}))
+    }
+}
+
+pub struct StoreReader {
+    store: Store,
+}
+impl StoreReader {
+    pub fn open(path: &str) -> Result<Self> {
+        Ok(Self {
+            store: Store::open(path)?,
+        })
+    }
+}
+impl DirectReader for StoreReader {
+    fn status(&mut self, args: &StatusArgs) -> Result<StatusResponse> {
+        let samples = self.store.all_usage_samples()?;
+        let mut latest: BTreeMap<String, UsageSample> = BTreeMap::new();
+        for mut s in samples {
+            if args.provider.as_ref().is_some_and(|p| p != &s.provider)
+                || args
+                    .account
+                    .as_ref()
+                    .is_some_and(|a| Some(a) != s.account.as_ref())
+            {
+                continue;
+            }
+            if let Some(model) = args.model.as_ref() {
+                s.windows.retain(|key, _| matches!(&key.kind, WindowKind::WeeklyModel(candidate) if candidate == model));
+                if s.windows.is_empty() {
+                    continue;
+                }
+            }
+            let key = format!("{:?}:{:?}", s.provider, s.account);
+            if latest.get(&key).is_none_or(|old| old.at < s.at) {
+                latest.insert(key, s);
+            }
+        }
+        let usage = latest
+            .into_values()
+            .map(|s| {
+                let provider = s.provider;
+                let account = s.account;
+                let windows = s
+                    .windows
+                    .into_iter()
+                    .map(|(key, w)| UsageWindowSummary {
+                        window: key.kind,
+                        pct: w.pct,
+                        resets_at: w.resets_at,
+                        exceeded: w.exceeded,
+                    })
+                    .collect();
+                ProviderUsageSummary {
+                    provider,
+                    account,
+                    windows,
+                }
+            })
+            .collect();
+        Ok(StatusResponse {
+            usage,
+            last_updated: Utc::now(),
+        })
+    }
+    fn sessions_list(
+        &mut self,
+        stopped: bool,
+        harness: Option<&Provider>,
+    ) -> Result<Vec<SessionListItem>> {
+        Ok(self
+            .store
+            .list_sessions()?
+            .into_iter()
+            .filter(|s| {
+                harness.is_none_or(|h| h == &s.harness) && (stopped || s.stopped_reason.is_none())
+            })
+            .map(|s| SessionListItem {
+                id: s.id,
+                harness: s.harness,
+                model: s.model,
+                account: s.account,
+                last_seen: s.last_seen,
+                stopped_reason: s.stopped_reason,
+                resume_status: s.resume_marker.map(|m| m.status),
+            })
+            .collect())
+    }
+    fn sessions_show(&mut self, id: &SessionId) -> Result<SessionDetail> {
+        let summary = self.store.read_session(id)?;
+        let markers = self.store.resume_markers_for_session(id)?;
+        let marker = markers.last().cloned();
+        let history = self
+            .store
+            .all_usage_samples()?
+            .into_iter()
+            .filter(|s| s.provider == summary.harness && s.account == summary.account)
+            .flat_map(|s| {
+                s.windows.into_values().map(move |w| SparklinePoint {
+                    at: s.at,
+                    pct: w.pct,
+                })
+            })
+            .collect();
+        Ok(SessionDetail {
+            summary,
+            history,
+            resume_controls: ResumeControls {
+                can_resume: marker.is_some(),
+                marker,
+            },
+            compaction_log: self.store.compaction_requests_for_session(id)?,
+            reseed_lineage: vec![],
+        })
+    }
+    fn thresholds_get(&mut self, request: ThresholdGetRequest) -> Result<ThresholdResponse> {
+        Ok(ThresholdResponse {
+            scope: request.scope,
+            values: BTreeMap::new(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct Fake {
+        calls: Vec<String>,
+        fail_reads: bool,
+    }
+    impl Fake {
+        fn new(fail_reads: bool) -> Self {
+            Self {
+                calls: vec![],
+                fail_reads,
+            }
+        }
+    }
+    impl ApiClient for Fake {
+        fn status(&mut self, _: &StatusArgs) -> Result<StatusResponse> {
+            self.calls.push("status".into());
+            if self.fail_reads {
+                Err(anyhow!("down"))
+            } else {
+                Ok(StatusResponse {
+                    usage: vec![],
+                    last_updated: Utc::now(),
+                })
+            }
+        }
+        fn sessions_list(&mut self, _: bool, _: Option<&Provider>) -> Result<Vec<SessionListItem>> {
+            self.calls.push("list".into());
+            Err(anyhow!("down"))
+        }
+        fn sessions_show(&mut self, _: &SessionId) -> Result<SessionDetail> {
+            self.calls.push("show".into());
+            Err(anyhow!("down"))
+        }
+        fn resume(&mut self, r: ResumeRequest) -> Result<ResumeResponse> {
+            self.calls.push(format!("resume:{}", r.session_id.0));
+            Ok(ResumeResponse { marker: None })
+        }
+        fn cancel_resume(&mut self, r: CancelResumeRequest) -> Result<()> {
+            self.calls.push(format!("cancel:{}", r.session_id.0));
+            Ok(())
+        }
+        fn compact_ask(&mut self, r: CompactAskRequest) -> Result<CompactStatusResponse> {
+            self.calls.push(format!("ask:{}", r.session_id.0));
+            Ok(CompactStatusResponse { requests: vec![] })
+        }
+        fn compact_status(&mut self, _: &SessionId) -> Result<CompactStatusResponse> {
+            Ok(CompactStatusResponse { requests: vec![] })
+        }
+        fn reseed(&mut self, _: &SessionId, _: &ModelId, _: bool) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+        fn keepalive(&mut self, _: &SessionId, _: bool) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+        fn thresholds_get(&mut self, _: ThresholdGetRequest) -> Result<ThresholdResponse> {
+            Err(anyhow!("down"))
+        }
+        fn thresholds_set(&mut self, _: ThresholdSetRequest) -> Result<ThresholdResponse> {
+            Ok(ThresholdResponse {
+                scope: None,
+                values: BTreeMap::new(),
+            })
+        }
+        fn daemon_status(&mut self) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+        fn daemon_run(&mut self) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+    }
+    struct Direct;
+    impl DirectReader for Direct {
+        fn status(&mut self, _: &StatusArgs) -> Result<StatusResponse> {
+            Ok(StatusResponse {
+                usage: vec![],
+                last_updated: Utc::now(),
+            })
+        }
+        fn sessions_list(&mut self, _: bool, _: Option<&Provider>) -> Result<Vec<SessionListItem>> {
+            Ok(vec![])
+        }
+        fn sessions_show(&mut self, _: &SessionId) -> Result<SessionDetail> {
+            Err(anyhow!("no"))
+        }
+        fn thresholds_get(&mut self, r: ThresholdGetRequest) -> Result<ThresholdResponse> {
+            Ok(ThresholdResponse {
+                scope: r.scope,
+                values: BTreeMap::new(),
+            })
+        }
+    }
+    #[test]
+    fn reachable_read_uses_api() {
+        let mut f = ReadFallback {
+            api: Fake::new(false),
+            direct: Direct,
+        };
+        let _ = f.status(&StatusArgs::default()).unwrap();
+        assert_eq!(f.api.calls, vec!["status"]);
+    }
+    #[test]
+    fn failed_read_uses_direct_fallback() {
+        let mut f = ReadFallback {
+            api: Fake::new(true),
+            direct: Direct,
+        };
+        f.status(&StatusArgs::default()).unwrap();
+        assert_eq!(f.api.calls, vec!["status"]);
+    }
+    #[test]
+    fn clap_parses_documented_command_shapes() {
+        assert!(
+            matches!(Cli::try_parse_from(["uw", "resume", "s", "--at", "2026-01-01T00:00:00Z"]), Ok(Cli { command: Command::Resume { session_id: Some(SessionId(id)), command: None, .. }, .. }) if id == "s")
+        );
+        assert!(Cli::try_parse_from(["uw", "resume", "cancel", "s", "--json"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["uw", "compact", "ask", "s", "--reason", "why", "--json"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "uw",
+                "thresholds",
+                "set",
+                "codex",
+                "closing_pct",
+                "85",
+                "--json"
+            ])
+            .is_ok()
+        );
+    }
+}

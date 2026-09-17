@@ -401,6 +401,17 @@ pub async fn run_polling_loop(
     }
 }
 
+/// Entry point shared by the daemon binary and the Phase 6 CLI command. Service
+/// configuration (SQLite path and adapter registry) is intentionally still a later
+/// wiring concern; this preserves the same cadence/ownership point for Phase 7.
+pub async fn run_daemon_loop() -> anyhow::Result<()> {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+    loop {
+        ticker.tick().await;
+        tracing::debug!("uw-daemon poll tick");
+    }
+}
+
 /// Hook ingress is intentionally fail-open. The backend is a future routing seam;
 /// TODO Phase-6: match harness-specific event names to daemon actions.
 pub async fn handle_hook<R, F, Fut>(input: R, backend: F) -> serde_json::Value

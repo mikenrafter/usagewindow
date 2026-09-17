@@ -22,6 +22,7 @@ uw-core = { path = "crates/uw-core" }
 uw-adapters = { path = "crates/uw-adapters" }
 uw-policy = { path = "crates/uw-policy" }
 uw-store = { path = "crates/uw-store" }
+uw-daemon = { path = "crates/uw-daemon" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -32,6 +33,7 @@ async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
+clap = { version = "4", features = ["derive"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

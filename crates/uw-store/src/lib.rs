@@ -113,6 +113,77 @@ impl Store {
             reseeded_from: r.14.map(SessionId),
         })
     }
+    pub fn list_sessions(&self) -> StoreResult<Vec<SessionSummary>> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT id FROM sessions ORDER BY last_seen DESC, id")?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| self.read_session(&SessionId(id)))
+            .collect()
+    }
+    pub fn resume_markers_for_session(&self, id: &SessionId) -> StoreResult<Vec<ResumeMarker>> {
+        let mut stmt = self.connection.prepare("SELECT id,session_id,reason,resume_at,created_at,status,status_detail FROM resume_markers WHERE session_id=? ORDER BY created_at,id")?;
+        let rows = stmt.query_map([id.0.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, session_id, reason, resume_at, created_at, status, detail) = row?;
+            Ok(ResumeMarker {
+                id: uuid::Uuid::parse_str(&id)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                session_id: SessionId(session_id),
+                reason: serde_json::from_str(&reason)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                resume_at,
+                created_at,
+                status: decode_resume_status(&status, detail),
+            })
+        })
+        .collect()
+    }
+    pub fn compaction_requests_for_session(
+        &self,
+        id: &SessionId,
+    ) -> StoreResult<Vec<CompactionRequest>> {
+        let mut stmt = self.connection.prepare("SELECT id,session_id,kind,prompt,reason,status,created_at FROM compaction_requests WHERE session_id=? ORDER BY created_at,id")?;
+        let rows = stmt.query_map([id.0.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get(6)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, session_id, kind, prompt, reason, status, created_at) = row?;
+            Ok(CompactionRequest {
+                id: uuid::Uuid::parse_str(&id)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                session_id: SessionId(session_id),
+                kind: serde_json::from_str(&kind)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                prompt,
+                reason,
+                status: decode_compaction_status(&status, None),
+                created_at,
+            })
+        })
+        .collect()
+    }
     pub fn due_resume_markers(&self, now: DateTime<Utc>) -> StoreResult<Vec<ResumeMarker>> {
         let mut stmt = self.connection.prepare("SELECT id,session_id,reason,resume_at,created_at,status,status_detail FROM resume_markers WHERE status IN ('pending','scheduled') AND resume_at IS NOT NULL AND resume_at<=? ORDER BY resume_at,id")?;
         let rows = stmt.query_map([now], |row| {
@@ -172,7 +243,7 @@ impl Store {
     }
     pub fn pending_compaction_requests(&self) -> StoreResult<Vec<CompactionRequest>> {
         let mut statement = self.connection.prepare(
-            "SELECT id,session_id,kind,prompt,reason,status,status_detail,created_at FROM compaction_requests WHERE status='pending' ORDER BY created_at,id",
+            "SELECT id,session_id,kind,prompt,reason,status,created_at FROM compaction_requests WHERE status='pending' ORDER BY created_at,id",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -182,12 +253,11 @@ impl Store {
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get(7)?,
+                row.get(6)?,
             ))
         })?;
         rows.map(|row| {
-            let (id, session_id, kind, prompt, reason, status, detail, created_at) = row?;
+            let (id, session_id, kind, prompt, reason, status, created_at) = row?;
             Ok(CompactionRequest {
                 id: uuid::Uuid::parse_str(&id)
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
@@ -195,7 +265,7 @@ impl Store {
                 kind: serde_json::from_str(&kind)?,
                 prompt,
                 reason,
-                status: decode_compaction_status(&status, detail),
+                status: decode_compaction_status(&status, None),
                 created_at,
             })
         })
@@ -214,13 +284,8 @@ impl Store {
         status: CompactionStatus,
     ) -> StoreResult<()> {
         self.connection.execute(
-            "UPDATE compaction_requests SET status=?,status_detail=?,updated_at=? WHERE id=?",
-            params![
-                compaction_status_name(&status),
-                compaction_status_detail(&status),
-                Utc::now(),
-                id
-            ],
+            "UPDATE compaction_requests SET status=?,updated_at=? WHERE id=?",
+            params![compaction_status_name(&status), Utc::now(), id],
         )?;
         Ok(())
     }
@@ -316,13 +381,6 @@ fn compaction_status_name(s: &CompactionStatus) -> &'static str {
         CompactionStatus::Sent => "sent",
         CompactionStatus::Failed(_) => "failed",
         CompactionStatus::Cancelled => "cancelled",
-    }
-}
-fn compaction_status_detail(s: &CompactionStatus) -> Option<&str> {
-    if let CompactionStatus::Failed(detail) = s {
-        Some(detail)
-    } else {
-        None
     }
 }
 fn decode_compaction_status(status: &str, detail: Option<String>) -> CompactionStatus {
@@ -436,5 +494,14 @@ mod tests {
             })
             .is_err()
         );
+    }
+    #[test]
+    fn read_queries_list_sessions_and_related_records() {
+        let s = Store::open_memory().unwrap();
+        let id = SessionId("query-session".into());
+        s.insert_session(&session(&id)).unwrap();
+        assert_eq!(s.list_sessions().unwrap().len(), 1);
+        assert!(s.resume_markers_for_session(&id).unwrap().is_empty());
+        assert!(s.compaction_requests_for_session(&id).unwrap().is_empty());
     }
 }

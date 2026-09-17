@@ -1,5 +1,19 @@
-//! uw: the CLI, a thin client over uw-daemon's local API. Placeholder — lands in Phase 6.
+use clap::Parser;
+use uw_cli::{Cli, HttpApiClient, ReadFallback, StoreReader, execute};
 
-fn main() {
-    println!("uw: not yet implemented (see docs/architecture.md, Phase 6)");
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let path = std::env::var("UW_DB_PATH").unwrap_or_else(|_| "usagewindow.db".into());
+    let direct = StoreReader::open(&path)?;
+    println!(
+        "{}",
+        execute(
+            cli,
+            ReadFallback {
+                api: HttpApiClient,
+                direct
+            }
+        )?
+    );
+    Ok(())
 }
