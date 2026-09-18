@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use uw_core::adapter::{
     AdapterError, Capabilities, DeliveryOutcome, DiscoveredSession, HarnessAdapter, SeedContext,
-    SeedMode, StatusEvent,
+    SeedMode, StatusEvent, TokenUsageRecord,
 };
 use uw_core::model::*;
 use uw_core::summarizer::{SummarizeTemplate, Summarizer};
@@ -104,6 +104,7 @@ pub trait DaemonStore: Send + Sync {
     ) -> anyhow::Result<()>;
     async fn enqueue_compaction(&self, request: CompactionRequest) -> anyhow::Result<()>;
     async fn usage_samples(&self, session: &SessionSummary) -> anyhow::Result<Vec<UsageSample>>;
+    async fn token_usage(&self, session_id: &SessionId) -> anyhow::Result<Vec<TokenUsageRecord>>;
     async fn active_resume_marker(
         &self,
         session_id: &SessionId,
@@ -289,6 +290,11 @@ impl DaemonStore for SqliteDaemonStore {
         })
         .await
     }
+    async fn token_usage(&self, id: &SessionId) -> anyhow::Result<Vec<TokenUsageRecord>> {
+        let id = id.clone();
+        self.blocking(move |store| Ok(store.token_usage_for_session(&id)?))
+            .await
+    }
     async fn active_resume_marker(
         &self,
         id: &SessionId,
@@ -394,8 +400,8 @@ impl ObservationStore for SqliteDaemonStore {
         now: DateTime<Utc>,
     ) -> anyhow::Result<()> {
         self.blocking(move |store| {
-            Ok(store.upsert_session(&SessionSummary {
-                id: found.id,
+            let session = SessionSummary {
+                id: found.id.clone(),
                 harness: provider,
                 model: found.model,
                 account: None,
@@ -411,7 +417,10 @@ impl ObservationStore for SqliteDaemonStore {
                 resume_marker: None,
                 superseded_by: None,
                 reseeded_from: None,
-            })?)
+            };
+            store.upsert_session(&session)?;
+            store.insert_token_usage_records(&session.id, &found.token_usage)?;
+            Ok(())
         })
         .await
     }
@@ -441,13 +450,12 @@ pub async fn run_observation_tick(
             Ok(found) => {
                 let now = Utc::now();
                 for session in found {
-                    if known.iter().any(|existing| existing.id == session.id) {
-                        continue;
+                    if !known.iter().any(|existing| existing.id == session.id) {
+                        report.sessions_discovered += 1;
                     }
                     store
                         .upsert_discovered_session(adapter.provider(), session, now)
                         .await?;
-                    report.sessions_discovered += 1;
                 }
             }
             Err(AdapterError::Unsupported) => {}
@@ -866,6 +874,25 @@ pub async fn run_policy_tick(
     state: &mut PolicyRuntimeState,
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
+    let mut token_rates = HashMap::new();
+    for session in sessions {
+        let records = store.token_usage(&session.id).await?;
+        let activity_weight = if now - session.last_seen <= Duration::minutes(5) {
+            1.0
+        } else {
+            0.3
+        };
+        if let Some(rate) = uw_policy::weighted_token_rate_per_minute(
+            &records,
+            now,
+            Duration::minutes(30),
+            Duration::minutes(5),
+            1.2,
+            activity_weight,
+        ) {
+            token_rates.insert(session.id.clone(), rate);
+        }
+    }
     for session in sessions {
         let Some(adapter) = adapters.get(&session.harness) else {
             continue;
@@ -919,7 +946,7 @@ pub async fn run_policy_tick(
                         && marker.resume_at.is_none()
                 });
             if stopped_on_this_window || manual_resume_waiting_for_schedule {
-                reconcile_resume_marker(
+                reconcile_resume_marker_with_token_rates(
                     store,
                     session,
                     block,
@@ -927,6 +954,8 @@ pub async fn run_policy_tick(
                     profile,
                     session.model.as_ref().map_or("", |model| model.0.as_str()),
                     &[],
+                    sessions,
+                    &token_rates,
                 )
                 .await?;
             }
@@ -1020,9 +1049,44 @@ pub async fn reconcile_resume_marker(
     model: &str,
     history: &[CacheCostObservation],
 ) -> anyhow::Result<bool> {
+    reconcile_resume_marker_with_token_rates(
+        store,
+        session,
+        block,
+        now,
+        profile,
+        model,
+        history,
+        &[],
+        &HashMap::new(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_resume_marker_with_token_rates(
+    store: &dyn DaemonStore,
+    session: &SessionSummary,
+    block: &WindowBlock,
+    now: DateTime<Utc>,
+    profile: &ThresholdProfile,
+    model: &str,
+    history: &[CacheCostObservation],
+    sessions: &[SessionSummary],
+    token_rates: &HashMap<SessionId, f64>,
+) -> anyhow::Result<bool> {
+    let token_burn_rate = scaled_token_burn_rate(block, session, sessions, token_rates);
     match store.active_resume_marker(&session.id).await? {
         Some(marker) if marker.resume_at.is_none() => {
-            let Some(floor) = resume_floor(session, block, now, profile, model, history) else {
+            let Some(floor) = resume_floor_with_burn(
+                session,
+                block,
+                now,
+                profile,
+                model,
+                history,
+                token_burn_rate,
+            ) else {
                 return Ok(false);
             };
             let resume_at = marker.requested_at.map_or(floor, |requested| requested.max(floor));
@@ -1031,7 +1095,15 @@ pub async fn reconcile_resume_marker(
         }
         Some(_) => Ok(false),
         None => {
-            let Some(marker) = plan_resume_marker(session, block, now, profile, model, history)
+            let Some(marker) = plan_resume_marker_with_burn(
+                session,
+                block,
+                now,
+                profile,
+                model,
+                history,
+                token_burn_rate,
+            )
             else {
                 return Ok(false);
             };
@@ -1039,6 +1111,26 @@ pub async fn reconcile_resume_marker(
             Ok(true)
         }
     }
+}
+
+fn scaled_token_burn_rate(
+    block: &WindowBlock,
+    session: &SessionSummary,
+    sessions: &[SessionSummary],
+    token_rates: &HashMap<SessionId, f64>,
+) -> Option<f64> {
+    let global = uw_policy::burn_rate_pct_per_hour_available(block, Duration::minutes(30))?
+        as f64
+        / 60.0;
+    let target = *token_rates.get(&session.id)?;
+    let total: f64 = sessions
+        .iter()
+        .filter(|other| {
+            other.harness == session.harness && other.account == session.account
+        })
+        .filter_map(|other| token_rates.get(&other.id))
+        .sum();
+    (total > 0.0).then_some(global * target / total)
 }
 impl Default for IdleEpisodeTracker {
     fn default() -> Self {
@@ -1050,6 +1142,7 @@ impl Default for IdleEpisodeTracker {
 /// which remaining window budget, burn rate, and cache-write cost line up, per
 /// `uw_policy::resume_lead_minutes`. This is the invariant floor — nothing may
 /// resume before it, whether auto-detected or manually requested via `--at`.
+#[cfg(test)]
 fn resume_floor(
     session: &SessionSummary,
     block: &WindowBlock,
@@ -1057,6 +1150,18 @@ fn resume_floor(
     profile: &ThresholdProfile,
     model: &str,
     history: &[CacheCostObservation],
+) -> Option<DateTime<Utc>> {
+    resume_floor_with_burn(session, block, now, profile, model, history, None)
+}
+
+fn resume_floor_with_burn(
+    session: &SessionSummary,
+    block: &WindowBlock,
+    now: DateTime<Utc>,
+    profile: &ThresholdProfile,
+    model: &str,
+    history: &[CacheCostObservation],
+    token_burn_rate: Option<f64>,
 ) -> Option<DateTime<Utc>> {
     let (_, pct) = *block.points.last()?;
     let cache_ttl = profile
@@ -1068,31 +1173,35 @@ fn resume_floor(
         return Some(now);
     }
     let lookback_minutes = match block.key.kind {
-        WindowKind::Rolling { minutes } => u64::from(minutes).min(30).max(1),
+        WindowKind::Rolling { minutes } => u64::from(minutes).clamp(1, 30),
         _ => 30,
     };
-    let burn = uw_policy::burn_rate_pct_per_hour(
-        block,
-        Duration::minutes(lookback_minutes as i64),
-    )? / 60.0;
+    let burn = token_burn_rate.unwrap_or_else(|| {
+        uw_policy::burn_rate_pct_per_hour_available(
+            block,
+            Duration::minutes(lookback_minutes as i64),
+        )
+        .unwrap_or_default() as f64
+            / 60.0
+    });
     let cache = uw_policy::estimate_cache_write_pct(
         session.last_known_token_count.unwrap_or_default(),
         model,
         profile,
         history,
     );
-    let remaining = 100.0 - pct;
+    let remaining = 100.0_f64 - f64::from(pct);
     if burn <= 0.0 {
-        return (remaining > cache).then_some(now);
+        return (remaining > f64::from(cache)).then_some(now);
     }
     let horizon_minutes = match block.key.kind {
-        WindowKind::Rolling { minutes } => minutes.min(30) as f32,
+        WindowKind::Rolling { minutes } => f64::from(minutes.min(30)),
         _ => 30.0,
     };
     if remaining / burn >= horizon_minutes {
         return Some(now);
     }
-    let lead = uw_policy::resume_lead_minutes(100.0 - pct, cache, burn, profile)?;
+    let lead = uw_policy::resume_lead_minutes(100.0 - pct, cache, burn as f32, profile)?;
     Some(now + Duration::minutes(lead as i64))
 }
 
@@ -1104,10 +1213,30 @@ pub fn plan_resume_marker(
     model: &str,
     history: &[CacheCostObservation],
 ) -> Option<ResumeMarker> {
+    plan_resume_marker_with_burn(session, block, now, profile, model, history, None)
+}
+
+fn plan_resume_marker_with_burn(
+    session: &SessionSummary,
+    block: &WindowBlock,
+    now: DateTime<Utc>,
+    profile: &ThresholdProfile,
+    model: &str,
+    history: &[CacheCostObservation],
+    token_burn_rate: Option<f64>,
+) -> Option<ResumeMarker> {
     if !matches!(session.stopped_reason, Some(StopReason::UsageLimit { .. })) {
         return None;
     }
-    let resume_at = resume_floor(session, block, now, profile, model, history)?;
+    let resume_at = resume_floor_with_burn(
+        session,
+        block,
+        now,
+        profile,
+        model,
+        history,
+        token_burn_rate,
+    )?;
     Some(ResumeMarker {
         id: uuid::Uuid::new_v4(),
         session_id: session.id.clone(),
@@ -1448,8 +1577,9 @@ mod tests {
         samples: Vec<UsageSample>,
         enqueues: Arc<StdMutex<u32>>,
         active_resume: Option<ResumeMarker>,
-        resolved: Arc<StdMutex<Vec<(uuid::Uuid, DateTime<Utc>)>>>,
+        resolved: ResolvedTimes,
     }
+    type ResolvedTimes = Arc<StdMutex<Vec<(uuid::Uuid, DateTime<Utc>)>>>;
     #[async_trait]
     impl DaemonStore for FakeStore {
         async fn pending_compactions(&self) -> anyhow::Result<Vec<CompactionRequest>> {
@@ -1475,6 +1605,9 @@ mod tests {
         }
         async fn usage_samples(&self, _: &SessionSummary) -> anyhow::Result<Vec<UsageSample>> {
             Ok(self.samples.clone())
+        }
+        async fn token_usage(&self, _: &SessionId) -> anyhow::Result<Vec<TokenUsageRecord>> {
+            Ok(vec![])
         }
         async fn active_resume_marker(
             &self,
@@ -1707,6 +1840,31 @@ mod tests {
         block.point_resets_at = vec![None, None, None];
         assert!(resume_floor(&session, &block, now, &profile, "claude", &[])
             .is_some_and(|at| at > now));
+    }
+
+    #[test]
+    fn token_burn_share_uses_per_chat_work_rates() {
+        let (first, mut block) = near_limit_session_and_block();
+        let now = Utc::now();
+        block.points = vec![(now - Duration::minutes(20), 0.0), (now, 50.0)];
+        block.point_resets_at = vec![None, None];
+        let mut second = session();
+        second.id = SessionId("other".into());
+        let rates = HashMap::from([(first.id.clone(), 2.0), (second.id.clone(), 0.3)]);
+        let scaled = scaled_token_burn_rate(
+            &block,
+            &first,
+            &[first.clone(), second],
+            &rates,
+        )
+        .expect("the block has a usable quota burn rate");
+        let global = uw_policy::burn_rate_pct_per_hour_available(
+            &block,
+            Duration::minutes(30),
+        )
+        .unwrap() as f64
+            / 60.0;
+        assert!((scaled - global * 2.0 / 2.3).abs() < 0.0001);
     }
 
     #[test]
@@ -2264,6 +2422,9 @@ mod tests {
             Ok(())
         }
         async fn usage_samples(&self, _: &SessionSummary) -> anyhow::Result<Vec<UsageSample>> {
+            Ok(vec![])
+        }
+        async fn token_usage(&self, _: &SessionId) -> anyhow::Result<Vec<TokenUsageRecord>> {
             Ok(vec![])
         }
         async fn active_resume_marker(

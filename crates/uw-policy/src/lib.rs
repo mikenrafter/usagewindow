@@ -3,6 +3,7 @@
 use chrono::{DateTime, Duration, Utc};
 use std::collections::BTreeMap;
 use uw_core::adapter::Capabilities;
+use uw_core::adapter::TokenUsageRecord;
 use uw_core::model::{
     AccountId, IdleCompactConfig, ReseedAutoConfig, Severity, ThresholdProfile, UsageSample,
     WindowKey,
@@ -150,6 +151,35 @@ pub fn burn_rate_pct_per_hour(block: &WindowBlock, lookback: Duration) -> Option
         .enumerate()
         .rev()
         .find(|(_, (at, _))| *at <= cutoff)?;
+    burn_rate_between(block, first_index, first_at, first_pct, last_at, last_pct)
+}
+
+/// Computes burn from the available portion of a window when a full lookback
+/// anchor does not exist yet. It still refuses reset-spanning pairs and
+/// zero-length intervals; callers can use this during daemon startup when a
+/// fresh window has only a few minutes of history.
+pub fn burn_rate_pct_per_hour_available(
+    block: &WindowBlock,
+    lookback: Duration,
+) -> Option<f32> {
+    let &(last_at, last_pct) = block.points.last()?;
+    let cutoff = last_at - lookback;
+    let (first_index, &(first_at, first_pct)) = block
+        .points
+        .iter()
+        .enumerate()
+        .find(|(_, (at, _))| *at >= cutoff && *at < last_at)?;
+    burn_rate_between(block, first_index, first_at, first_pct, last_at, last_pct)
+}
+
+fn burn_rate_between(
+    block: &WindowBlock,
+    first_index: usize,
+    first_at: DateTime<Utc>,
+    first_pct: f32,
+    last_at: DateTime<Utc>,
+    last_pct: f32,
+) -> Option<f32> {
     if first_at >= last_at
         || !same_window_instance(
             block
@@ -170,6 +200,66 @@ pub fn burn_rate_pct_per_hour(block: &WindowBlock, lookback: Duration) -> Option
     }
     let hours = (last_at - first_at).num_seconds() as f32 / 3600.0;
     (hours > 0.0).then_some((last_pct - first_pct) / hours)
+}
+
+/// Estimates per-session token work from rollout records. Each record describes
+/// one response, so its work is assigned to the interval since the previous
+/// response. The newest five minutes receive a configurable recency coefficient;
+/// `activity_weight` lets callers reduce the contribution of inactive chats when
+/// combining sessions.
+pub fn weighted_token_rate_per_minute(
+    records: &[TokenUsageRecord],
+    now: DateTime<Utc>,
+    lookback: Duration,
+    recent_window: Duration,
+    recent_coefficient: f64,
+    activity_weight: f64,
+) -> Option<f64> {
+    if records.len() < 2
+        || recent_coefficient <= 0.0
+        || activity_weight <= 0.0
+        || lookback <= Duration::zero()
+    {
+        return None;
+    }
+    let cutoff = now - lookback;
+    let recent_cutoff = now - recent_window;
+    let mut ordered = records.to_vec();
+    ordered.sort_by_key(|record| record.at);
+    let mut weighted_work = 0.0;
+    let mut weighted_minutes = 0.0;
+    for pair in ordered.windows(2) {
+        let previous = &pair[0];
+        let current = &pair[1];
+        if current.at <= cutoff || previous.at >= now {
+            continue;
+        }
+        let start = previous.at.max(cutoff);
+        let end = current.at.min(now);
+        if start >= end {
+            continue;
+        }
+        let minutes = (end - start).num_milliseconds() as f64 / 60_000.0;
+        let uncached_input = current
+            .input_tokens
+            .saturating_sub(current.cached_input_tokens);
+        // Cache writes are part of input_tokens, so they remain in uncached_input.
+        // reasoning_output_tokens is a subtype of output_tokens and is not added
+        // separately.
+        let work = uncached_input.saturating_add(current.output_tokens) as f64;
+        let work_per_minute = work / minutes;
+        let recent_minutes = if end > recent_cutoff {
+            (end - start.max(recent_cutoff)).num_milliseconds() as f64 / 60_000.0
+        } else {
+            0.0
+        };
+        let old_minutes = minutes - recent_minutes;
+        let weighted_interval_minutes =
+            old_minutes + recent_minutes * recent_coefficient;
+        weighted_work += work_per_minute * weighted_interval_minutes * activity_weight;
+        weighted_minutes += weighted_interval_minutes;
+    }
+    (weighted_minutes > 0.0).then_some(weighted_work / weighted_minutes)
 }
 
 pub fn projected_exhaustion(block: &WindowBlock, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
@@ -392,6 +482,85 @@ mod tests {
     fn at(minutes: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_700_000_000 + minutes * 60, 0).unwrap()
     }
+    fn token_record(
+        minutes: i64,
+        input: u64,
+        cached: u64,
+        cache_write: u64,
+        output: u64,
+    ) -> TokenUsageRecord {
+        TokenUsageRecord {
+            at: at(minutes),
+            model: Some(uw_core::model::ModelId("gpt-5.6-luna".into())),
+            input_tokens: input,
+            cached_input_tokens: cached,
+            cache_write_input_tokens: cache_write,
+            output_tokens: output,
+            reasoning_output_tokens: 0,
+            total_tokens: input.saturating_add(output),
+        }
+    }
+
+    #[test]
+    fn weighted_token_rate_uses_uncached_input_and_output() {
+        let records = vec![
+            token_record(0, 0, 0, 0, 0),
+            token_record(10, 100, 50, 20, 0),
+            token_record(20, 200, 100, 40, 0),
+        ];
+        // Each interval contributes 50 and 100 uncached tokens over ten minutes.
+        assert_eq!(
+            weighted_token_rate_per_minute(
+                &records,
+                at(20),
+                Duration::minutes(30),
+                Duration::minutes(5),
+                1.2,
+                1.0,
+            ),
+            Some(160.0 / 21.0)
+        );
+    }
+
+    #[test]
+    fn weighted_token_rate_emphasizes_recent_work_and_inactive_weight() {
+        let records = vec![
+            token_record(0, 0, 0, 0, 0),
+            token_record(10, 100, 0, 0, 0),
+            token_record(20, 100, 0, 0, 0),
+            token_record(30, 300, 0, 0, 100),
+        ];
+        // Old work is 10 tokens/min. Recent work is 40 tokens/min, weighted 1.2.
+        // The inactive chat contributes at 0.3 of that weighted average.
+        let rate = weighted_token_rate_per_minute(
+            &records,
+            at(30),
+            Duration::minutes(30),
+            Duration::minutes(5),
+            1.2,
+            0.3,
+        )
+        .unwrap();
+        assert!((rate - (640.0 / 31.0 * 0.3)).abs() < 0.0001, "rate={rate}");
+    }
+
+    #[test]
+    fn weighted_token_rate_uses_available_history_without_thirty_minute_anchor() {
+        let records = vec![
+            token_record(20, 100, 0, 0, 0),
+            token_record(25, 200, 0, 0, 0),
+            token_record(30, 300, 0, 0, 0),
+        ];
+        assert!(weighted_token_rate_per_minute(
+            &records,
+            at(30),
+            Duration::minutes(30),
+            Duration::minutes(5),
+            1.2,
+            1.0,
+        )
+        .is_some());
+    }
     fn block(points: Vec<(DateTime<Utc>, f32)>, reset: Option<DateTime<Utc>>) -> WindowBlock {
         WindowBlock {
             key: key(),
@@ -433,6 +602,18 @@ mod tests {
             point_resets_at: vec![Some(at(100)), Some(at(200))],
         };
         assert_eq!(burn_rate_pct_per_hour(&reset, Duration::minutes(15)), None);
+    }
+
+    #[test]
+    fn available_burn_rate_uses_fresh_window_history_before_thirty_minutes() {
+        let b = block(
+            vec![(at(20), 0.), (at(25), 1.), (at(30), 3.)],
+            Some(at(100)),
+        );
+        assert_eq!(
+            burn_rate_pct_per_hour_available(&b, Duration::minutes(30)),
+            Some(18.0)
+        );
     }
 
     #[test]

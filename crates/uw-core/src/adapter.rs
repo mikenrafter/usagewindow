@@ -81,6 +81,22 @@ pub struct DiscoveredSession {
     /// Path to the on-disk record backing this session, if any — lets later reads
     /// (e.g. a transcript preview) go straight to it without re-scanning.
     pub state_path: Option<String>,
+    /// Per-turn token usage recovered from the session's on-disk rollout.
+    pub token_usage: Vec<TokenUsageRecord>,
+}
+/// Token accounting emitted by a harness for one response. Cached input is a
+/// subset of input tokens; cache-write tokens are reported separately when the
+/// harness exposes them. `reasoning_output_tokens` is a subtype of output.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsageRecord {
+    pub at: DateTime<Utc>,
+    pub model: Option<ModelId>,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+    pub total_tokens: u64,
 }
 /// One user- or assistant-authored turn, for a short "remind me what this session was
 /// about" preview — not a full transcript export.

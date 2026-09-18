@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use uw_core::adapter::{
     AdapterError, AdapterResult, Capabilities, DeliveryOutcome, DiscoveredSession, HarnessAdapter,
-    SeedContext, SeedMode, StatusEvent, TurnPreview, TurnRole,
+    SeedContext, SeedMode, StatusEvent, TokenUsageRecord, TurnPreview, TurnRole,
 };
 use uw_core::model::*;
 
@@ -441,9 +441,8 @@ fn rollout_files(root: &std::path::Path) -> Vec<PathBuf> {
 /// - The timestamp on the last record read, as `last_seen`.
 ///
 /// A file that isn't valid JSONL or doesn't start with `session_meta` is skipped, not an
-/// error — most files under `sessions/` are unrelated or historical, and this only ever
-/// runs once per session at discovery time (not on every tick), so a full read here is
-/// an acceptable one-time cost.
+/// error — most files under `sessions/` are unrelated or historical. The daemon uses this
+/// scan both to discover new sessions and to refresh token history for known sessions.
 fn scan_rollout(path: &std::path::Path) -> Option<DiscoveredSession> {
     let file = std::fs::File::open(path).ok()?;
     let mut lines = std::io::BufReader::new(file).lines();
@@ -470,6 +469,8 @@ fn scan_rollout(path: &std::path::Path) -> Option<DiscoveredSession> {
     let mut context_window_size = None;
     let mut last_known_token_count = None;
     let mut last_seen = first_seen;
+    let mut token_usage = Vec::new();
+    let mut usage_model = model.clone();
     for line in lines.map_while(Result::ok) {
         let Ok(record) = serde_json::from_str::<Value>(&line) else {
             continue;
@@ -485,6 +486,7 @@ fn scan_rollout(path: &std::path::Path) -> Option<DiscoveredSession> {
             Some("turn_context") => {
                 if let Some(m) = record.pointer("/payload/model").and_then(Value::as_str) {
                     model = Some(ModelId(m.to_owned()));
+                    usage_model = model.clone();
                 }
             }
             Some("event_msg")
@@ -499,12 +501,47 @@ fn scan_rollout(path: &std::path::Path) -> Option<DiscoveredSession> {
                 }
             }
             Some("token_usage_record") => {
-                if let Some(t) = record
-                    .pointer("/payload/usage/total_tokens")
-                    .and_then(Value::as_u64)
-                {
-                    last_known_token_count = Some(t);
-                }
+                let Some(timestamp) = record
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+                    .map(|ts| ts.with_timezone(&Utc))
+                else {
+                    continue;
+                };
+                let Some(usage) = record.pointer("/payload/usage") else {
+                    continue;
+                };
+                let Some(total_tokens) = usage.get("total_tokens").and_then(Value::as_u64) else {
+                    continue;
+                };
+                let token_usage_record = TokenUsageRecord {
+                    at: timestamp,
+                    model: usage_model.clone(),
+                    input_tokens: usage
+                        .get("input_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default(),
+                    cached_input_tokens: usage
+                        .get("cached_input_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default(),
+                    cache_write_input_tokens: usage
+                        .get("cache_write_input_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default(),
+                    output_tokens: usage
+                        .get("output_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default(),
+                    reasoning_output_tokens: usage
+                        .get("reasoning_output_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default(),
+                    total_tokens,
+                };
+                last_known_token_count = Some(total_tokens);
+                token_usage.push(token_usage_record);
             }
             _ => {}
         }
@@ -518,6 +555,7 @@ fn scan_rollout(path: &std::path::Path) -> Option<DiscoveredSession> {
         first_seen,
         last_seen,
         state_path: Some(path.to_string_lossy().into_owned()),
+        token_usage,
     })
 }
 
@@ -949,7 +987,9 @@ done
                 r#"{{"timestamp":"2026-09-17T23:32:32Z","type":"session_meta","payload":{{"session_id":"{id}","cwd":"/home/v0id/Documents/repos/usagewindow"}}}}
 {{"timestamp":"2026-09-17T23:32:32.5Z","type":"event_msg","payload":{{"type":"task_started","model_context_window":258400}}}}
 {{"timestamp":"2026-09-17T23:32:33Z","type":"turn_context","payload":{{"model":"gpt-5.6-luna"}}}}
-{{"timestamp":"2026-09-17T23:32:34Z","type":"token_usage_record","payload":{{"usage":{{"total_tokens":14362}},"thread_token_usage":{{"total_tokens":4304079}}}}}}
+{{"timestamp":"2026-09-17T23:32:34Z","type":"token_usage_record","payload":{{"usage":{{"input_tokens":12000,"cached_input_tokens":9000,"cache_write_input_tokens":500,"output_tokens":1862,"reasoning_output_tokens":321,"total_tokens":14362}},"thread_token_usage":{{"total_tokens":4304079}}}}}}
+{{"timestamp":"2026-09-17T23:32:34.5Z","type":"token_usage_record","payload":{{"usage":{{"input_tokens":999}}}}}}
+{{"type":"token_usage_record","payload":{{"usage":{{"total_tokens":999}}}}}}
 {{"timestamp":"2026-09-17T23:32:35Z","type":"event_msg","payload":{{"type":"item_completed","item":{{"type":"UserMessage","content":[{{"type":"text","text":"first question"}}]}}}}}}
 {{"timestamp":"2026-09-17T23:32:36Z","type":"event_msg","payload":{{"type":"item_completed","item":{{"type":"AgentMessage","content":[{{"type":"Text","text":"first answer"}}]}}}}}}
 {{"timestamp":"2026-09-18T00:23:18Z","type":"event_msg","payload":{{"type":"item_completed","item":{{"type":"UserMessage","content":[{{"type":"text","text":"last question"}}]}}}}}}
@@ -978,6 +1018,21 @@ done
         assert_eq!(found.context_window_size, Some(258400));
         // The last response's total, not thread_token_usage's lifetime sum.
         assert_eq!(found.last_known_token_count, Some(14362));
+        assert_eq!(
+            found.token_usage,
+            vec![TokenUsageRecord {
+                at: DateTime::parse_from_rfc3339("2026-09-17T23:32:34Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                model: Some(ModelId("gpt-5.6-luna".into())),
+                input_tokens: 12000,
+                cached_input_tokens: 9000,
+                cache_write_input_tokens: 500,
+                output_tokens: 1862,
+                reasoning_output_tokens: 321,
+                total_tokens: 14362,
+            }]
+        );
         assert_eq!(
             found.first_seen.unwrap().to_rfc3339(),
             "2026-09-17T23:32:32+00:00"
