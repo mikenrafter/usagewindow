@@ -4,3 +4,5 @@
 *.db-wal
 *.db-shm
 .env
+result
+usagewindow.db.claude-usage-cache.json
