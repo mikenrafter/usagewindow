@@ -77,15 +77,12 @@ SessionSummary = { id: SessionId, harness: Provider, model: Option<ModelId>,
 LaunchMode = Interactive | Headless
 StopReason = UsageLimit { window: WindowKey } | UserQuit | Crashed | Unknown
 
-// SessionId "survives compaction" is an assumption carried over from the Paseo reference
-// (which layers its own agent-id above Claude Code's session id specifically to dodge
-// this). For Claude Code, the hook session_id / transcript-filename UUID / `--resume`
-// argument are believed to be the same value, but Phase 2's test suite must verify this
-// empirically (does the id change across a real compaction? does `--resume` mint a new
-// id?) before any code relies on it. If it does change, add a `superseded_by:
-// Option<SessionId>` lineage field rather than assuming stability. Codex is verified
-// clean here: `session_meta.id` == `threads.id`, stable across resume/fork
-// (docs/research-codex.md).
+// Claude Code 2.1.267 was verified with a disposable real session: hook session_id,
+// transcript-filename UUID, SessionStart(source=compact), and explicit --resume output
+// retained one UUID across a 62,299 -> 721 token manual compaction. The fixture parser
+// and hook ingress fail closed on disagreement. Keep superseded_by for a later harness
+// version that violates this verified invariant. Codex is also verified clean:
+// session_meta.id == threads.id, stable across resume/fork. See both research notes.
 
 // One resume attempt per (session, quota-window-instance), not one-ever-per-session: a
 // session can legitimately hit its limit, get resumed, and hit it again next window.
@@ -220,9 +217,10 @@ an explicit "not supported for this harness" result, not a silently-dropped requ
   a brand-new session, so none of the hook-injection gotchas above apply; an initial
   prompt on the command line is the normal, unproblematic path. No `ForkWithHistory` mode
   (not investigated / no evidence of an equivalent CLI primitive for Claude Code).
-- Session identity: the harness-assigned id, believed stable across compaction — **Phase 2
-  must verify this empirically** (see `SessionId` note in the domain model above) rather
-  than trust it as given.
+- Session identity: the harness-assigned UUID is verified stable across manual
+  compaction and explicit headless resume on Claude Code 2.1.267. Fail closed if the
+  transcript filename, transcript records, or hook payload disagree. See
+  `docs/research-claude-code.md` for the exact evidence and rerunnable probe.
 
 ### Codex adapter (research complete — see docs/research-codex.md)
 

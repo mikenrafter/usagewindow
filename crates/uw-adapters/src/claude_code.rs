@@ -402,6 +402,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         session: &SessionSummary,
         req: &CompactionRequest,
     ) -> AdapterResult<DeliveryOutcome> {
+        validate_session_owner(session)?;
         let text = compact_instructions(&req.prompt, session_state_path(session));
         if let Some(messenger) = &self.messenger {
             return messenger.send(&session.id, &text).await;
@@ -413,6 +414,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         session: &SessionSummary,
         message: Option<&str>,
     ) -> AdapterResult<()> {
+        validate_session_owner(session)?;
         let mut args = vec!["--print".to_string(), "--resume".into(), session.id.0.clone()];
         if let Some(message) = message {
             args.push(message.to_string());
@@ -478,11 +480,12 @@ impl HarnessAdapter for ClaudeCodeAdapter {
 }
 
 fn scan_transcript(path: &str, content: &str) -> Option<DiscoveredSession> {
-    let mut id = std::path::Path::new(path)
+    let filename_id = std::path::Path::new(path)
         .file_stem()
         .and_then(|stem| stem.to_str())
         .filter(|stem| uuid::Uuid::parse_str(stem).is_ok())
         .map(str::to_owned);
+    let mut record_id: Option<String> = None;
     let mut cwd = None;
     let mut model = None;
     let mut context_window_size = None;
@@ -495,13 +498,16 @@ fn scan_transcript(path: &str, content: &str) -> Option<DiscoveredSession> {
         let Ok(record) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if id.is_none() {
-            id = record
-                .get("sessionId")
-                .or_else(|| record.get("session_id"))
-                .and_then(Value::as_str)
-                .filter(|value| uuid::Uuid::parse_str(value).is_ok())
-                .map(str::to_owned);
+        if let Some(candidate) = record
+            .get("sessionId")
+            .or_else(|| record.get("session_id"))
+            .and_then(Value::as_str)
+            .filter(|value| uuid::Uuid::parse_str(value).is_ok())
+        {
+            if record_id.as_deref().is_some_and(|known| known != candidate) {
+                return None;
+            }
+            record_id.get_or_insert_with(|| candidate.to_owned());
         }
         if cwd.is_none() {
             cwd = record.get("cwd").and_then(Value::as_str).map(str::to_owned);
@@ -557,7 +563,14 @@ fn scan_transcript(path: &str, content: &str) -> Option<DiscoveredSession> {
         }
     }
 
-    let id = id?;
+    if filename_id
+        .as_deref()
+        .zip(record_id.as_deref())
+        .is_some_and(|(filename, record)| filename != record)
+    {
+        return None;
+    }
+    let id = filename_id.or(record_id)?;
     Some(DiscoveredSession {
         id: SessionId(id),
         cwd: cwd.unwrap_or_else(|| ".".into()),
@@ -573,6 +586,21 @@ fn scan_transcript(path: &str, content: &str) -> Option<DiscoveredSession> {
 
 fn session_state_path(session: &SessionSummary) -> &str {
     session.state_path.as_deref().unwrap_or("<not recorded>")
+}
+
+fn validate_session_owner(session: &SessionSummary) -> AdapterResult<()> {
+    if uuid::Uuid::parse_str(&session.id.0).is_err() {
+        return Err(AdapterError::Other(
+            "Claude Code session id is not a valid UUID".into(),
+        ));
+    }
+    if let Some(replacement) = &session.superseded_by {
+        return Err(AdapterError::Other(format!(
+            "Claude Code session {} was superseded by {}",
+            session.id.0, replacement.0
+        )));
+    }
+    Ok(())
 }
 #[cfg(test)]
 mod tests {
@@ -620,6 +648,48 @@ mod tests {
         assert_eq!(found[0].token_usage[0].cached_input_tokens, 800);
         assert_eq!(found[0].token_usage[0].cache_write_input_tokens, 100);
         assert_eq!(found[0].token_usage[0].total_tokens, 2400);
+    }
+
+    #[tokio::test]
+    async fn discovery_fails_closed_when_transcript_identity_disagrees() {
+        let filename_id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b40";
+        let record_id = "7fd75ec4-661a-4d52-8308-b65c60f44b85";
+        let adapter = adapter(
+            200,
+            Arc::new(Cache {
+                entry: Mutex::new(None),
+            }),
+            Arc::new(Mutex::new(0)),
+        )
+        .with_transcript_fs(Arc::new(TranscriptFixture {
+            path: format!("/tmp/{filename_id}.jsonl"),
+            content: format!(
+                r#"{{"timestamp":"2026-09-17T23:32:32Z","sessionId":"{record_id}","cwd":"/work"}}"#
+            ),
+        }));
+
+        assert!(adapter.discover_sessions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn discovery_fails_closed_when_records_contain_multiple_session_ids() {
+        let first = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b40";
+        let second = "7fd75ec4-661a-4d52-8308-b65c60f44b85";
+        let adapter = adapter(
+            200,
+            Arc::new(Cache {
+                entry: Mutex::new(None),
+            }),
+            Arc::new(Mutex::new(0)),
+        )
+        .with_transcript_fs(Arc::new(TranscriptFixture {
+            path: "/tmp/not-an-id.jsonl".into(),
+            content: format!(
+                "{{\"sessionId\":\"{first}\"}}\n{{\"sessionId\":\"{second}\"}}"
+            ),
+        }));
+
+        assert!(adapter.discover_sessions().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -890,7 +960,7 @@ mod tests {
     }
     fn session(mode: LaunchMode) -> SessionSummary {
         SessionSummary {
-            id: SessionId("abc".into()),
+            id: SessionId("3507fe61-2d6b-4aae-a0b6-4fe4eec12b40".into()),
             harness: Provider::ClaudeCode,
             model: None,
             account: None,
@@ -927,7 +997,11 @@ mod tests {
             *record.lock().unwrap(),
             Some(ProcessSpec {
                 program: "claude".into(),
-                args: vec!["--print".into(), "--resume".into(), "abc".into()],
+                args: vec![
+                    "--print".into(),
+                    "--resume".into(),
+                    "3507fe61-2d6b-4aae-a0b6-4fe4eec12b40".into()
+                ],
                 cwd: "/work".into()
             })
         );
@@ -957,6 +1031,40 @@ mod tests {
             a.seed_new_session(SeedMode::ForkWithHistory, &seed).await,
             Err(AdapterError::Unsupported)
         ));
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_non_uuid_and_superseded_session_ownership() {
+        let record = Arc::new(Mutex::new(None));
+        let adapter = adapter(
+            200,
+            Arc::new(Cache {
+                entry: Mutex::new(None),
+            }),
+            Arc::new(Mutex::new(0)),
+        )
+        .with_delivery(
+            Arc::new(NoHook),
+            Arc::new(NoMessenger),
+            Arc::new(Recorder(record.clone())),
+        );
+
+        let mut malformed = session(LaunchMode::Headless);
+        malformed.id = SessionId("not-a-uuid".into());
+        assert!(matches!(
+            adapter.resume_session(&malformed, None).await,
+            Err(AdapterError::Other(message)) if message.contains("valid UUID")
+        ));
+        let mut superseded = session(LaunchMode::Headless);
+        superseded.id = SessionId("3507fe61-2d6b-4aae-a0b6-4fe4eec12b40".into());
+        superseded.superseded_by = Some(SessionId(
+            "7fd75ec4-661a-4d52-8308-b65c60f44b85".into(),
+        ));
+        assert!(matches!(
+            adapter.resume_session(&superseded, None).await,
+            Err(AdapterError::Other(message)) if message.contains("superseded")
+        ));
+        assert!(record.lock().unwrap().is_none());
     }
     struct NoHook;
     #[async_trait::async_trait]

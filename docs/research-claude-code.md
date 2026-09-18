@@ -37,12 +37,17 @@ DankMaterialShell status-bar plugin (bash+QML). This is ground truth for the Cla
   full hook-event list. `PreCompact`/`PostCompact` are NOT in that union — anything a
   `PostCompact` hook returns is silently rejected wholesale. This is why nothing can
   inject text right at the compaction boundary via that hook.
-- `SessionStart:compact` fires ~55ms after `PostCompact` and CAN inject
-  `additionalContext` — this is the one confirmed-working "push text into a fresh/
+- `SessionStart:compact` CAN inject `additionalContext` — this is the one
+  confirmed-working "push text into a fresh/
   compacted session's context" channel. Its `initialUserMessage` field does NOT start a
   new turn, though (only the CLI bootstrap consumes `pendingInitialUserMessage`; a hook
   setting it produces `num_turns: 0`, verified empirically) — so it can add context, but
   cannot itself kick off a new turn of work.
+- On Claude Code 2.1.267, the disposable live probe observed
+  `PreCompact -> SessionStart(source=compact) -> PostCompact`. Older reference evidence
+  had `PostCompact` before `SessionStart:compact`, so consumers must not depend on the
+  relative order of those last two hooks. The compact boundary in the transcript is the
+  completion evidence.
 - `Stop`'s `additionalContext` really does ride the agent's own live turn (verified with
   an echo-marker test) — this is the channel used to "ask" the agent to consider
   compacting, since it can act on it in the same turn without a separate message being
@@ -126,13 +131,47 @@ response costs negligible tokens when the server has nothing relevant to offer f
 given session (e.g. gate on a marker env var this adapter sets when it spawns/attaches
 to a session it's tracking, similar to Paseo's own `PASEO_AGENT_ID`-presence gate).
 
-## Local verification gaps (2026-09-17)
+## Local verification (2026-09-18)
 
-- Session-id stability across a real `/compact` remains unverified on this machine. A
-  safe check requires a disposable live Claude Code session: record the `SessionStart`
-  and transcript UUID, send one claimed `/compact`, wait for the compact boundary, and
-  compare the following `SessionStart:compact` id. If it changes, persist the new id in
-  `sessions.superseded_by` before enabling automatic compaction for that installation.
+Claude Code 2.1.267 was tested with a disposable, sequential, noninteractive Sonnet
+session. The invocation used an explicit UUID, invocation-scoped recording hooks, no
+MCP servers, no tools, and `dontAsk` permission mode. Each process exited before the
+next `--resume`, so the probe never attached a second process to a live session.
+
+The verified UUID was `adce47c2-0e0c-4efe-914b-8e06dd1d5e6b`. All of these carried
+that exact value:
+
+- the initial `SessionStart(source=startup)` hook;
+- every `claude --resume` JSON result and `SessionStart(source=resume)` hook;
+- `PreCompact(trigger=manual)`;
+- `SessionStart(source=compact)`;
+- `PostCompact(trigger=manual)`;
+- the post-compaction `claude --resume` JSON result;
+- every transcript record inspected and the transcript filename UUID.
+
+The transcript's `compact_boundary` record reported `preTokens: 62299` and
+`postTokens: 721`, so this was a completed compaction, not merely an accepted command.
+The first compact attempt returned `Not enough messages to compact.` and was excluded
+from the result. This distinction matters because `PreCompact` can fire for a refused
+attempt without a following `SessionStart(source=compact)` or compact boundary.
+
+The reusable probe is `scripts/verify-claude-session-identity.sh`. It refuses to run
+unless `UW_RUN_LIVE_CLAUDE_IDENTITY_PROBE=1` is set because it consumes real account
+quota. It fails unless hook ids, command result ids, transcript filename, and the
+completed compact boundary all agree. Its result includes the measured pre- and
+post-compact token counts. The test suite uses captured-shape fixtures and does not run
+this live probe.
+
+Adapter decision: Claude Code's hook session id, transcript UUID, post-compact session
+id, and explicit resume id are one stable UUID in the tested version. Keep the existing
+`superseded_by` field for fail-closed handling if a later Claude release violates this
+invariant. Transcript discovery rejects filename/record disagreement, hook ingress
+requires the documented transcript path and rejects a mismatch, and destructive
+operations refuse a superseded owner. Hook payload consistency is not authentication;
+the hook endpoint remains a loopback-only local trust boundary.
+
+## Remaining local verification gaps
+
 - Usage-limit stop detection also remains unverified because no local Claude Code
   session was at a usage limit during this implementation pass. The concrete next test
   is to capture the final transcript record and hook sequence from a session that
@@ -145,9 +184,9 @@ to a session it's tracking, similar to Paseo's own `PASEO_AGENT_ID`-presence gat
   without adding another unsolicited-send path is still required before keepalive can
   claim full live-session coverage; the current queue is bounded and fail-open but may
   wait for the next matching hook.
-- No verified external messenger for injecting `/compact` into an already-running idle
-  Claude Code process was available locally. Starting `claude --resume` against a live
-  session would create a competing process and is not documented as safe, so the real
-  adapter reports `can_trigger_compaction: false` unless a verified `SessionMessenger`
-  is supplied. The next step is a disposable-session test of the owning harness process'
-  supported message/steer interface; do not substitute a second resume process.
+- Claude Code 2.1.267 documents `--bg` and says `--resume` preserves the background id
+  unless the session is already running, in which case it starts a copy. That does not
+  establish a safe external messenger for an already-running idle process. The real
+  adapter therefore still reports `can_trigger_compaction: false` unless a verified
+  `SessionMessenger` is supplied. The next test must use the owning background process'
+  supported message or remote-control interface and prove it does not create a copy.

@@ -72,7 +72,14 @@ pub fn plan_compaction_tick(
     _request: &CompactionRequest,
     capabilities: &Capabilities,
     idle: bool,
+    session: &SessionSummary,
 ) -> CompactionPlan {
+    if let Some(replacement) = &session.superseded_by {
+        return CompactionPlan::SkipUnsupported(format!(
+            "session identity was superseded by {}",
+            replacement.0
+        ));
+    }
     if !capabilities.can_trigger_compaction {
         return CompactionPlan::SkipUnsupported(
             "adapter cannot honor destructive compaction requests".into(),
@@ -763,6 +770,7 @@ pub async fn run_compaction_tick(
             &request,
             &adapter.capabilities(),
             liveness.is_idle(&session).await,
+            &session,
         ) {
             CompactionPlan::SkipUnsupported(reason) => {
                 store
@@ -1521,8 +1529,9 @@ impl SessionLivenessChecker for SystemSessionLivenessChecker {
     }
 }
 
-/// Hook ingress is intentionally fail-open. The backend is a future routing seam;
-/// TODO Phase-6: match harness-specific event names to daemon actions.
+/// Hook ingress is intentionally fail-open. The HTTP backend validates and routes
+/// harness-specific event names, records session observations, and returns only the
+/// response fields supported by that harness and event.
 pub async fn handle_hook<R, F, Fut>(input: R, backend: F) -> serde_json::Value
 where
     R: AsyncRead + Unpin,
@@ -1901,7 +1910,12 @@ mod tests {
     #[test]
     fn unsupported_compaction_is_failed_without_send_plan() {
         assert_eq!(
-            plan_compaction_tick(&request(), &caps(false, false, false), true),
+            plan_compaction_tick(
+                &request(),
+                &caps(false, false, false),
+                true,
+                &session(),
+            ),
             CompactionPlan::SkipUnsupported(
                 "adapter cannot honor destructive compaction requests".into()
             )
@@ -1910,7 +1924,7 @@ mod tests {
     #[test]
     fn race_plan_requires_claim_before_send() {
         assert_eq!(
-            plan_compaction_tick(&request(), &caps(true, false, false), true),
+            plan_compaction_tick(&request(), &caps(true, false, false), true, &session()),
             CompactionPlan::ClaimAndSend
         );
     }
@@ -2666,6 +2680,18 @@ mod tests {
         first.unwrap();
         second.unwrap();
         assert_eq!(RESUME_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn superseded_session_is_not_eligible_for_destructive_compaction() {
+        let mut owner = session();
+        owner.superseded_by = Some(SessionId("replacement".into()));
+        assert_eq!(
+            plan_compaction_tick(&request(), &caps(true, true, true), true, &owner),
+            CompactionPlan::SkipUnsupported(
+                "session identity was superseded by replacement".into()
+            )
+        );
     }
 
     #[test]

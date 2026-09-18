@@ -78,21 +78,7 @@ async fn hook_ingress(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing hook event name".into()))?
         .to_owned();
-    if !matches!(
-        event.as_str(),
-        "SessionStart"
-            | "UserPromptSubmit"
-            | "PreToolUse"
-            | "PostToolUse"
-            | "PermissionRequest"
-            | "Stop"
-            | "SubagentStart"
-            | "SubagentStop"
-            | "SessionEnd"
-            | "Interrupt"
-            | "PreCompact"
-            | "PostCompact"
-    ) {
+    if !supports_hook_event(&provider, &event) {
         return Err((StatusCode::BAD_REQUEST, "unsupported hook event".into()));
     }
     let id = payload
@@ -106,6 +92,33 @@ async fn hook_ingress(
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     {
         return Err((StatusCode::BAD_REQUEST, "invalid session id".into()));
+    }
+    if provider == Provider::ClaudeCode && uuid::Uuid::parse_str(id).is_err() {
+        return Err((StatusCode::BAD_REQUEST, "invalid Claude session id".into()));
+    }
+    let transcript_path = payload
+        .get("transcript_path")
+        .or_else(|| payload.get("transcriptPath"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    if provider == Provider::ClaudeCode && transcript_path.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "missing Claude transcript path".into(),
+        ));
+    }
+    if provider == Provider::ClaudeCode
+        && transcript_path.as_deref().is_some_and(|path| {
+            std::path::Path::new(path)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                != Some(id)
+        })
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Claude transcript path does not match session id".into(),
+        ));
     }
     let id = SessionId(id.to_owned());
     let cwd = payload
@@ -133,7 +146,7 @@ async fn hook_ingress(
             first_seen: now,
             last_seen: now,
             cwd,
-            state_path: None,
+            state_path: transcript_path,
             context_window_size: None,
             last_known_token_count: None,
             launch_mode: LaunchMode::Interactive,
@@ -161,6 +174,45 @@ async fn hook_ingress(
             "additionalContext": messages.join("\n")
         }
     })))
+}
+
+fn supports_hook_event(provider: &Provider, event: &str) -> bool {
+    match provider {
+        Provider::ClaudeCode => matches!(
+            event,
+            "SessionStart"
+                | "UserPromptSubmit"
+                | "PreToolUse"
+                | "PostToolUse"
+                | "PermissionRequest"
+                | "Stop"
+                | "SubagentStart"
+                | "SubagentStop"
+                | "SessionEnd"
+                | "Interrupt"
+                | "PreCompact"
+                | "PostCompact"
+        ),
+        Provider::Codex => matches!(
+            event,
+            "SessionStart"
+                | "UserPromptSubmit"
+                | "PreToolUse"
+                | "PostToolUse"
+                | "PermissionRequest"
+                | "Stop"
+                | "SubagentStart"
+                | "SubagentStop"
+                | "SessionEnd"
+                | "Interrupt"
+                | "PreCompact"
+                | "PostCompact"
+        ),
+        _ => matches!(
+            event,
+            "SessionStart" | "UserPromptSubmit" | "PostToolUse" | "Stop" | "SessionEnd"
+        ),
+    }
 }
 
 async fn read<T, F>(state: AppState, operation: F) -> Result<T, (StatusCode, String)>
@@ -731,6 +783,90 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({"hook_event_name":"MadeUp"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn claude_hook_ingress_rejects_transcript_identity_mismatch() {
+        let id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b40";
+        let other = "7fd75ec4-661a-4d52-8308-b65c60f44b85";
+        let response = app(Store::open_memory().unwrap())
+            .oneshot(
+                Request::post("/api/hooks?provider=claude-code")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "hook_event_name": "SessionStart",
+                            "session_id": id,
+                            "source": "compact",
+                            "transcript_path": format!("/tmp/{other}.jsonl")
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn claude_hook_ingress_records_verified_transcript_path() {
+        let id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b40";
+        let path = format!("/tmp/{id}.jsonl");
+        let router = app(Store::open_memory().unwrap());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/hooks?provider=claude-code")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "hook_event_name": "SessionStart",
+                            "session_id": id,
+                            "source": "compact",
+                            "transcript_path": path
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = router
+            .oneshot(
+                Request::get(format!("/api/sessions/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let detail: SessionDetail = serde_json::from_slice(&body).unwrap();
+        assert_eq!(detail.summary.state_path.as_deref(), Some(path.as_str()));
+    }
+
+    #[tokio::test]
+    async fn claude_hook_ingress_rejects_missing_transcript_identity() {
+        let response = app(Store::open_memory().unwrap())
+            .oneshot(
+                Request::post("/api/hooks?provider=claude-code")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "hook_event_name": "SessionStart",
+                            "session_id": "3507fe61-2d6b-4aae-a0b6-4fe4eec12b40"
+                        })
+                        .to_string(),
                     ))
                     .unwrap(),
             )
