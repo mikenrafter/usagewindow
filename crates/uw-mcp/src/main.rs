@@ -1,5 +1,14 @@
-//! Minimal newline-delimited JSON-RPC MCP server for usagewindow.
+//! MCP server for usagewindow.
+//!
+//! HTTP serves the stateless MCP 2026-07-28 protocol. `--stdio` retains the
+//! previous newline-delimited JSON-RPC transport for older local clients.
 
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::{Json, Router};
 use chrono::Utc;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -9,6 +18,12 @@ use uw_core::adapter::HarnessAdapter;
 use uw_core::api::{ProviderUsageSummary, StatusResponse, UsageWindowSummary};
 use uw_core::model::*;
 use uw_store::Store;
+
+const PROTOCOL_VERSION: &str = "2026-07-28";
+const SERVER_INFO_KEY: &str = "io.modelcontextprotocol/serverInfo";
+const PROTOCOL_VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+const CLIENT_INFO_KEY: &str = "io.modelcontextprotocol/clientInfo";
+const CLIENT_CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
 
 pub struct Deps {
     pub store: Arc<Mutex<Store>>,
@@ -25,7 +40,7 @@ fn result(id: Value, value: Value) -> Value {
 
 fn tool_result(value: Value) -> Value {
     let text = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
-    json!({"content":[{"type":"text","text":text}],"structuredContent":value})
+    json!({"resultType":"complete","content":[{"type":"text","text":text}],"structuredContent":value})
 }
 
 fn tool_definitions() -> Value {
@@ -187,8 +202,242 @@ pub fn handle_request(request: Value, deps: &Deps) -> Value {
     }
 }
 
-fn main() -> anyhow::Result<()> {
-    let path = std::env::var("UW_DB_PATH").unwrap_or_else(|_| "usagewindow.db".into());
+fn server_meta() -> Value {
+    json!({SERVER_INFO_KEY: {
+        "name": "usagewindow",
+        "version": env!("CARGO_PKG_VERSION")
+    }})
+}
+
+fn modern_result(id: Value, mut value: Value) -> Value {
+    if let Some(object) = value.as_object_mut() {
+        object
+            .entry("resultType")
+            .or_insert_with(|| Value::String("complete".into()));
+        object.insert("_meta".into(), server_meta());
+    }
+    result(id, value)
+}
+
+fn modern_error(id: Value, code: i64, message: impl Into<String>) -> Value {
+    error(id, code, message)
+}
+
+fn error_with_data(id: Value, code: i64, message: impl Into<String>, data: Value) -> Value {
+    json!({"jsonrpc":"2.0", "id":id, "error":{"code":code, "message":message.into(), "data":data}})
+}
+
+fn validate_request(request: &Value, headers: &HeaderMap) -> Result<(), (i64, String, Value)> {
+    let invalid = |message: &str| (-32600, message.to_string(), Value::Null);
+    let valid_id = request
+        .get("id")
+        .is_some_and(|id| id.is_string() || id.as_i64().is_some() || id.as_u64().is_some());
+    if request.get("jsonrpc") != Some(&Value::String("2.0".into()))
+        || !valid_id
+        || !request.get("method").is_some_and(Value::is_string)
+        || !request.get("params").is_some_and(Value::is_object)
+    {
+        return Err(invalid("invalid JSON-RPC request"));
+    }
+
+    let params = &request["params"];
+    let Some(meta) = params.get("_meta").and_then(Value::as_object) else {
+        return Err((-32602, "params._meta is required".into(), Value::Null));
+    };
+    let Some(body_version) = meta.get(PROTOCOL_VERSION_KEY).and_then(Value::as_str) else {
+        return Err((
+            -32602,
+            format!("params._meta.{PROTOCOL_VERSION_KEY} is required"),
+            Value::Null,
+        ));
+    };
+    if !meta
+        .get(CLIENT_CAPABILITIES_KEY)
+        .is_some_and(Value::is_object)
+    {
+        return Err((
+            -32602,
+            format!("params._meta.{CLIENT_CAPABILITIES_KEY} must be an object"),
+            Value::Null,
+        ));
+    }
+    if let Some(client_info) = meta.get(CLIENT_INFO_KEY)
+        && (!client_info.get("name").is_some_and(Value::is_string)
+            || !client_info.get("version").is_some_and(Value::is_string))
+    {
+        return Err((
+            -32602,
+            format!("params._meta.{CLIENT_INFO_KEY} must contain string name and version"),
+            Value::Null,
+        ));
+    }
+    let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+    if header("mcp-protocol-version") != Some(body_version) {
+        return Err((
+            -32020,
+            "MCP-Protocol-Version header mismatch".into(),
+            Value::Null,
+        ));
+    }
+    let method = request["method"].as_str().expect("validated method");
+    if header("mcp-method") != Some(method) {
+        return Err((-32020, "Mcp-Method header mismatch".into(), Value::Null));
+    }
+    if body_version != PROTOCOL_VERSION {
+        return Err((
+            -32022,
+            format!("unsupported protocol version: {body_version}"),
+            json!({"requested":body_version,"supported":[PROTOCOL_VERSION]}),
+        ));
+    }
+    if method == "tools/call" {
+        let Some(name) = params.get("name").and_then(Value::as_str) else {
+            return Err((
+                -32602,
+                "tools/call requires a tool name".into(),
+                Value::Null,
+            ));
+        };
+        if params
+            .get("arguments")
+            .is_some_and(|value| !value.is_object())
+        {
+            return Err((
+                -32602,
+                "tools/call arguments must be an object".into(),
+                Value::Null,
+            ));
+        }
+        if header("mcp-name") != Some(name) {
+            return Err((-32020, "Mcp-Name header mismatch".into(), Value::Null));
+        }
+    } else if method == "tools/list" && params.get("cursor").is_some_and(|value| !value.is_string())
+    {
+        return Err((
+            -32602,
+            "tools/list cursor must be a string".into(),
+            Value::Null,
+        ));
+    }
+    Ok(())
+}
+
+fn handle_modern_request(request: Value, headers: &HeaderMap, deps: &Deps) -> (StatusCode, Value) {
+    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    if let Err((code, message, data)) = validate_request(&request, headers) {
+        let response = if data.is_null() {
+            modern_error(id, code, message)
+        } else {
+            error_with_data(id, code, message, data)
+        };
+        return (StatusCode::BAD_REQUEST, response);
+    }
+    let method = request["method"].as_str().expect("validated method");
+    let params = &request["params"];
+    let value = match method {
+        "server/discover" => json!({
+            "resultType":"complete",
+            "supportedVersions":[PROTOCOL_VERSION],
+            "capabilities":{"tools":{}},
+            "instructions":"Read usage and resume state. Compaction requests are capability-gated by the session harness.",
+            "ttlMs":300_000,
+            "cacheScope":"public"
+        }),
+        "tools/list" => {
+            let mut definitions = tool_definitions();
+            let object = definitions
+                .as_object_mut()
+                .expect("tool definitions object");
+            object.insert("resultType".into(), json!("complete"));
+            object.insert("ttlMs".into(), json!(300_000));
+            object.insert("cacheScope".into(), json!("public"));
+            definitions
+        }
+        "tools/call" => {
+            let name = params["name"].as_str().expect("validated tool name");
+            match call_tool(name, params.get("arguments").unwrap_or(&json!({})), deps) {
+                Ok(value) => value,
+                Err(message) if message.starts_with("unknown tool:") => {
+                    return (StatusCode::BAD_REQUEST, modern_error(id, -32602, message));
+                }
+                Err(message) => {
+                    return (
+                        StatusCode::OK,
+                        modern_result(
+                            id,
+                            json!({"resultType":"complete","content":[{"type":"text","text":message}],"isError":true}),
+                        ),
+                    );
+                }
+            }
+        }
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                modern_error(id, -32601, format!("method not found: {method}")),
+            );
+        }
+    };
+    (StatusCode::OK, modern_result(id, value))
+}
+
+async fn mcp_http(State(deps): State<Arc<Deps>>, headers: HeaderMap, body: Bytes) -> Response {
+    if headers
+        .get("origin")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|origin| !origin_is_allowed(origin))
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(modern_error(Value::Null, -32000, "Origin is not allowed")),
+        )
+            .into_response();
+    }
+    let request = match serde_json::from_slice::<Value>(&body) {
+        Ok(request) => request,
+        Err(parse_error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(modern_error(
+                    Value::Null,
+                    -32700,
+                    format!("parse error: {parse_error}"),
+                )),
+            )
+                .into_response();
+        }
+    };
+    let (status, response) = handle_modern_request(request, &headers, &deps);
+    (status, Json(response)).into_response()
+}
+
+fn origin_is_allowed(origin: &str) -> bool {
+    let local = [
+        "http://localhost",
+        "https://localhost",
+        "http://127.0.0.1",
+        "https://127.0.0.1",
+    ]
+    .iter()
+    .any(|prefix| {
+        origin.strip_prefix(prefix).is_some_and(|suffix| {
+            suffix.is_empty()
+                || suffix.strip_prefix(':').is_some_and(|port| {
+                    !port.is_empty() && port.chars().all(|c| c.is_ascii_digit())
+                })
+        })
+    });
+    local
+        || std::env::var("UW_MCP_ALLOWED_ORIGINS")
+            .ok()
+            .is_some_and(|origins| origins.split(',').map(str::trim).any(|item| item == origin))
+}
+
+pub fn http_app(deps: Arc<Deps>) -> Router {
+    Router::new().route("/mcp", post(mcp_http)).with_state(deps)
+}
+
+fn build_deps(path: &str) -> anyhow::Result<Deps> {
     let cache_path = std::env::var("UW_CLAUDE_CACHE_PATH")
         .unwrap_or_else(|_| format!("{path}.claude-usage-cache.json"));
     let adapters: HashMap<Provider, Arc<dyn HarnessAdapter>> = HashMap::from([
@@ -204,21 +453,40 @@ fn main() -> anyhow::Result<()> {
             Arc::new(uw_adapters::codex::CodexAdapter::real()) as Arc<dyn HarnessAdapter>,
         ),
     ]);
-    let deps = Deps {
-        store: Arc::new(Mutex::new(Store::open(&path)?)),
+    Ok(Deps {
+        store: Arc::new(Mutex::new(Store::open(path)?)),
         adapters,
-    };
+    })
+}
+
+fn run_stdio(deps: &Deps) -> anyhow::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::BufWriter::new(io::stdout().lock());
     for line in stdin.lock().lines() {
         let line = line?;
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(request) => handle_request(request, &deps),
+            Ok(request) => handle_request(request, deps),
             Err(e) => error(Value::Null, -32700, format!("parse error: {e}")),
         };
         writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
         stdout.flush()?;
     }
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let path = std::env::var("UW_DB_PATH").unwrap_or_else(|_| "usagewindow.db".into());
+    let deps = build_deps(&path)?;
+    if std::env::args().any(|arg| arg == "--stdio")
+        || std::env::var("UW_MCP_TRANSPORT").is_ok_and(|value| value == "stdio")
+    {
+        return run_stdio(&deps);
+    }
+
+    let address = std::env::var("UW_MCP_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:7880".into());
+    let listener = tokio::net::TcpListener::bind(&address).await?;
+    axum::serve(listener, http_app(Arc::new(deps))).await?;
     Ok(())
 }
 
@@ -405,5 +673,218 @@ mod tests {
         let response = handle_request(json!({"jsonrpc":"2.0","id":"x","method":"nope"}), &deps());
         assert_eq!(response["error"]["code"], -32601);
         assert_eq!(response["id"], "x");
+    }
+
+    mod modern_http {
+        use super::*;
+        use axum::body::{Body, to_bytes};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        const META: &str = r#""_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"uw-test","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}"#;
+
+        fn request(method: &str, name: Option<&str>, body: String) -> Request<Body> {
+            let mut builder = Request::post("/mcp")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2026-07-28")
+                .header("mcp-method", method);
+            if let Some(name) = name {
+                builder = builder.header("mcp-name", name);
+            }
+            builder.body(Body::from(body)).unwrap()
+        }
+
+        async fn json(response: axum::response::Response) -> Value {
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn discover_uses_modern_envelope() {
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":"d1","method":"server/discover","params":{{{META}}}}}"#
+            );
+            let response = http_app(Arc::new(deps()))
+                .oneshot(request("server/discover", None, body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = json(response).await;
+            assert_eq!(value["result"]["resultType"], "complete");
+            assert_eq!(value["result"]["supportedVersions"], json!(["2026-07-28"]));
+            assert!(value["result"]["capabilities"]["tools"].is_object());
+            assert_eq!(
+                value["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+                "usagewindow"
+            );
+            assert_eq!(value["result"]["cacheScope"], "public");
+        }
+
+        #[tokio::test]
+        async fn tools_list_and_call_work_without_shared_protocol_session() {
+            let app = http_app(Arc::new(deps()));
+            for id in [1, 2] {
+                let body = format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/list","params":{{{META}}}}}"#
+                );
+                let response = app
+                    .clone()
+                    .oneshot(request("tools/list", None, body))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let value = json(response).await;
+                assert_eq!(value["result"]["resultType"], "complete");
+                assert_eq!(value["result"]["tools"].as_array().unwrap().len(), 3);
+                assert_eq!(value["result"]["cacheScope"], "public");
+            }
+
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"get_usage","arguments":{{}},{META}}}}}"#
+            );
+            let response = app
+                .oneshot(request("tools/call", Some("get_usage"), body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = json(response).await;
+            assert_eq!(value["result"]["resultType"], "complete");
+            assert!(value["result"]["structuredContent"]["usage"].is_array());
+        }
+
+        #[tokio::test]
+        async fn rejects_missing_modern_metadata_and_header_mismatches() {
+            let app = http_app(Arc::new(deps()));
+            let missing_meta = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+            let response = app
+                .clone()
+                .oneshot(request("tools/list", None, missing_meta.into()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(json(response).await["error"]["code"], -32602);
+
+            let body =
+                format!(r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{{META}}}}}"#);
+            let response = app
+                .oneshot(request("tools/call", None, body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(json(response).await["error"]["code"], -32020);
+
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"get_usage","arguments":[],{META}}}}}"#
+            );
+            let response = http_app(Arc::new(deps()))
+                .oneshot(request("tools/call", Some("get_usage"), body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(json(response).await["error"]["code"], -32602);
+        }
+
+        #[tokio::test]
+        async fn rejects_unsupported_versions_and_invalid_request_ids() {
+            let unsupported_meta = META.replace("2026-07-28", "2099-01-01");
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{{{unsupported_meta}}}}}"#
+            );
+            let mut unsupported = request("tools/list", None, body);
+            unsupported
+                .headers_mut()
+                .insert("mcp-protocol-version", "2099-01-01".parse().unwrap());
+            let response = http_app(Arc::new(deps()))
+                .oneshot(unsupported)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let value = json(response).await;
+            assert_eq!(value["error"]["code"], -32022);
+            assert_eq!(value["error"]["data"]["supported"], json!(["2026-07-28"]));
+
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":{{}},"method":"tools/list","params":{{{META}}}}}"#
+            );
+            let response = http_app(Arc::new(deps()))
+                .oneshot(request("tools/list", None, body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(json(response).await["error"]["code"], -32600);
+        }
+
+        #[tokio::test]
+        async fn malformed_json_and_unknown_methods_have_spec_statuses() {
+            let app = http_app(Arc::new(deps()));
+            let response = app
+                .clone()
+                .oneshot(request("tools/list", None, "{".into()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(json(response).await["error"]["code"], -32700);
+
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":9,"method":"unknown/method","params":{{{META}}}}}"#
+            );
+            let response = app
+                .oneshot(request("unknown/method", None, body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(json(response).await["error"]["code"], -32601);
+        }
+
+        #[tokio::test]
+        async fn get_and_delete_are_not_legacy_session_transports() {
+            for method in ["GET", "DELETE"] {
+                let request = Request::builder()
+                    .method(method)
+                    .uri("/mcp")
+                    .body(Body::empty())
+                    .unwrap();
+                let response = http_app(Arc::new(deps())).oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+            }
+        }
+
+        #[tokio::test]
+        async fn rejects_untrusted_browser_origins() {
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":10,"method":"server/discover","params":{{{META}}}}}"#
+            );
+            let request = request("server/discover", None, body);
+            let (mut parts, body) = request.into_parts();
+            parts
+                .headers
+                .insert("origin", "https://attacker.example".parse().unwrap());
+            let response = http_app(Arc::new(deps()))
+                .oneshot(Request::from_parts(parts, body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn modern_http_preserves_codex_compaction_gate() {
+            let deps = deps();
+            deps.store
+                .lock()
+                .unwrap()
+                .insert_session(&session("codex-http", Provider::Codex))
+                .unwrap();
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{{"name":"request_compaction","arguments":{{"session_id":"codex-http"}},{META}}}}}"#
+            );
+            let response = http_app(Arc::new(deps))
+                .oneshot(request("tools/call", Some("request_compaction"), body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = json(response).await;
+            assert_eq!(value["result"]["structuredContent"]["supported"], false);
+        }
     }
 }

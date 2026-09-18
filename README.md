@@ -15,7 +15,7 @@ See `docs/architecture.md` for the design and the research notes for capability 
 - `uw-daemon` (`uw-daemon` binary) — the long-running service.
 - `uw-cli` (`uw` binary) — CLI, thin client over the daemon's local API.
 - `uw-web` — web UI server.
-- `uw-mcp` (`uw-mcp` binary) — MCP server for harnesses that support it.
+- `uw-mcp` (`uw-mcp` binary) — stateless HTTP MCP server, with legacy stdio available.
 
 ## Development
 
@@ -30,6 +30,28 @@ on `UW_LISTEN_ADDR`, defaulting to `127.0.0.1:7878`. Configure `uw-hook` with
 `UW_HOOK_PROVIDER=claude-code` or `UW_HOOK_PROVIDER=codex`; `UW_DAEMON_URL` defaults to
 the matching local address. Generic usage polling is available through
 `UW_GENERIC_USAGE_COMMAND`.
+
+Run `result/bin/uw-mcp` beside the daemon with the same `UW_DB_PATH`. Its MCP endpoint
+is `http://127.0.0.1:7880/mcp`; change the listener with `UW_MCP_LISTEN_ADDR`. The
+endpoint implements MCP `2026-07-28`: each JSON-RPC request is an independent HTTP
+POST with modern request metadata and the required `MCP-Protocol-Version`,
+`Mcp-Method`, and, for tool calls, `Mcp-Name` headers. It supports
+`server/discover`, `tools/list`, and `tools/call`. It does not create protocol sessions
+or expose the 2025 GET/SSE and DELETE lifecycle endpoints.
+
+The implementation intentionally covers only the documented envelope, discovery,
+tool, and stateless HTTP behavior used by these three tools. It does not attempt the
+rest of the MCP feature set, such as resources, prompts, subscriptions, MRTR, or SSE
+progress responses. This avoids inventing a server framework while Rust MCP crates
+catch up with the revision. The wire behavior follows the official
+[MCP 2026-07-28 specification](https://modelcontextprotocol.io/specification/2026-07-28).
+For old local clients, `uw-mcp --stdio` or `UW_MCP_TRANSPORT=stdio` starts the retained
+newline-delimited `2024-11-05` mode.
+
+HTTP mode rejects non-local browser origins by default. Set
+`UW_MCP_ALLOWED_ORIGINS` to a comma-separated list of exact additional origins when a
+trusted reverse proxy needs them. Keep the default loopback binding unless the
+endpoint has authentication and TLS in front of it.
 
 Automatic reseed remains off unless `UW_RESEED_AUTO=true` and all of
 `UW_SUMMARIZER_BASE_URL`, `UW_SUMMARIZER_MODEL`, `UW_RESEED_MODEL`,
