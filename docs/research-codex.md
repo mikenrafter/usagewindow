@@ -95,9 +95,7 @@ rg -n -i 'compact|context_window|context.window|auto_compact' ~/.codex/config.to
 
 The CLI help has no compact subcommand or --compact flag. It does list remote_compaction_v2 as a stable enabled feature and context_management as under development, but codex features list does not expose a user-facing compact command. The current config has no auto_compact or context_window setting.
 
-The official hook contract confirms that Codex can fire PreCompact and PostCompact for manual or auto triggers. That establishes automatic compaction exists, but the CLI does not expose a public slash command or headless compact operation in the inspected help. The exact internal trigger and token threshold are opaque to this adapter.
-
-Adapter decision: treat compaction as automatic and observe it through PreCompact/PostCompact plus SessionStart(source=compact). Do not model a Codex equivalent of sending /compact. A SessionStart(source=compact) hook can restore a short status or state summary into the immediate continuation.
+The official hook contract confirms that Codex can fire PreCompact and PostCompact for manual or auto triggers. The generated app-server protocol for the installed Codex 0.154.0 also exposes the native `thread/compact/start` request with `{ "threadId": "..." }`. The adapter uses that method through its persistent app-server transport, after the daemon's claim-before-send and idle checks. It does not send `/compact` as a user message or invoke `codex exec resume`, so it does not create a copy. PreCompact/PostCompact plus SessionStart(source=compact) remain the observation and post-compaction context hooks.
 
 ## Resume
 

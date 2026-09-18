@@ -211,6 +211,7 @@ pub struct CompactionRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompactionKind {
     AskNearLimit,
+    AgentRequested,
     OpportunisticIdle,
     AltModelReseed,
 }
@@ -328,6 +329,33 @@ pub struct ThresholdScope {
     pub model: Option<ModelId>,
     pub session: Option<SessionId>,
 }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderFetchStatus {
+    pub provider: Provider,
+    pub account: Option<AccountId>,
+    pub last_attempt_at: DateTime<Utc>,
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub consecutive_failures: u32,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompactionSource {
+    Inline,
+    External,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CompactionEvent {
+    pub id: Uuid,
+    pub session_id: SessionId,
+    pub source: CompactionSource,
+    pub trigger: Option<String>,
+    pub context_pct_before: Option<f32>,
+    pub usage_window_pct_before: Option<f32>,
+    pub tokens_before: Option<u64>,
+    pub tokens_after: Option<u64>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
 
 #[cfg(test)]
 mod tests {
@@ -406,6 +434,38 @@ mod tests {
         assert_eq!(
             profile,
             serde_json::from_str(&serde_json::to_string(&profile).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn provider_fetch_status_and_compaction_event_round_trip_through_serde() {
+        let status = ProviderFetchStatus {
+            provider: Provider::Codex,
+            account: None,
+            last_attempt_at: Utc::now(),
+            last_success_at: Some(Utc::now()),
+            last_error: Some("timeout".into()),
+            consecutive_failures: 2,
+        };
+        assert_eq!(
+            status,
+            serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap()
+        );
+        let event = CompactionEvent {
+            id: Uuid::new_v4(),
+            session_id: SessionId("s".into()),
+            source: CompactionSource::Inline,
+            trigger: Some("manual".into()),
+            context_pct_before: Some(80.0),
+            usage_window_pct_before: Some(50.0),
+            tokens_before: Some(100_000),
+            tokens_after: Some(10_000),
+            started_at: Utc::now(),
+            completed_at: None,
+        };
+        assert_eq!(
+            event,
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap()
         );
     }
 

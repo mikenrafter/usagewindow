@@ -90,16 +90,15 @@ ResumeMarker = { id: Uuid, session_id, reason: AutoDetectedLimit | ManuallyMarke
                   resume_at: Option<DateTime<Utc>>, created_at, status }
 ResumeStatus = Pending | Scheduled | Fired | Cancelled | Failed(String)
 
-// Only OpportunisticIdle and AltModelReseed go through adapter.compact() and the
-// claim-before-send queue below — they're destructive. AskNearLimit rows are an audit
-// log of adapter.advise() calls (non-destructive, not claimed/queued the same way) so
-// the /compactions UI view has one place to see all three kinds of request, not because
-// all three are delivered identically.
+// AgentRequested, OpportunisticIdle, and AltModelReseed go through adapter.compact()
+// and the claim-before-send queue below — they're destructive. AskNearLimit rows are
+// an audit log of adapter.advise() calls (non-destructive, not claimed/queued the same
+// way) so the /compactions UI view has one place to see advisory requests too.
 CompactionRequest = { id: Uuid, session_id, kind: CompactionKind, prompt: String,
                        reason: String, status: CompactionStatus, created_at }
-CompactionKind = AskNearLimit | OpportunisticIdle | AltModelReseed
+CompactionKind = AskNearLimit | AgentRequested | OpportunisticIdle | AltModelReseed
 CompactionStatus = Pending | Sending | Sent | Failed(String) | Cancelled
-// claim-before-send (OpportunisticIdle/AltModelReseed only):
+// claim-before-send (AgentRequested/OpportunisticIdle/AltModelReseed only):
 // UPDATE ... SET status='sending' WHERE id=? AND status='pending';
 // 0 rows affected => already claimed by someone else, fail closed, never retry blindly
 // (compaction delivery is destructive/non-idempotent).
@@ -144,7 +143,7 @@ trait HarnessAdapter {
 }
 
 Capabilities = {
-    can_trigger_compaction: bool,   // Claude Code: true (/compact). Codex: false (automatic/opaque).
+    can_trigger_compaction: bool,   // Claude Code: true (/compact). Codex: true (app-server compact).
     can_advise_mid_turn: bool,      // Claude Code: true (Stop's additionalContext rides the live turn).
     can_inject_at_session_start: bool, // Claude Code: true (SessionStart:compact). Codex: true (SessionStart, any source).
     can_observe_compaction: bool,   // both true: PreCompact/PostCompact (Codex) or transcript
@@ -172,6 +171,16 @@ StatusEvent = WillAutoResumeAt(DateTime<Utc>) | CompactedFromTo{before_tokens,af
             | AutoResumeCanceled | Custom(String)
 DeliveryOutcome = Delivered | QueuedForNextIdle | Unsupported
 ```
+
+#### Destructive compaction fallback
+
+Adapters may be decorated with a `FallbackCompactionAdapter`. It delegates every
+operation except `compact` to the provider-native adapter. Compaction attempts the
+native route first; only an error then sends the same queued `/compact` prompt through
+the configured meta-harness adapter, such as T3Code or Paseo. If every route fails, the
+queue row is marked failed with both errors. This keeps the fallback provider-neutral:
+future providers use the same decorator and do not need to know whether the owner is
+Paseo, T3Code, or another meta-harness.
 
 Policy implication (Phase 3): the near-limit "ask" trigger only calls `advise` when
 `can_advise_mid_turn` (or degrades to `can_inject_at_session_start`, queued for the next
@@ -230,9 +239,9 @@ an explicit "not supported for this harness" result, not a silently-dropped requ
   duration field, never by positional primary/secondary guessing (a plan change on
   OpenAI's side must not silently mis-key samples). Also carries `rateLimitReachedType`
   and `planType` — feed `rateLimitReachedType` into `StopReason::UsageLimit` detection.
-- `Capabilities`: `can_trigger_compaction: false` — compaction is automatic/opaque, no
-  `/compact`-equivalent exists (confirmed: no compact subcommand/flag in `codex --help`;
-  `remote_compaction_v2` is a stable-but-internal feature). `can_advise_mid_turn: false`
+- `Capabilities`: `can_trigger_compaction: true` — the app-server exposes the native
+  `thread/compact/start` method. This is not a `/compact` user message and does not
+  invoke `codex exec resume`. `can_advise_mid_turn: false`
   — `Stop` has no additional-context field (expects JSON, can only ask Codex to continue
   via `decision:"block"`, which is a different, more invasive primitive than Claude
   Code's passive `additionalContext`). `can_inject_at_session_start: true` — `SessionStart`
@@ -245,14 +254,14 @@ an explicit "not supported for this harness" result, not a silently-dropped requ
   size was found; idle-compact/reseed-auto/keepalive must skip (not guess) for Codex until
   a real source is confirmed (check `codex exec --json` event stream and hook payloads).
   `headless_resume: true`. `seed_modes: [InitialPrompt, ForkWithHistory]`.
-- Since `can_advise_mid_turn` and `can_trigger_compaction` are both false, the near-limit
+- Since `can_advise_mid_turn` is false, the near-limit
   policy's only available action for Codex is: checkpoint state (if/when a state-file
   convention exists for Codex — TBD, no equivalent of Claude Code's paseo-style state
   file researched yet) and log the projected exhaustion time. This is a real, accepted
   capability gap, not a bug to route around.
-- `compact`: not implemented — `Capabilities.can_trigger_compaction` is false, so
-  `uw-policy`/`uw-daemon` never call it for this adapter. `emit_status`/general status
-  strings use the `SessionStart(source:"compact")` channel above.
+- `compact`: `thread/compact/start` through the persistent app-server transport;
+  `emit_status`/general status strings use the `SessionStart(source:"compact")` channel
+  above.
 - `resume_session`: `codex exec resume <session-uuid> "Continue from the saved state."`
   (headless, targets a specific id directly — no picker). In `session.cwd`.
 - `seed_new_session(InitialPrompt, ...)`: `codex exec "<summary>"` — a blank new session
@@ -272,9 +281,11 @@ an explicit "not supported for this harness" result, not a silently-dropped requ
   `POST /api/orchestration/dispatch` endpoint. The T3Code thread UUID is the adapter's
   session id. This preserves the T3Code owner process and avoids detached `claude
   --resume` branches.
-- `Capabilities`: native headless resume is true; compaction, mid-turn advice, session
-  start injection, stop detection, usage polling, and token reporting are false until
-  T3Code exposes stable corresponding endpoints.
+- `Capabilities`: headless resume and destructive compaction delivery are true. T3Code
+  compaction is the meta-harness fallback: it sends the queued `/compact` prompt through
+  `thread.turn.start`, rather than claiming a native compaction RPC. Mid-turn advice,
+  session-start injection, stop detection, usage polling, and token reporting remain
+  false until T3Code exposes stable corresponding endpoints.
 - Authentication is explicit configuration: an already-issued bearer token or browser
   session cookie. The adapter does not mint pairing credentials or automate a browser.
 - The daemon registers this adapter only when `UW_T3CODE_URL` and exactly one of

@@ -6,6 +6,7 @@ use chrono::{DateTime, Duration, Utc};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use uw_core::adapter::{
     AdapterError, Capabilities, DeliveryOutcome, DiscoveredSession, HarnessAdapter, SeedContext,
@@ -18,6 +19,151 @@ use uw_store::Store;
 
 struct StoreHookChannel {
     db_path: String,
+}
+
+#[cfg(test)]
+mod paseo_messenger_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_paseo_agent_from_claude_session_id() {
+        let root = std::env::temp_dir().join(format!(
+            "usagewindow-paseo-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let agents = root.join("agents/project");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("agent.json"),
+            r#"{"id":"paseo-agent","runtimeInfo":{"sessionId":"claude-session"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_paseo_agent_id(&root, &SessionId("claude-session".into())).unwrap(),
+            Some("paseo-agent".into())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn does_not_resolve_an_unrelated_claude_session() {
+        let root = std::env::temp_dir().join(format!(
+            "usagewindow-paseo-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let agents = root.join("agents/project");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("agent.json"),
+            r#"{"id":"paseo-agent","persistence":{"sessionId":"other-session"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_paseo_agent_id(&root, &SessionId("claude-session".into())).unwrap(),
+            None
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+fn resolve_paseo_agent_id(home: &Path, session_id: &SessionId) -> anyhow::Result<Option<String>> {
+    fn visit(dir: &Path, session_id: &str) -> anyhow::Result<Option<String>> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(id) = visit(&path, session_id)? {
+                    return Ok(Some(id));
+                }
+                continue;
+            }
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let value: serde_json::Value = match serde_json::from_str(&std::fs::read_to_string(&path)?) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let matches = value
+                .pointer("/runtimeInfo/sessionId")
+                .or_else(|| value.pointer("/persistence/sessionId"))
+                .and_then(serde_json::Value::as_str)
+                == Some(session_id);
+            if matches
+                && let Some(id) = value.get("id").and_then(serde_json::Value::as_str)
+            {
+                return Ok(Some(id.to_owned()));
+            }
+        }
+        Ok(None)
+    }
+
+    let agents = home.join("agents");
+    if !agents.is_dir() {
+        return Ok(None);
+    }
+    visit(&agents, &session_id.0)
+}
+
+#[derive(Clone)]
+struct PaseoSessionMessenger {
+    home: PathBuf,
+    program: String,
+}
+
+impl PaseoSessionMessenger {
+    fn from_environment() -> Self {
+        let home = std::env::var_os("PASEO_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".paseo")))
+            .unwrap_or_else(|| PathBuf::from(".paseo"));
+        Self {
+            home,
+            program: std::env::var("UW_PASEO_CLI").unwrap_or_else(|_| "paseo".into()),
+        }
+    }
+}
+
+#[async_trait]
+impl uw_adapters::claude_code::SessionMessenger for PaseoSessionMessenger {
+    async fn send(
+        &self,
+        session_id: &SessionId,
+        text: &str,
+    ) -> uw_core::adapter::AdapterResult<DeliveryOutcome> {
+        let home = self.home.clone();
+        let session_id = session_id.clone();
+        let agent_id = tokio::task::spawn_blocking(move || resolve_paseo_agent_id(&home, &session_id))
+            .await
+            .map_err(|error| AdapterError::Other(error.to_string()))?
+            .map_err(|error| AdapterError::Other(error.to_string()))?
+            .ok_or(AdapterError::Unsupported)?;
+        let output = tokio::process::Command::new(&self.program)
+            .args(["send", "--no-wait", &agent_id, text])
+            .output()
+            .await
+            .map_err(|error| AdapterError::Transient(error.to_string()))?;
+        if !output.status.success() {
+            return Err(AdapterError::Other(format!(
+                "Paseo send failed for agent {agent_id}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(DeliveryOutcome::Delivered)
+    }
+}
+
+#[async_trait]
+impl uw_adapters::fallback::MetaHarnessMessenger for PaseoSessionMessenger {
+    async fn send(
+        &self,
+        session_id: &SessionId,
+        text: &str,
+    ) -> uw_core::adapter::AdapterResult<DeliveryOutcome> {
+        <Self as uw_adapters::claude_code::SessionMessenger>::send(self, session_id, text).await
+    }
 }
 
 #[async_trait]
@@ -85,10 +231,17 @@ pub fn plan_compaction_tick(
             "adapter cannot honor destructive compaction requests".into(),
         );
     }
-    if !idle {
-        CompactionPlan::WaitForIdle
-    } else {
-        CompactionPlan::ClaimAndSend
+    match _request.kind {
+        CompactionKind::AgentRequested | CompactionKind::AskNearLimit => {
+            CompactionPlan::ClaimAndSend
+        }
+        CompactionKind::OpportunisticIdle | CompactionKind::AltModelReseed => {
+            if idle {
+                CompactionPlan::ClaimAndSend
+            } else {
+                CompactionPlan::WaitForIdle
+            }
+        }
     }
 }
 
@@ -162,6 +315,15 @@ pub trait ObservationStore: Send + Sync {
         provider: Provider,
         found: DiscoveredSession,
         now: DateTime<Utc>,
+    ) -> anyhow::Result<()>;
+    /// Records the outcome of a provider usage poll without touching `usage_samples` —
+    /// a failure must never clobber the last-known-good sample.
+    async fn record_fetch_result(
+        &self,
+        provider: Provider,
+        account: Option<AccountId>,
+        result: Result<(), String>,
+        at: DateTime<Utc>,
     ) -> anyhow::Result<()>;
 }
 
@@ -431,6 +593,22 @@ impl ObservationStore for SqliteDaemonStore {
         })
         .await
     }
+    async fn record_fetch_result(
+        &self,
+        provider: Provider,
+        account: Option<AccountId>,
+        result: Result<(), String>,
+        at: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        self.blocking(move |store| {
+            match &result {
+                Ok(()) => store.record_fetch_success(&provider, account.as_ref(), at)?,
+                Err(error) => store.record_fetch_failure(&provider, account.as_ref(), at, error)?,
+            }
+            Ok(())
+        })
+        .await
+    }
 }
 
 /// Polls each registered provider once, then checks every tracked session for a
@@ -445,10 +623,21 @@ pub async fn run_observation_tick(
     for adapter in adapters.values() {
         match adapter.fetch_usage(None).await {
             Ok(sample) => {
+                store
+                    .record_fetch_result(adapter.provider(), None, Ok(()), Utc::now())
+                    .await?;
                 store.record_usage(sample).await?;
                 report.samples_recorded += 1;
             }
             Err(error) => {
+                store
+                    .record_fetch_result(
+                        adapter.provider(),
+                        None,
+                        Err(error.to_string()),
+                        Utc::now(),
+                    )
+                    .await?;
                 report.adapter_errors += 1;
                 tracing::warn!(provider = ?adapter.provider(), %error, "usage poll failed");
             }
@@ -755,7 +944,10 @@ pub async fn run_compaction_tick(
     for request in store.pending_compactions().await? {
         if !matches!(
             request.kind,
-            CompactionKind::OpportunisticIdle | CompactionKind::AltModelReseed
+            CompactionKind::AskNearLimit
+                | CompactionKind::AgentRequested
+                | CompactionKind::OpportunisticIdle
+                | CompactionKind::AltModelReseed
         ) {
             continue;
         }
@@ -1325,6 +1517,9 @@ pub async fn run_production_ticks(
     let auto_reseed = auto_reseed_runtime_from_env();
     loop {
         ticker.tick().await;
+        // Explicit compaction requests are destructive and user-directed. Dispatch
+        // them before provider observation, which may block on a harness transport.
+        run_compaction_tick(store.as_ref(), adapters, liveness).await?;
         run_observation_tick(store.as_ref(), adapters).await?;
         let retention_days = std::env::var("UW_RETENTION_DAYS")
             .ok()
@@ -1395,7 +1590,6 @@ pub async fn run_production_ticks(
             )
             .await?;
         }
-        run_compaction_tick(store.as_ref(), adapters, liveness).await?;
         run_resume_tick(store.as_ref(), adapters, Utc::now()).await?;
     }
 }
@@ -1440,14 +1634,24 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
     let hook_channel = Arc::new(StoreHookChannel {
         db_path: path.clone(),
     });
+    let paseo_messenger = Arc::new(PaseoSessionMessenger::from_environment());
     let claude = uw_adapters::claude_code::ClaudeCodeAdapter::real(
         cache_path,
         std::env::var("UW_CLAUDE_VERSION").unwrap_or_else(|_| "unknown".into()),
     )
-    .with_hook_channel(hook_channel.clone());
-    let codex = uw_adapters::codex::CodexAdapter::real().with_hook_channel(hook_channel);
+    .with_delivery(
+        hook_channel.clone(),
+        paseo_messenger.clone(),
+        Arc::new(uw_adapters::process::TokioProcessSpawner),
+    );
+    let paseo_fallback: Arc<dyn HarnessAdapter> = Arc::new(
+        uw_adapters::fallback::MessageCompactionAdapter::new(paseo_messenger),
+    );
+    let mut codex: Arc<dyn HarnessAdapter> = Arc::new(
+        uw_adapters::codex::CodexAdapter::real().with_hook_channel(hook_channel),
+    );
     let mut adapters: HashMap<Provider, Arc<dyn HarnessAdapter>> = HashMap::from([
-        (Provider::Codex, Arc::new(codex) as Arc<dyn HarnessAdapter>),
+        (Provider::Codex, codex.clone()),
         (
             Provider::ClaudeCode,
             Arc::new(claude) as Arc<dyn HarnessAdapter>,
@@ -1489,12 +1693,24 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
             }
         };
         if let Some(auth) = auth {
+            let t3code: Arc<dyn HarnessAdapter> = Arc::new(
+                uw_adapters::t3code::T3CodeAdapter::real(base_url, auth),
+            );
+            codex = Arc::new(uw_adapters::fallback::FallbackCompactionAdapter::new(
+                codex,
+                t3code.clone(),
+            ));
             adapters.insert(
                 Provider::Other("t3code".into()),
-                Arc::new(uw_adapters::t3code::T3CodeAdapter::real(base_url, auth)),
+                t3code,
             );
         }
     }
+    codex = Arc::new(uw_adapters::fallback::FallbackCompactionAdapter::new(
+        codex,
+        paseo_fallback,
+    ));
+    adapters.insert(Provider::Codex, codex);
     let liveness = SystemSessionLivenessChecker {
         db_path: path.clone(),
     };
@@ -1968,6 +2184,15 @@ mod tests {
         ) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn record_fetch_result(
+            &self,
+            _: Provider,
+            _: Option<AccountId>,
+            _: Result<(), String>,
+            _: DateTime<Utc>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     struct ObservationAdapter {
@@ -2193,7 +2418,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ask_near_limit_is_never_sent_to_destructive_compact() {
+    async fn ask_near_limit_is_sent_immediately_even_when_session_is_active() {
         let compacted = Arc::new(StdMutex::new(0));
         let adapter = Arc::new(FakeAdapter {
             capabilities: caps(true, true, false),
@@ -2212,6 +2437,47 @@ mod tests {
             active_resume: None,
             resolved: Arc::new(StdMutex::new(vec![])),
         };
+        struct NeverIdle;
+        #[async_trait]
+        impl SessionLivenessChecker for NeverIdle {
+            async fn is_idle(&self, _: &SessionSummary) -> bool {
+                false
+            }
+        }
+        run_compaction_tick(
+            &store,
+            &HashMap::from([(Provider::ClaudeCode, adapter as Arc<dyn HarnessAdapter>)]),
+            &NeverIdle,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*compacted.lock().unwrap(), 1);
+        assert!(matches!(
+            store.status.lock().unwrap()[0],
+            CompactionStatus::Sent
+        ));
+    }
+
+    #[tokio::test]
+    async fn agent_requested_compaction_is_claimed_and_sent() {
+        let compacted = Arc::new(StdMutex::new(0));
+        let adapter = Arc::new(FakeAdapter {
+            capabilities: caps(true, true, false),
+            compacted: compacted.clone(),
+            advised: Arc::new(StdMutex::new(0)),
+        });
+        let mut requested = request();
+        requested.kind = CompactionKind::AgentRequested;
+        let store = FakeStore {
+            request: StdMutex::new(Some(requested)),
+            owner: session(),
+            claim: true,
+            status: StdMutex::new(vec![]),
+            samples: vec![],
+            enqueues: Arc::new(StdMutex::new(0)),
+            active_resume: None,
+            resolved: Arc::new(StdMutex::new(vec![])),
+        };
         run_compaction_tick(
             &store,
             &HashMap::from([(Provider::ClaudeCode, adapter as Arc<dyn HarnessAdapter>)]),
@@ -2219,7 +2485,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(*compacted.lock().unwrap(), 0);
+        assert_eq!(*compacted.lock().unwrap(), 1);
+        assert!(matches!(
+            store.status.lock().unwrap()[0],
+            CompactionStatus::Sent
+        ));
     }
 
     #[tokio::test]

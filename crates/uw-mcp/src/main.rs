@@ -47,7 +47,7 @@ fn tool_definitions() -> Value {
     json!({"tools":[
         {"name":"get_usage","description":"Read the latest usage-window state.","inputSchema":{"type":"object","properties":{"provider":{"type":"string"},"account":{"type":"string"}}}},
         {"name":"get_resume_state","description":"Read resume markers for a session.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}},
-        {"name":"request_compaction","description":"Queue a compaction request when this harness supports triggering compaction.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"prompt":{"type":"string"},"reason":{"type":"string"}},"required":["session_id"]}}
+        {"name":"request_compaction","description":"Queue an agent-requested compaction for a harness with a live message transport.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"prompt":{"type":"string"},"reason":{"type":"string"}},"required":["session_id"]}}
     ]})
 }
 
@@ -93,6 +93,11 @@ fn get_usage(args: &Value, deps: &Deps) -> Result<Value, String> {
                     pct: window.pct,
                     resets_at: window.resets_at,
                     exceeded: window.exceeded,
+                    // MCP surface stays lightweight: burn rate / exhaustion projection and
+                    // per-window session counts are HTTP-API-only (see uw-web::status).
+                    burn_rate_pct_per_hour: None,
+                    active_sessions: 0,
+                    depletes_at: None,
                 })
                 .collect(),
         })
@@ -100,6 +105,8 @@ fn get_usage(args: &Value, deps: &Deps) -> Result<Value, String> {
     serde_json::to_value(StatusResponse {
         usage,
         last_updated: Utc::now(),
+        provider_status: store.fetch_statuses().map_err(|e| e.to_string())?,
+        keepalive_active_count: store.keepalive_active_count().map_err(|e| e.to_string())?,
     })
     .map_err(|e| e.to_string())
 }
@@ -155,7 +162,7 @@ fn call_tool(name: &str, args: &Value, deps: &Deps) -> Result<Value, String> {
             let request = CompactionRequest {
                 id: uuid::Uuid::new_v4(),
                 session_id,
-                kind: CompactionKind::AskNearLimit,
+                kind: CompactionKind::AgentRequested,
                 prompt,
                 reason,
                 status: CompactionStatus::Pending,
@@ -667,6 +674,41 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+    #[test]
+    fn request_compaction_queues_an_agent_requested_claude_delivery() {
+        let mut deps = deps();
+        let s = session("claude-session", Provider::ClaudeCode);
+        deps.store.lock().unwrap().insert_session(&s).unwrap();
+        deps.adapters.insert(
+            Provider::ClaudeCode,
+            Arc::new(FakeAdapter {
+                provider: Provider::ClaudeCode,
+                capabilities: Capabilities {
+                    can_trigger_compaction: true,
+                    can_advise_mid_turn: false,
+                    can_inject_at_session_start: true,
+                    can_observe_compaction: true,
+                    reports_token_counts: true,
+                    headless_resume: true,
+                    seed_modes: vec![SeedMode::InitialPrompt],
+                },
+            }),
+        );
+        let response = handle_request(
+            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"request_compaction","arguments":{"session_id":"claude-session","prompt":"/compact"}}}),
+            &deps,
+        );
+        assert_eq!(response["result"]["structuredContent"]["supported"], true);
+        let request = deps
+            .store
+            .lock()
+            .unwrap()
+            .pending_compaction_requests()
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(request.kind, CompactionKind::AgentRequested);
     }
     #[test]
     fn unknown_method_returns_json_rpc_error() {

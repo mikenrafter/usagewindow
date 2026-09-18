@@ -503,6 +503,11 @@ impl DirectReader for StoreReader {
                         pct: w.pct,
                         resets_at: w.resets_at,
                         exceeded: w.exceeded,
+                        // CLI status stays lightweight: burn rate / exhaustion projection and
+                        // per-window session counts are HTTP-API-only (see uw-web::status).
+                        burn_rate_pct_per_hour: None,
+                        active_sessions: 0,
+                        depletes_at: None,
                     })
                     .collect();
                 ProviderUsageSummary {
@@ -515,6 +520,8 @@ impl DirectReader for StoreReader {
         Ok(StatusResponse {
             usage,
             last_updated: Utc::now(),
+            provider_status: self.store.fetch_statuses()?,
+            keepalive_active_count: self.store.keepalive_active_count()?,
         })
     }
     fn sessions_list(
@@ -529,14 +536,22 @@ impl DirectReader for StoreReader {
             .filter(|s| {
                 harness.is_none_or(|h| h == &s.harness) && (stopped || s.stopped_reason.is_none())
             })
-            .map(|s| SessionListItem {
-                id: s.id,
-                harness: s.harness,
-                model: s.model,
-                account: s.account,
-                last_seen: s.last_seen,
-                stopped_reason: s.stopped_reason,
-                resume_status: s.resume_marker.map(|m| m.status),
+            .map(|s| {
+                let keepalive = self
+                    .store
+                    .keepalive_config(&s.id)
+                    .map(|k| k.enabled)
+                    .unwrap_or(false);
+                SessionListItem {
+                    id: s.id,
+                    harness: s.harness,
+                    model: s.model,
+                    account: s.account,
+                    last_seen: s.last_seen,
+                    stopped_reason: s.stopped_reason,
+                    resume_status: s.resume_marker.map(|m| m.status),
+                    keepalive,
+                }
             })
             .collect())
     }
@@ -599,6 +614,8 @@ mod tests {
                 Ok(StatusResponse {
                     usage: vec![],
                     last_updated: Utc::now(),
+                    provider_status: vec![],
+                    keepalive_active_count: 0,
                 })
             }
         }
@@ -653,6 +670,8 @@ mod tests {
             Ok(StatusResponse {
                 usage: vec![],
                 last_updated: Utc::now(),
+                provider_status: vec![],
+                keepalive_active_count: 0,
             })
         }
         fn sessions_list(&mut self, _: bool, _: Option<&Provider>) -> Result<Vec<SessionListItem>> {
@@ -717,6 +736,8 @@ mod tests {
                 axum::Json(StatusResponse {
                     usage: vec![],
                     last_updated: Utc::now(),
+                    provider_status: vec![],
+                    keepalive_active_count: 0,
                 })
             }),
         );

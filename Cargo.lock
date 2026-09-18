@@ -1734,6 +1734,7 @@ dependencies = [
  "tower",
  "uuid",
  "uw-core",
+ "uw-policy",
  "uw-store",
 ]
 

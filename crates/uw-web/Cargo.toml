@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 uw-core.workspace = true
+uw-policy.workspace = true
 uw-store.workspace = true
 tokio.workspace = true
 anyhow.workspace = true

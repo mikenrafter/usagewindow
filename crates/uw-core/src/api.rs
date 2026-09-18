@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub struct StatusResponse {
     pub usage: Vec<ProviderUsageSummary>,
     pub last_updated: DateTime<Utc>,
+    pub provider_status: Vec<ProviderFetchStatus>,
+    pub keepalive_active_count: u32,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProviderUsageSummary {
@@ -19,6 +21,9 @@ pub struct UsageWindowSummary {
     pub pct: f32,
     pub resets_at: Option<DateTime<Utc>>,
     pub exceeded: bool,
+    pub burn_rate_pct_per_hour: Option<f32>,
+    pub active_sessions: u32,
+    pub depletes_at: Option<DateTime<Utc>>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionListItem {
@@ -29,6 +34,14 @@ pub struct SessionListItem {
     pub last_seen: DateTime<Utc>,
     pub stopped_reason: Option<StopReason>,
     pub resume_status: Option<ResumeStatus>,
+    pub keepalive: bool,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionsPage {
+    pub items: Vec<SessionListItem>,
+    pub total: u32,
+    pub offset: u32,
+    pub limit: u32,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionDetail {
@@ -125,9 +138,21 @@ mod tests {
                     pct: 42.0,
                     resets_at: None,
                     exceeded: false,
+                    burn_rate_pct_per_hour: Some(1.5),
+                    active_sessions: 2,
+                    depletes_at: None,
                 }],
             }],
             last_updated: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            provider_status: vec![ProviderFetchStatus {
+                provider: Provider::Codex,
+                account: None,
+                last_attempt_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+                last_success_at: None,
+                last_error: Some("timeout".into()),
+                consecutive_failures: 1,
+            }],
+            keepalive_active_count: 3,
         });
     }
 
@@ -141,8 +166,15 @@ mod tests {
             last_seen: Utc::now(),
             stopped_reason: None,
             resume_status: None,
+            keepalive: false,
         };
-        round_trip(item);
+        round_trip(item.clone());
+        round_trip(SessionsPage {
+            items: vec![item],
+            total: 1,
+            offset: 0,
+            limit: 15,
+        });
         round_trip(SessionDetail {
             summary: SessionSummary {
                 id: SessionId("s".into()),
@@ -200,6 +232,22 @@ mod tests {
             },
             field: "closing_pct".into(),
             value: "85".into(),
+        });
+    }
+
+    #[test]
+    fn compaction_event_dto_round_trips() {
+        round_trip(CompactionEvent {
+            id: uuid::Uuid::new_v4(),
+            session_id: SessionId("s".into()),
+            source: CompactionSource::External,
+            trigger: Some("auto".into()),
+            context_pct_before: Some(90.0),
+            usage_window_pct_before: Some(60.0),
+            tokens_before: Some(150_000),
+            tokens_after: None,
+            started_at: Utc::now(),
+            completed_at: None,
         });
     }
 

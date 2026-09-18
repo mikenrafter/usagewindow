@@ -185,8 +185,11 @@ the hook endpoint remains a loopback-only local trust boundary.
   claim full live-session coverage; the current queue is bounded and fail-open but may
   wait for the next matching hook.
 - Claude Code 2.1.267 documents `--bg` and says `--resume` preserves the background id
-  unless the session is already running, in which case it starts a copy. That does not
-  establish a safe external messenger for an already-running idle process. The real
-  adapter therefore still reports `can_trigger_compaction: false` unless a verified
-  `SessionMessenger` is supplied. The next test must use the owning background process'
-  supported message or remote-control interface and prove it does not create a copy.
+  unless the session is already running, in which case it starts a copy. The Paseo
+  owning process provides the safe external messenger: `paseo send --no-wait <agent-id>
+  <message>`. The daemon resolves the Claude native session id to Paseo's persisted
+  agent id through `runtimeInfo.sessionId`/`persistence.sessionId`, then sends the
+  literal `/compact` message through that agent-message path. It never invokes
+  `claude --resume` for compaction and therefore does not create a copy. The mapping
+  uses `PASEO_HOME` (falling back to `$HOME/.paseo`) and `UW_PASEO_CLI` can override
+  the CLI executable.

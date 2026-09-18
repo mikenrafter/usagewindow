@@ -6,7 +6,7 @@ use axum::{
     response::Response,
     routing::{get, post},
 };
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use std::{
@@ -51,6 +51,7 @@ pub fn app_with_adapters(
         .route("/api/sessions/{id}/keepalive", post(keepalive))
         .route("/api/hooks", post(hook_ingress))
         .route("/api/thresholds", get(thresholds_get).post(thresholds_set))
+        .route("/api/compactions/recent", get(compactions_recent))
         .fallback(static_asset)
         .with_state(AppState {
             store: Arc::new(Mutex::new(store)),
@@ -137,6 +138,10 @@ async fn hook_ingress(
     let now = Utc::now();
     let output_event = event.clone();
     let output_provider = provider.clone();
+    let trigger = payload
+        .get("trigger")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
     let messages = read(state, move |store| {
         store.upsert_session(&SessionSummary {
             id: id.clone(),
@@ -157,6 +162,14 @@ async fn hook_ingress(
             reseeded_from: None,
         })?;
         store.record_hook_event(&id, &event)?;
+        match event.as_str() {
+            "PreCompact" => record_pre_compact(store, &id, trigger, now)?,
+            "PostCompact" => {
+                let tokens_after = store.read_session(&id)?.last_known_token_count;
+                store.complete_compaction_event(&id, tokens_after, now)?;
+            }
+            _ => {}
+        }
         Ok(store.take_hook_messages(&id, &event)?)
     })
     .await?;
@@ -174,6 +187,53 @@ async fn hook_ingress(
             "additionalContext": messages.join("\n")
         }
     })))
+}
+
+/// Opens a compaction_events row for a PreCompact hook. `source` is a heuristic:
+/// a `CompactionRequest` we sent ourselves (Sending/Sent, created within the last
+/// 5 minutes) means this compaction was triggered by us (Inline); otherwise the
+/// harness/user triggered it on their own (External) — there's no direct FK
+/// linking a `CompactionRequest` to the hook event, so timing is the best signal available.
+fn record_pre_compact(
+    store: &Store,
+    id: &SessionId,
+    trigger: Option<String>,
+    now: chrono::DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let session = store.read_session(id)?;
+    let inline = store.compaction_requests_for_session(id)?.into_iter().any(|r| {
+        matches!(r.status, CompactionStatus::Sending | CompactionStatus::Sent)
+            && (now - r.created_at) <= chrono::Duration::minutes(5)
+    });
+    let tokens_before = session.last_known_token_count;
+    let context_pct_before = match (tokens_before, session.context_window_size) {
+        (Some(tokens), Some(window)) if window > 0 => Some(tokens as f32 / window as f32 * 100.0),
+        _ => None,
+    };
+    // Best-effort snapshot: the highest pct across this session's provider/account
+    // windows in the most recent sample, since a session can be gated by whichever
+    // window is closest to its limit, not necessarily the first one in the map.
+    let usage_window_pct_before = store
+        .all_usage_samples()?
+        .into_iter()
+        .filter(|s| s.provider == session.harness && s.account == session.account)
+        .max_by_key(|s| s.at)
+        .and_then(|s| s.windows.values().map(|w| w.pct).fold(None, |acc: Option<f32>, pct| {
+            Some(acc.map_or(pct, |acc| acc.max(pct)))
+        }));
+    store.insert_compaction_event(&CompactionEvent {
+        id: uuid::Uuid::new_v4(),
+        session_id: id.clone(),
+        source: if inline { CompactionSource::Inline } else { CompactionSource::External },
+        trigger,
+        context_pct_before,
+        usage_window_pct_before,
+        tokens_before,
+        tokens_after: None,
+        started_at: now,
+        completed_at: None,
+    })?;
+    Ok(())
 }
 
 fn supports_hook_event(provider: &Provider, event: &str) -> bool {
@@ -251,8 +311,10 @@ async fn status(
     let model = query.model.map(ModelId);
     let account = query.account.map(AccountId);
     let value = read(state, move |store| {
+        let all_samples = store.all_usage_samples()?;
+        let sessions = store.list_sessions()?;
         let mut latest: BTreeMap<String, UsageSample> = BTreeMap::new();
-        for mut sample in store.all_usage_samples()? {
+        for mut sample in all_samples.iter().cloned() {
             if provider.as_ref().is_some_and(|p| p != &sample.provider) || account.as_ref().is_some_and(|a| Some(a) != sample.account.as_ref()) { continue; }
             if let Some(model) = &model { sample.windows.retain(|key, _| matches!(&key.kind, WindowKind::WeeklyModel(candidate) if candidate == model)); }
             if sample.windows.is_empty() { continue; }
@@ -264,37 +326,103 @@ async fn status(
                 _ => {}
             }
         }
-        Ok(StatusResponse { usage: latest.into_values().map(|sample| ProviderUsageSummary { provider: sample.provider, account: sample.account, windows: sample.windows.into_iter().map(|(key, window)| UsageWindowSummary { window: key.kind, pct: window.pct, resets_at: window.resets_at, exceeded: window.exceeded }).collect() }).collect(), last_updated: Utc::now() })
+        let now = Utc::now();
+        let activity_cutoff = now - Duration::minutes(30);
+        let active_session_ids = sessions
+            .iter()
+            .filter(|session| session.stopped_reason.is_none())
+            .map(|session| {
+                let active = store
+                    .token_usage_for_session(&session.id)?
+                    .into_iter()
+                    .any(|record| record.at >= activity_cutoff && record.total_tokens > 0);
+                Ok((session.id.clone(), active))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let usage = latest.into_values().map(|sample| {
+            let provider = sample.provider.clone();
+            let account = sample.account.clone();
+            let active_sessions = sessions
+                .iter()
+                .filter(|s| {
+                    s.harness == provider
+                        && s.account == account
+                        && active_session_ids
+                            .iter()
+                            .any(|(id, active)| id == &s.id && *active)
+                })
+                .count() as u32;
+            let windows = sample.windows.into_iter().map(|(key, window)| {
+                let window_key = WindowKey { provider: provider.clone(), kind: key.kind.clone() };
+                let blocks = uw_policy::segment_blocks(&all_samples, &window_key, account.as_ref());
+                let burn_rate_pct_per_hour = blocks.last().and_then(|block| uw_policy::burn_rate_pct_per_hour_available(block, chrono::Duration::minutes(30)));
+                let depletes_at = burn_rate_pct_per_hour.filter(|rate| *rate > 0.0).map(|rate| {
+                    let minutes_remaining = (100.0 - window.pct) / rate * 60.0;
+                    now + chrono::Duration::minutes(minutes_remaining.max(0.0) as i64)
+                });
+                UsageWindowSummary { window: key.kind, pct: window.pct, resets_at: window.resets_at, exceeded: window.exceeded, burn_rate_pct_per_hour, active_sessions, depletes_at }
+            }).collect();
+            ProviderUsageSummary { provider, account, windows }
+        }).collect();
+        Ok(StatusResponse {
+            usage,
+            last_updated: now,
+            provider_status: store.fetch_statuses()?,
+            keepalive_active_count: store.keepalive_active_count()?,
+        })
     }).await?;
     Ok(Json(value))
 }
+
+const DEFAULT_SESSIONS_LIMIT: u32 = 15;
+const MAX_SESSIONS_LIMIT: u32 = 200;
 
 #[derive(Debug, Deserialize, Default)]
 struct SessionsQuery {
     stopped: Option<bool>,
     harness: Option<String>,
     q: Option<String>,
+    offset: Option<u32>,
+    limit: Option<u32>,
 }
 
 async fn sessions(
     State(state): State<AppState>,
     Query(query): Query<SessionsQuery>,
-) -> Result<Json<Vec<SessionListItem>>, (StatusCode, String)> {
+) -> Result<Json<SessionsPage>, (StatusCode, String)> {
     let harness: Option<Provider> = query.harness.and_then(|value| value.parse().ok());
     let include_stopped = query.stopped.unwrap_or(false);
+    let offset = query.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(DEFAULT_SESSIONS_LIMIT).min(MAX_SESSIONS_LIMIT);
     Ok(Json(
         read(state, move |store| {
-            let mut items = Vec::new();
+            let mut matching = Vec::new();
             for s in store.search_sessions(query.q.as_deref())? {
                 if !harness.as_ref().is_none_or(|h| h == &s.harness)
                     || (!include_stopped && s.stopped_reason.is_some())
                 {
                     continue;
                 }
+                matching.push(s);
+            }
+            let total = matching.len() as u32;
+            // Filtering (harness/stopped/q) happens above in Rust rather than SQL, so
+            // pagination is a plain slice here too — this DB is small/local and doing
+            // it in SQL would require duplicating those filters in the query.
+            let mut items = Vec::new();
+            for s in matching
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+            {
                 let resume_status = store
                     .resume_markers_for_session(&s.id)?
                     .last()
                     .map(|m| m.status.clone());
+                let keepalive = store
+                    .keepalive_config(&s.id)
+                    .map(|k| k.enabled)
+                    .unwrap_or(false);
                 items.push(SessionListItem {
                     id: s.id,
                     harness: s.harness,
@@ -303,9 +431,10 @@ async fn sessions(
                     last_seen: s.last_seen,
                     stopped_reason: s.stopped_reason,
                     resume_status,
+                    keepalive,
                 });
             }
-            Ok(items)
+            Ok(SessionsPage { items, total, offset, limit })
         })
         .await?,
     ))
@@ -616,6 +745,24 @@ async fn thresholds_set(
     ))
 }
 
+const DEFAULT_COMPACTIONS_LIMIT: u32 = 20;
+const MAX_COMPACTIONS_LIMIT: u32 = 200;
+
+#[derive(Debug, Deserialize, Default)]
+struct CompactionsQuery {
+    limit: Option<u32>,
+}
+
+async fn compactions_recent(
+    State(state): State<AppState>,
+    Query(query): Query<CompactionsQuery>,
+) -> Result<Json<Vec<CompactionEvent>>, (StatusCode, String)> {
+    let limit = query.limit.unwrap_or(DEFAULT_COMPACTIONS_LIMIT).min(MAX_COMPACTIONS_LIMIT);
+    Ok(Json(
+        read(state, move |store| Ok(store.recent_compaction_events(limit)?)).await?,
+    ))
+}
+
 async fn static_asset() -> Response<Body> {
     let Some(asset) = Assets::get("index.html") else {
         return Response::builder()
@@ -637,6 +784,7 @@ mod tests {
     use chrono::Utc;
     use std::collections::HashMap;
     use tower::ServiceExt;
+    use uw_core::adapter::TokenUsageRecord;
 
     fn session() -> SessionSummary {
         SessionSummary {
@@ -695,6 +843,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn status_counts_only_sessions_with_recent_token_usage_as_active() {
+        let store = Store::open_memory().unwrap();
+        let active = session();
+        let mut idle = session();
+        idle.id = SessionId("session-2".into());
+        store.insert_session(&active).unwrap();
+        store.insert_session(&idle).unwrap();
+        store
+            .insert_token_usage_records(
+                &active.id,
+                &[TokenUsageRecord {
+                    at: Utc::now(),
+                    model: active.model.clone(),
+                    input_tokens: 100,
+                    cached_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 20,
+                    reasoning_output_tokens: 0,
+                    total_tokens: 120,
+                }],
+            )
+            .unwrap();
+        store
+            .insert_usage_sample(&UsageSample {
+                at: Utc::now(),
+                fetched_at: None,
+                source: UsageSource::ProviderReported,
+                provider: Provider::Codex,
+                account: None,
+                windows: HashMap::from([(
+                    WindowKey {
+                        provider: Provider::Codex,
+                        kind: WindowKind::Rolling { minutes: 300 },
+                    },
+                    UsageWindowState::new(42.0, false, true, None, None),
+                )]),
+                credits: None,
+            })
+            .unwrap();
+
+        let response = app(store)
+            .oneshot(Request::get("/api/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: StatusResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(value.usage[0].windows[0].active_sessions, 1);
     }
 
     #[tokio::test]
@@ -877,6 +1078,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn precompact_postcompact_hooks_record_inline_and_external_compaction_events() {
+        let id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b40";
+        let path = format!("/tmp/{id}.jsonl");
+        let store = Store::open_memory().unwrap();
+        store.insert_session(&{
+            let mut s = session();
+            s.id = SessionId(id.into());
+            s.harness = Provider::ClaudeCode;
+            s
+        }).unwrap();
+        // A CompactionRequest we issued ourselves and have already claimed for
+        // delivery (Sending), so the upcoming PreCompact should be classified
+        // as Inline.
+        let request = CompactionRequest {
+            id: uuid::Uuid::new_v4(),
+            session_id: SessionId(id.into()),
+            kind: CompactionKind::AskNearLimit,
+            prompt: "compact".into(),
+            reason: "near limit".into(),
+            status: CompactionStatus::Pending,
+            created_at: Utc::now(),
+        };
+        store.insert_compaction_request(&request).unwrap();
+        assert!(store.claim_compaction(request.id).unwrap());
+        let router = app(store);
+
+        let precompact = router
+            .clone()
+            .oneshot(
+                Request::post("/api/hooks?provider=claude-code")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "hook_event_name": "PreCompact",
+                            "session_id": id,
+                            "source": "compact",
+                            "transcript_path": path,
+                            "trigger": "manual"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(precompact.status(), StatusCode::OK);
+
+        router
+            .clone()
+            .oneshot(
+                Request::post("/api/hooks?provider=claude-code")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "hook_event_name": "PostCompact",
+                            "session_id": id,
+                            "source": "compact",
+                            "transcript_path": path
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // A second session with no CompactionRequest history — its PreCompact
+        // must be classified as External.
+        let other_id = "7fd75ec4-661a-4d52-8308-b65c60f44b85";
+        let other_path = format!("/tmp/{other_id}.jsonl");
+        router
+            .clone()
+            .oneshot(
+                Request::post("/api/hooks?provider=claude-code")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "hook_event_name": "SessionStart",
+                            "session_id": other_id,
+                            "source": "startup",
+                            "transcript_path": other_path
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        router
+            .clone()
+            .oneshot(
+                Request::post("/api/hooks?provider=claude-code")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "hook_event_name": "PreCompact",
+                            "session_id": other_id,
+                            "source": "compact",
+                            "transcript_path": other_path,
+                            "trigger": "auto"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let response = router
+            .oneshot(
+                Request::get("/api/compactions/recent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let events: Vec<CompactionEvent> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(events.len(), 2);
+        let inline = events
+            .iter()
+            .find(|e| e.session_id == SessionId(id.into()))
+            .unwrap();
+        assert_eq!(inline.source, CompactionSource::Inline);
+        assert_eq!(inline.trigger.as_deref(), Some("manual"));
+        assert!(inline.completed_at.is_some());
+        let external = events
+            .iter()
+            .find(|e| e.session_id == SessionId(other_id.into()))
+            .unwrap();
+        assert_eq!(external.source, CompactionSource::External);
+        assert_eq!(external.trigger.as_deref(), Some("auto"));
+        assert!(external.completed_at.is_none());
+    }
+
+    #[tokio::test]
     async fn resume_compaction_and_threshold_routes_write_store() {
         let store = Store::open_memory().unwrap();
         store.insert_session(&session()).unwrap();
@@ -973,9 +1313,53 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let items: Vec<SessionListItem> = serde_json::from_slice(&body).unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].id, SessionId("alpha".into()));
+        let page: SessionsPage = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].id, SessionId("alpha".into()));
+    }
+
+    #[tokio::test]
+    async fn sessions_are_paginated_with_a_sane_default_and_cap() {
+        let store = Store::open_memory().unwrap();
+        for i in 0..3 {
+            let mut s = session();
+            s.id = SessionId(format!("session-{i}"));
+            store.insert_session(&s).unwrap();
+        }
+        let router = app(store);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/api/sessions?limit=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: SessionsPage = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.total, 3);
+        assert_eq!(page.limit, 2);
+        assert_eq!(page.offset, 0);
+
+        let response = router
+            .oneshot(
+                Request::get("/api/sessions?offset=2&limit=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: SessionsPage = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.total, 3);
     }
 
     #[tokio::test]

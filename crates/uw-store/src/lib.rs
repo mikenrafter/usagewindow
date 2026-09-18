@@ -49,6 +49,13 @@ impl Store {
         {
             return Err(err.into());
         }
+        if let Err(err) = self
+            .connection
+            .execute("ALTER TABLE compaction_requests ADD COLUMN status_detail TEXT", [])
+            && !err.to_string().contains("duplicate column name")
+        {
+            return Err(err.into());
+        }
         Ok(())
     }
     pub fn insert_usage_sample(&self, s: &UsageSample) -> StoreResult<i64> {
@@ -219,7 +226,7 @@ impl Store {
         &self,
         id: &SessionId,
     ) -> StoreResult<Vec<CompactionRequest>> {
-        let mut stmt = self.connection.prepare("SELECT id,session_id,kind,prompt,reason,status,created_at FROM compaction_requests WHERE session_id=? ORDER BY created_at,id")?;
+        let mut stmt = self.connection.prepare("SELECT id,session_id,kind,prompt,reason,status,status_detail,created_at FROM compaction_requests WHERE session_id=? ORDER BY created_at,id")?;
         let rows = stmt.query_map([id.0.as_str()], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -228,11 +235,12 @@ impl Store {
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
-                row.get(6)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get(7)?,
             ))
         })?;
         rows.map(|row| {
-            let (id, session_id, kind, prompt, reason, status, created_at) = row?;
+            let (id, session_id, kind, prompt, reason, status, detail, created_at) = row?;
             Ok(CompactionRequest {
                 id: uuid::Uuid::parse_str(&id)
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
@@ -241,7 +249,7 @@ impl Store {
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
                 prompt,
                 reason,
-                status: decode_compaction_status(&status, None),
+                status: decode_compaction_status(&status, detail),
                 created_at,
             })
         })
@@ -449,14 +457,14 @@ impl Store {
     }
     pub fn insert_compaction_request(&self, request: &CompactionRequest) -> StoreResult<()> {
         self.connection.execute(
-            "INSERT INTO compaction_requests(id,session_id,kind,prompt,reason,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-            params![request.id.to_string(), request.session_id.0, json(&request.kind)?, request.prompt, request.reason, compaction_status_name(&request.status), request.created_at, request.created_at],
+            "INSERT INTO compaction_requests(id,session_id,kind,prompt,reason,status,status_detail,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            params![request.id.to_string(), request.session_id.0, json(&request.kind)?, request.prompt, request.reason, compaction_status_name(&request.status), compaction_status_detail(&request.status), request.created_at, request.created_at],
         )?;
         Ok(())
     }
     pub fn pending_compaction_requests(&self) -> StoreResult<Vec<CompactionRequest>> {
         let mut statement = self.connection.prepare(
-            "SELECT id,session_id,kind,prompt,reason,status,created_at FROM compaction_requests WHERE status='pending' ORDER BY created_at,id",
+            "SELECT id,session_id,kind,prompt,reason,status,status_detail,created_at FROM compaction_requests WHERE status='pending' ORDER BY created_at,id",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -466,11 +474,12 @@ impl Store {
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
-                row.get(6)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get(7)?,
             ))
         })?;
         rows.map(|row| {
-            let (id, session_id, kind, prompt, reason, status, created_at) = row?;
+            let (id, session_id, kind, prompt, reason, status, detail, created_at) = row?;
             Ok(CompactionRequest {
                 id: uuid::Uuid::parse_str(&id)
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
@@ -478,7 +487,7 @@ impl Store {
                 kind: serde_json::from_str(&kind)?,
                 prompt,
                 reason,
-                status: decode_compaction_status(&status, None),
+                status: decode_compaction_status(&status, detail),
                 created_at,
             })
         })
@@ -487,7 +496,7 @@ impl Store {
     /// Atomically claims a pending destructive delivery. False means another tick won.
     pub fn claim_compaction(&self, id: uuid::Uuid) -> StoreResult<bool> {
         Ok(self.connection.execute(
-            "UPDATE compaction_requests SET status='sending',updated_at=? WHERE id=? AND status='pending'",
+            "UPDATE compaction_requests SET status='sending',status_detail=NULL,updated_at=? WHERE id=? AND status='pending'",
             params![Utc::now(), id.to_string()],
         )? == 1)
     }
@@ -497,8 +506,8 @@ impl Store {
         status: CompactionStatus,
     ) -> StoreResult<()> {
         self.connection.execute(
-            "UPDATE compaction_requests SET status=?,updated_at=? WHERE id=?",
-            params![compaction_status_name(&status), Utc::now(), id.to_string()],
+            "UPDATE compaction_requests SET status=?,status_detail=?,updated_at=? WHERE id=?",
+            params![compaction_status_name(&status), compaction_status_detail(&status), Utc::now(), id.to_string()],
         )?;
         Ok(())
     }
@@ -580,6 +589,116 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?)
+    }
+    pub fn record_fetch_success(
+        &self,
+        provider: &Provider,
+        account: Option<&AccountId>,
+        at: DateTime<Utc>,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO provider_fetch_status(provider,account,last_attempt_at,last_success_at,last_error,consecutive_failures) VALUES(?,?,?,?,NULL,0) ON CONFLICT(provider,COALESCE(account,'')) DO UPDATE SET last_attempt_at=excluded.last_attempt_at,last_success_at=excluded.last_success_at,last_error=NULL,consecutive_failures=0",
+            params![json(provider)?, opt_json(&account)?, at, at],
+        )?;
+        Ok(())
+    }
+    pub fn record_fetch_failure(
+        &self,
+        provider: &Provider,
+        account: Option<&AccountId>,
+        at: DateTime<Utc>,
+        error: &str,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO provider_fetch_status(provider,account,last_attempt_at,last_success_at,last_error,consecutive_failures) VALUES(?,?,?,NULL,?,1) ON CONFLICT(provider,COALESCE(account,'')) DO UPDATE SET last_attempt_at=excluded.last_attempt_at,last_error=excluded.last_error,consecutive_failures=provider_fetch_status.consecutive_failures+1",
+            params![json(provider)?, opt_json(&account)?, at, error],
+        )?;
+        Ok(())
+    }
+    pub fn fetch_statuses(&self) -> StoreResult<Vec<ProviderFetchStatus>> {
+        let mut statement = self.connection.prepare(
+            "SELECT provider,account,last_attempt_at,last_success_at,last_error,consecutive_failures FROM provider_fetch_status ORDER BY provider,account",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (provider, account, last_attempt_at, last_success_at, last_error, failures) =
+                row?;
+            Ok(ProviderFetchStatus {
+                provider: serde_json::from_str(&provider)?,
+                account: account.map(|x| serde_json::from_str(&x)).transpose()?,
+                last_attempt_at,
+                last_success_at,
+                last_error,
+                consecutive_failures: failures as u32,
+            })
+        })
+        .collect()
+    }
+    pub fn keepalive_active_count(&self) -> StoreResult<u32> {
+        Ok(self.connection.query_row(
+            "SELECT COUNT(*) FROM keepalive_config WHERE enabled=1",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+    pub fn insert_compaction_event(&self, event: &CompactionEvent) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO compaction_events(id,session_id,source,trigger,context_pct_before,usage_window_pct_before,tokens_before,tokens_after,started_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            params![
+                event.id.to_string(),
+                event.session_id.0,
+                compaction_source_name(&event.source),
+                event.trigger,
+                event.context_pct_before,
+                event.usage_window_pct_before,
+                event.tokens_before.map(|x| x as i64),
+                event.tokens_after.map(|x| x as i64),
+                event.started_at,
+                event.completed_at,
+            ],
+        )?;
+        Ok(())
+    }
+    /// Fills in the most recently opened (`completed_at IS NULL`) compaction event for
+    /// this session. There should only ever be one open row per session, but we still
+    /// pick the latest by `started_at` in case of overlap.
+    pub fn complete_compaction_event(
+        &self,
+        session_id: &SessionId,
+        tokens_after: Option<u64>,
+        at: DateTime<Utc>,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            "UPDATE compaction_events SET completed_at=?,tokens_after=COALESCE(?,tokens_after) WHERE id=(SELECT id FROM compaction_events WHERE session_id=? AND completed_at IS NULL ORDER BY started_at DESC LIMIT 1)",
+            params![at, tokens_after.map(|x| x as i64), session_id.0],
+        )?;
+        Ok(())
+    }
+    pub fn recent_compaction_events(&self, limit: u32) -> StoreResult<Vec<CompactionEvent>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id,session_id,source,trigger,context_pct_before,usage_window_pct_before,tokens_before,tokens_after,started_at,completed_at FROM compaction_events ORDER BY started_at DESC,id DESC LIMIT ?",
+        )?;
+        let rows = statement.query_map([limit as i64], decode_compaction_event_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+    pub fn compaction_events_for_session(
+        &self,
+        id: &SessionId,
+    ) -> StoreResult<Vec<CompactionEvent>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id,session_id,source,trigger,context_pct_before,usage_window_pct_before,tokens_before,tokens_after,started_at,completed_at FROM compaction_events WHERE session_id=? ORDER BY started_at,id",
+        )?;
+        let rows = statement.query_map([id.0.as_str()], decode_compaction_event_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
     pub fn take_hook_messages(
         &self,
@@ -723,6 +842,13 @@ fn compaction_status_name(s: &CompactionStatus) -> &'static str {
         CompactionStatus::Cancelled => "cancelled",
     }
 }
+fn compaction_status_detail(s: &CompactionStatus) -> Option<&str> {
+    if let CompactionStatus::Failed(detail) = s {
+        Some(detail)
+    } else {
+        None
+    }
+}
 fn decode_compaction_status(status: &str, detail: Option<String>) -> CompactionStatus {
     match status {
         "pending" => CompactionStatus::Pending,
@@ -732,7 +858,37 @@ fn decode_compaction_status(status: &str, detail: Option<String>) -> CompactionS
         _ => CompactionStatus::Failed(detail.unwrap_or_else(|| "unknown failure".into())),
     }
 }
-const SCHEMA: &str = r#"PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS usage_samples(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,account TEXT,window_kind TEXT NOT NULL,window_scope_value TEXT NOT NULL,pct REAL NOT NULL,resets_at TEXT,exceeded INTEGER NOT NULL,active INTEGER NOT NULL,source TEXT NOT NULL,at TEXT NOT NULL,fetched_at TEXT,credits_json TEXT);CREATE INDEX IF NOT EXISTS usage_samples_window_at ON usage_samples(provider,window_kind,window_scope_value,at);CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,harness TEXT NOT NULL,model TEXT,account TEXT,cwd TEXT NOT NULL,state_path TEXT,context_window_size INTEGER,last_known_token_count INTEGER,launch_mode TEXT NOT NULL,pid INTEGER,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,stopped_reason TEXT,stopped_window_kind TEXT,superseded_by TEXT,reseeded_from TEXT);CREATE TABLE IF NOT EXISTS session_token_usage(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),at TEXT NOT NULL,model TEXT,input_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_write_input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,UNIQUE(session_id,at,total_tokens,input_tokens,output_tokens));CREATE INDEX IF NOT EXISTS session_token_usage_session_at ON session_token_usage(session_id,at);CREATE TABLE IF NOT EXISTS resume_markers(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),reason TEXT NOT NULL,resume_at TEXT,requested_at TEXT,created_at TEXT NOT NULL,status TEXT NOT NULL,status_detail TEXT,message TEXT);CREATE INDEX IF NOT EXISTS resume_markers_session_status ON resume_markers(session_id,status);CREATE UNIQUE INDEX IF NOT EXISTS resume_markers_active ON resume_markers(session_id) WHERE status IN ('pending','scheduled');CREATE TABLE IF NOT EXISTS compaction_requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL,prompt TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS compaction_requests_session_status ON compaction_requests(session_id,status);CREATE TABLE IF NOT EXISTS threshold_overrides(id TEXT PRIMARY KEY,scope_kind TEXT NOT NULL,provider TEXT NOT NULL,model_value TEXT,session_value TEXT,field TEXT NOT NULL,value_json TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS threshold_overrides_key ON threshold_overrides(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field);CREATE TABLE IF NOT EXISTS idle_reseed_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,source_model TEXT NOT NULL,summary_text TEXT NOT NULL,token_count_before INTEGER NOT NULL,token_count_after INTEGER NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS keepalive_config(session_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL,last_ping_at TEXT,ping_day TEXT,ping_count INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS hook_messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,text TEXT NOT NULL,created_at TEXT NOT NULL,delivered_at TEXT);CREATE INDEX IF NOT EXISTS hook_messages_delivery ON hook_messages(session_id,event,delivered_at,created_at);CREATE TABLE IF NOT EXISTS hook_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,created_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS hook_events_session_created ON hook_events(session_id,created_at);"#;
+fn compaction_source_name(s: &CompactionSource) -> &'static str {
+    match s {
+        CompactionSource::Inline => "inline",
+        CompactionSource::External => "external",
+    }
+}
+fn decode_compaction_source(s: &str) -> CompactionSource {
+    match s {
+        "inline" => CompactionSource::Inline,
+        _ => CompactionSource::External,
+    }
+}
+fn decode_compaction_event_row(row: &rusqlite::Row) -> rusqlite::Result<CompactionEvent> {
+    let id: String = row.get(0)?;
+    let session_id: String = row.get(1)?;
+    let source: String = row.get(2)?;
+    Ok(CompactionEvent {
+        id: uuid::Uuid::parse_str(&id)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+        session_id: SessionId(session_id),
+        source: decode_compaction_source(&source),
+        trigger: row.get(3)?,
+        context_pct_before: row.get(4)?,
+        usage_window_pct_before: row.get(5)?,
+        tokens_before: row.get::<_, Option<i64>>(6)?.map(|x| x as u64),
+        tokens_after: row.get::<_, Option<i64>>(7)?.map(|x| x as u64),
+        started_at: row.get(8)?,
+        completed_at: row.get(9)?,
+    })
+}
+const SCHEMA: &str = r#"PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS usage_samples(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,account TEXT,window_kind TEXT NOT NULL,window_scope_value TEXT NOT NULL,pct REAL NOT NULL,resets_at TEXT,exceeded INTEGER NOT NULL,active INTEGER NOT NULL,source TEXT NOT NULL,at TEXT NOT NULL,fetched_at TEXT,credits_json TEXT);CREATE INDEX IF NOT EXISTS usage_samples_window_at ON usage_samples(provider,window_kind,window_scope_value,at);CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,harness TEXT NOT NULL,model TEXT,account TEXT,cwd TEXT NOT NULL,state_path TEXT,context_window_size INTEGER,last_known_token_count INTEGER,launch_mode TEXT NOT NULL,pid INTEGER,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,stopped_reason TEXT,stopped_window_kind TEXT,superseded_by TEXT,reseeded_from TEXT);CREATE TABLE IF NOT EXISTS session_token_usage(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),at TEXT NOT NULL,model TEXT,input_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_write_input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,UNIQUE(session_id,at,total_tokens,input_tokens,output_tokens));CREATE INDEX IF NOT EXISTS session_token_usage_session_at ON session_token_usage(session_id,at);CREATE TABLE IF NOT EXISTS resume_markers(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),reason TEXT NOT NULL,resume_at TEXT,requested_at TEXT,created_at TEXT NOT NULL,status TEXT NOT NULL,status_detail TEXT,message TEXT);CREATE INDEX IF NOT EXISTS resume_markers_session_status ON resume_markers(session_id,status);CREATE UNIQUE INDEX IF NOT EXISTS resume_markers_active ON resume_markers(session_id) WHERE status IN ('pending','scheduled');CREATE TABLE IF NOT EXISTS compaction_requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL,prompt TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS compaction_requests_session_status ON compaction_requests(session_id,status);CREATE TABLE IF NOT EXISTS threshold_overrides(id TEXT PRIMARY KEY,scope_kind TEXT NOT NULL,provider TEXT NOT NULL,model_value TEXT,session_value TEXT,field TEXT NOT NULL,value_json TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS threshold_overrides_key ON threshold_overrides(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field);CREATE TABLE IF NOT EXISTS idle_reseed_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,source_model TEXT NOT NULL,summary_text TEXT NOT NULL,token_count_before INTEGER NOT NULL,token_count_after INTEGER NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS keepalive_config(session_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL,last_ping_at TEXT,ping_day TEXT,ping_count INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS hook_messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,text TEXT NOT NULL,created_at TEXT NOT NULL,delivered_at TEXT);CREATE INDEX IF NOT EXISTS hook_messages_delivery ON hook_messages(session_id,event,delivered_at,created_at);CREATE TABLE IF NOT EXISTS hook_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,created_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS hook_events_session_created ON hook_events(session_id,created_at);CREATE TABLE IF NOT EXISTS provider_fetch_status(provider TEXT NOT NULL,account TEXT,last_attempt_at TEXT NOT NULL,last_success_at TEXT,last_error TEXT,consecutive_failures INTEGER NOT NULL DEFAULT 0);CREATE UNIQUE INDEX IF NOT EXISTS provider_fetch_status_key ON provider_fetch_status(provider,COALESCE(account,''));CREATE TABLE IF NOT EXISTS compaction_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),source TEXT NOT NULL,trigger TEXT,context_pct_before REAL,usage_window_pct_before REAL,tokens_before INTEGER,tokens_after INTEGER,started_at TEXT NOT NULL,completed_at TEXT);CREATE INDEX IF NOT EXISTS compaction_events_session_started ON compaction_events(session_id,started_at);CREATE INDEX IF NOT EXISTS compaction_events_started ON compaction_events(started_at);"#;
 
 #[cfg(test)]
 mod tests {
@@ -995,6 +1151,37 @@ mod tests {
         assert!(s.compaction_requests_for_session(&sid).unwrap().is_empty());
         assert!(matches!(s.delete_session(&sid), Err(StoreError::NotFound)));
     }
+
+    #[test]
+    fn compaction_failure_detail_survives_round_trip() {
+        let s = Store::open_memory().unwrap();
+        let sid = SessionId("s".into());
+        s.insert_session(&session(&sid)).unwrap();
+        let id = uuid::Uuid::new_v4();
+        s.insert_compaction_request(&CompactionRequest {
+            id,
+            session_id: sid.clone(),
+            kind: CompactionKind::AgentRequested,
+            prompt: "compact".into(),
+            reason: "test".into(),
+            status: CompactionStatus::Pending,
+            created_at: Utc::now(),
+        })
+        .unwrap();
+
+        s.update_compaction_status(
+            id,
+            CompactionStatus::Failed("app-server rejected thread/compact/start".into()),
+        )
+        .unwrap();
+
+        let requests = s.compaction_requests_for_session(&sid).unwrap();
+        assert!(matches!(
+            &requests[0].status,
+            CompactionStatus::Failed(detail)
+                if detail == "app-server rejected thread/compact/start"
+        ));
+    }
     #[test]
     fn threshold_key_is_unique() {
         let s = Store::open_memory().unwrap();
@@ -1098,5 +1285,72 @@ mod tests {
         s.record_hook_event(&id, "UserPromptSubmit").unwrap();
         s.record_hook_event(&id, "Stop").unwrap();
         assert_eq!(s.latest_hook_event(&id).unwrap().as_deref(), Some("Stop"));
+    }
+
+    #[test]
+    fn fetch_status_tracks_success_and_failure_without_clobbering_history() {
+        let s = Store::open_memory().unwrap();
+        let t0 = Utc::now();
+        s.record_fetch_failure(&Provider::Codex, None, t0, "boom")
+            .unwrap();
+        s.record_fetch_failure(&Provider::Codex, None, t0 + Duration::minutes(1), "boom again")
+            .unwrap();
+        let statuses = s.fetch_statuses().unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].consecutive_failures, 2);
+        assert_eq!(statuses[0].last_error.as_deref(), Some("boom again"));
+        assert!(statuses[0].last_success_at.is_none());
+
+        let t1 = t0 + Duration::minutes(2);
+        s.record_fetch_success(&Provider::Codex, None, t1).unwrap();
+        let statuses = s.fetch_statuses().unwrap();
+        assert_eq!(statuses[0].consecutive_failures, 0);
+        assert_eq!(statuses[0].last_error, None);
+        assert_eq!(statuses[0].last_success_at, Some(t1));
+    }
+
+    #[test]
+    fn compaction_events_open_close_and_list_newest_first() {
+        let s = Store::open_memory().unwrap();
+        let sid = SessionId("compact-session".into());
+        s.insert_session(&session(&sid)).unwrap();
+        let started = Utc::now();
+        s.insert_compaction_event(&CompactionEvent {
+            id: uuid::Uuid::new_v4(),
+            session_id: sid.clone(),
+            source: CompactionSource::External,
+            trigger: Some("auto".into()),
+            context_pct_before: Some(90.0),
+            usage_window_pct_before: Some(40.0),
+            tokens_before: Some(150_000),
+            tokens_after: None,
+            started_at: started,
+            completed_at: None,
+        })
+        .unwrap();
+        let completed_at = started + Duration::minutes(1);
+        s.complete_compaction_event(&sid, Some(5_000), completed_at)
+            .unwrap();
+
+        let events = s.compaction_events_for_session(&sid).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tokens_after, Some(5_000));
+        assert_eq!(events[0].completed_at, Some(completed_at));
+
+        let recent = s.recent_compaction_events(10).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].source, CompactionSource::External);
+    }
+
+    #[test]
+    fn keepalive_active_count_counts_only_enabled_rows() {
+        let s = Store::open_memory().unwrap();
+        let a = SessionId("a".into());
+        let b = SessionId("b".into());
+        s.insert_session(&session(&a)).unwrap();
+        s.insert_session(&session(&b)).unwrap();
+        s.set_keepalive(&a, true).unwrap();
+        s.set_keepalive(&b, false).unwrap();
+        assert_eq!(s.keepalive_active_count().unwrap(), 1);
     }
 }

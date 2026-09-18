@@ -88,7 +88,7 @@ impl T3CodeAdapter {
 
     pub fn capabilities_static() -> Capabilities {
         Capabilities {
-            can_trigger_compaction: false,
+            can_trigger_compaction: true,
             can_advise_mid_turn: false,
             can_inject_at_session_start: false,
             can_observe_compaction: false,
@@ -127,10 +127,27 @@ impl HarnessAdapter for T3CodeAdapter {
 
     async fn compact(
         &self,
-        _: &SessionSummary,
-        _: &CompactionRequest,
+        session: &SessionSummary,
+        request: &CompactionRequest,
     ) -> AdapterResult<DeliveryOutcome> {
-        Err(AdapterError::Unsupported)
+        let payload = json!({
+            "type": "thread.turn.start",
+            "commandId": uuid::Uuid::new_v4(),
+            "threadId": session.id.0,
+            "message": {
+                "messageId": uuid::Uuid::new_v4(),
+                "role": "user",
+                "text": request.prompt,
+                "attachments": []
+            },
+            "runtimeMode": "full-access",
+            "interactionMode": "default",
+            "createdAt": chrono::Utc::now(),
+        });
+        self.transport
+            .post_dispatch(payload)
+            .await
+            .map(|_| DeliveryOutcome::Delivered)
     }
 
     async fn resume_session(
@@ -228,12 +245,38 @@ mod tests {
         assert_eq!(calls[0].1["message"]["attachments"], serde_json::json!([]));
     }
 
+    #[tokio::test]
+    async fn sends_compact_as_a_meta_harness_message() {
+        let transport = std::sync::Arc::new(FakeTransport {
+            calls: Mutex::new(Vec::new()),
+        });
+        let adapter = T3CodeAdapter::new(transport.clone());
+        let request = CompactionRequest {
+            id: uuid::Uuid::new_v4(),
+            session_id: session().id.clone(),
+            kind: CompactionKind::AgentRequested,
+            prompt: "/compact\nPreserve the active goal.".into(),
+            reason: "test".into(),
+            status: CompactionStatus::Sending,
+            created_at: chrono::Utc::now(),
+        };
+
+        assert_eq!(
+            adapter.compact(&session(), &request).await.unwrap(),
+            DeliveryOutcome::Delivered
+        );
+        let calls = transport.calls.lock().unwrap();
+        assert_eq!(calls[0].1["type"], "thread.turn.start");
+        assert_eq!(calls[0].1["threadId"], session().id.0);
+        assert_eq!(calls[0].1["message"]["text"], request.prompt);
+    }
+
     #[test]
     fn advertises_only_native_resume() {
         assert_eq!(
             T3CodeAdapter::capabilities_static(),
             Capabilities {
-                can_trigger_compaction: false,
+                can_trigger_compaction: true,
                 can_advise_mid_turn: false,
                 can_inject_at_session_start: false,
                 can_observe_compaction: false,
