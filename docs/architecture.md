@@ -268,6 +268,20 @@ an explicit "not supported for this harness" result, not a silently-dropped requ
   stable UUID, confirmed unchanged across resume/fork. No `SessionId`-stability caveat
   needed for Codex (unlike Claude Code, see above).
 
+### T3Code meta-harness adapter (research: `docs/research-t3code.md`)
+
+- `resume_session`: send a native `thread.turn.start` command to T3Code's authenticated
+  `POST /api/orchestration/dispatch` endpoint. The T3Code thread UUID is the adapter's
+  session id. This preserves the T3Code owner process and avoids detached `claude
+  --resume` branches.
+- `Capabilities`: native headless resume is true; compaction, mid-turn advice, session
+  start injection, stop detection, usage polling, and token reporting are false until
+  T3Code exposes stable corresponding endpoints.
+- Authentication is explicit configuration: an already-issued bearer token or browser
+  session cookie. The adapter does not mint pairing credentials or automate a browser.
+- The daemon registers this adapter only when `UW_T3CODE_URL` and exactly one of
+  `UW_T3CODE_BEARER_TOKEN` or `UW_T3CODE_COOKIE` are configured.
+
 ### Hook ingress — `uw-daemon`'s `uw-hook` shim
 
 Both harnesses deliver context only by executing a configured hook command and reading

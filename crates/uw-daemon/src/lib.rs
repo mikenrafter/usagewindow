@@ -1456,6 +1456,37 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
             );
         }
     }
+    if let Ok(base_url) = std::env::var("UW_T3CODE_URL") {
+        let auth = match (
+            std::env::var("UW_T3CODE_BEARER_TOKEN").ok(),
+            std::env::var("UW_T3CODE_COOKIE").ok(),
+        ) {
+            (Some(token), None) if !token.is_empty() => {
+                Some(uw_adapters::t3code::T3CodeAuth::Bearer(token))
+            }
+            (None, Some(cookie)) if !cookie.is_empty() => {
+                Some(uw_adapters::t3code::T3CodeAuth::Cookie(cookie))
+            }
+            (Some(_), Some(_)) => {
+                tracing::warn!(
+                    "both UW_T3CODE_BEARER_TOKEN and UW_T3CODE_COOKIE are set; T3Code adapter disabled"
+                );
+                None
+            }
+            _ => {
+                tracing::warn!(
+                    "UW_T3CODE_URL is set but neither T3Code auth variable is configured; adapter disabled"
+                );
+                None
+            }
+        };
+        if let Some(auth) = auth {
+            adapters.insert(
+                Provider::Other("t3code".into()),
+                Arc::new(uw_adapters::t3code::T3CodeAdapter::real(base_url, auth)),
+            );
+        }
+    }
     let liveness = SystemSessionLivenessChecker {
         db_path: path.clone(),
     };
