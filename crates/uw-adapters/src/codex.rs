@@ -313,19 +313,36 @@ impl HarnessAdapter for CodexAdapter {
         session: &SessionSummary,
         message: Option<&str>,
     ) -> AdapterResult<()> {
-        self.spawner
-            .run(ProcessSpec {
+        let message = message.unwrap_or("Continue from the saved state.");
+        let resume = self.spawner.run(ProcessSpec {
                 program: "codex".into(),
                 args: vec![
                     "exec".into(),
                     "resume".into(),
                     session.id.0.clone(),
-                    message.unwrap_or("Continue from the saved state.").into(),
+                    message.into(),
                 ],
                 cwd: session.cwd.clone(),
-            })
-            .await
-            .map(|_| ())
+            });
+        match resume.await {
+            Ok(_) => Ok(()),
+            Err(error) if error.to_string().contains("active writer") => self
+                .spawner
+                .run(ProcessSpec {
+                    program: "codex".into(),
+                    args: vec![
+                        "queue".into(),
+                        "--thread".into(),
+                        session.id.0.clone(),
+                        "--message".into(),
+                        message.into(),
+                    ],
+                    cwd: session.cwd.clone(),
+                })
+                .await
+                .map(|_| ()),
+            Err(error) => Err(error),
+        }
     }
     async fn seed_new_session(
         &self,
@@ -884,6 +901,44 @@ done
             })
         }
     }
+
+    struct BusyThenQueue {
+        specs: Arc<std::sync::Mutex<Vec<ProcessSpec>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessSpawner for BusyThenQueue {
+        async fn run(&self, spec: ProcessSpec) -> AdapterResult<crate::process::ProcessOutput> {
+            let mut specs = self.specs.lock().unwrap();
+            specs.push(spec);
+            if specs.len() == 1 {
+                Err(AdapterError::Other("thread-store conflict: active writer".into()))
+            } else {
+                Ok(crate::process::ProcessOutput::default())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_queues_into_an_existing_codex_writer() {
+        let specs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = CodexAdapter::new(Arc::new(Rpc)).with_spawner(Arc::new(BusyThenQueue {
+            specs: specs.clone(),
+        }));
+        adapter
+            .resume_session(&session_summary("thread"), Some("continue"))
+            .await
+            .unwrap();
+        let specs = specs.lock().unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].program, "codex");
+        assert_eq!(&specs[0].args[..3], &["exec", "resume", "thread"]);
+        assert_eq!(
+            specs[1].args,
+            vec!["queue", "--thread", "thread", "--message", "continue"]
+        );
+    }
+
     #[tokio::test]
     async fn resume_and_both_seed_modes_build_expected_commands() {
         let record = Arc::new(std::sync::Mutex::new(None));

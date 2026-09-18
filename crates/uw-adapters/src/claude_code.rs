@@ -6,8 +6,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uw_core::adapter::{
-    AdapterError, AdapterResult, Capabilities, DeliveryOutcome, HarnessAdapter, SeedContext,
-    SeedMode, StatusEvent,
+    AdapterError, AdapterResult, Capabilities, DeliveryOutcome, DiscoveredSession,
+    HarnessAdapter, SeedContext, SeedMode, StatusEvent, TokenUsageRecord,
 };
 use uw_core::model::*;
 
@@ -464,6 +464,111 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         }
         Ok(filter_keepalive_transcript(&matching.join("\n")))
     }
+
+    async fn discover_sessions(&self) -> AdapterResult<Vec<DiscoveredSession>> {
+        let mut discovered = Vec::new();
+        for path in self.transcript_fs.jsonl_files().await? {
+            let content = self.transcript_fs.read_to_string(&path).await?;
+            if let Some(session) = scan_transcript(&path, &content) {
+                discovered.push(session);
+            }
+        }
+        Ok(discovered)
+    }
+}
+
+fn scan_transcript(path: &str, content: &str) -> Option<DiscoveredSession> {
+    let mut id = std::path::Path::new(path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| uuid::Uuid::parse_str(stem).is_ok())
+        .map(str::to_owned);
+    let mut cwd = None;
+    let mut model = None;
+    let mut context_window_size = None;
+    let mut first_seen = None;
+    let mut last_seen = None;
+    let mut last_known_token_count = None;
+    let mut token_usage = Vec::new();
+
+    for line in content.lines() {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if id.is_none() {
+            id = record
+                .get("sessionId")
+                .or_else(|| record.get("session_id"))
+                .and_then(Value::as_str)
+                .filter(|value| uuid::Uuid::parse_str(value).is_ok())
+                .map(str::to_owned);
+        }
+        if cwd.is_none() {
+            cwd = record.get("cwd").and_then(Value::as_str).map(str::to_owned);
+        }
+        let timestamp = record
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc));
+        if let Some(at) = timestamp {
+            first_seen.get_or_insert(at);
+            last_seen = Some(at);
+        }
+        if let Some(value) = record.pointer("/message/model").and_then(Value::as_str) {
+            model = Some(ModelId(value.to_owned()));
+        }
+        if let Some(value) = record
+            .pointer("/message/usage/input_tokens")
+            .and_then(Value::as_u64)
+        {
+            context_window_size = record
+                .pointer("/message/model_context_window")
+                .and_then(Value::as_u64)
+                .or(context_window_size);
+            let cache_read = record
+                .pointer("/message/usage/cache_read_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let cache_write = record
+                .pointer("/message/usage/cache_creation_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let output = record
+                .pointer("/message/usage/output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let total_input = value
+                .saturating_add(cache_read)
+                .saturating_add(cache_write);
+            let total = total_input.saturating_add(output);
+            let Some(at) = timestamp else { continue };
+            last_known_token_count = Some(total);
+            token_usage.push(TokenUsageRecord {
+                at,
+                model: model.clone(),
+                input_tokens: total_input,
+                cached_input_tokens: cache_read,
+                cache_write_input_tokens: cache_write,
+                output_tokens: output,
+                reasoning_output_tokens: 0,
+                total_tokens: total,
+            });
+        }
+    }
+
+    let id = id?;
+    Some(DiscoveredSession {
+        id: SessionId(id),
+        cwd: cwd.unwrap_or_else(|| ".".into()),
+        model,
+        context_window_size,
+        last_known_token_count,
+        first_seen,
+        last_seen,
+        state_path: Some(path.to_owned()),
+        token_usage,
+    })
 }
 
 fn session_state_path(session: &SessionSummary) -> &str {
@@ -475,6 +580,47 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use std::sync::{Arc, Mutex};
     use uw_core::adapter::{Capabilities, HarnessAdapter};
+
+    struct TranscriptFixture {
+        path: String,
+        content: String,
+    }
+
+    #[async_trait::async_trait]
+    impl TranscriptFileSystem for TranscriptFixture {
+        async fn jsonl_files(&self) -> AdapterResult<Vec<String>> {
+            Ok(vec![self.path.clone()])
+        }
+
+        async fn read_to_string(&self, _: &str) -> AdapterResult<String> {
+            Ok(self.content.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_sessions_reads_claude_usage_and_cache_fields() {
+        let id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b40";
+        let adapter = adapter(200, Arc::new(Cache { entry: Mutex::new(None) }), Arc::new(Mutex::new(0)))
+            .with_transcript_fs(Arc::new(TranscriptFixture {
+                path: format!("/tmp/{id}.jsonl"),
+                content: format!(
+                    r#"{{"timestamp":"2026-09-17T23:32:32Z","sessionId":"{id}","cwd":"/work"}}
+{{"timestamp":"2026-09-17T23:32:34Z","type":"assistant","message":{{"model":"claude-sonnet-5","usage":{{"input_tokens":1200,"cache_read_input_tokens":800,"cache_creation_input_tokens":100,"output_tokens":300}}}}}}
+{{"timestamp":"2026-09-17T23:32:35Z","type":"assistant","message":{{"model":"claude-sonnet-5","usage":{{"input_tokens":100,"cache_read_input_tokens":50,"cache_creation_input_tokens":0,"output_tokens":25}}}}}}"#
+                ),
+            }));
+        let found = adapter.discover_sessions().await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, SessionId(id.into()));
+        assert_eq!(found[0].cwd, "/work");
+        assert_eq!(found[0].model, Some(ModelId("claude-sonnet-5".into())));
+        assert_eq!(found[0].last_known_token_count, Some(175));
+        assert_eq!(found[0].token_usage.len(), 2);
+        assert_eq!(found[0].token_usage[0].input_tokens, 2100);
+        assert_eq!(found[0].token_usage[0].cached_input_tokens, 800);
+        assert_eq!(found[0].token_usage[0].cache_write_input_tokens, 100);
+        assert_eq!(found[0].token_usage[0].total_tokens, 2400);
+    }
 
     #[tokio::test]
     async fn file_cache_survives_adapter_reconstruction() {
