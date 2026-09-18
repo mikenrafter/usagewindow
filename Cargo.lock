@@ -1666,6 +1666,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "reqwest",
  "serde_json",
  "tokio",
  "tracing",
@@ -1689,6 +1690,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "uuid",
+ "uw-adapters",
  "uw-core",
  "uw-store",
 ]

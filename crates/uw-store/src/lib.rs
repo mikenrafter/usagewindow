@@ -21,6 +21,7 @@ impl Store {
     pub fn open_memory() -> StoreResult<Self> {
         let c = Connection::open_in_memory()?;
         c.pragma_update(None, "journal_mode", "WAL")?;
+        c.busy_timeout(std::time::Duration::from_secs(5))?;
         let mut s = Self { connection: c };
         s.create_schema()?;
         Ok(s)
@@ -28,6 +29,7 @@ impl Store {
     pub fn open(path: &str) -> StoreResult<Self> {
         let c = Connection::open(path)?;
         c.pragma_update(None, "journal_mode", "WAL")?;
+        c.busy_timeout(std::time::Duration::from_secs(5))?;
         let mut s = Self { connection: c };
         s.create_schema()?;
         Ok(s)
@@ -88,6 +90,11 @@ impl Store {
         ids.into_iter()
             .map(|id| self.read_usage_sample(id))
             .collect()
+    }
+    pub fn prune_usage_before(&self, cutoff: DateTime<Utc>) -> StoreResult<usize> {
+        Ok(self
+            .connection
+            .execute("DELETE FROM usage_samples WHERE at<?", [cutoff])?)
     }
     pub fn read_session(&self, id: &SessionId) -> StoreResult<SessionSummary> {
         let r = self.connection.query_row(
@@ -217,6 +224,44 @@ impl Store {
         self.connection.execute("INSERT INTO sessions(id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,stopped_window_kind,superseded_by,reseeded_from) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![s.id.0,json(&s.harness)?,opt_json(&s.model)?,opt_json(&s.account)?,s.cwd,s.state_path,s.context_window_size.map(|x|x as i64),s.last_known_token_count.map(|x|x as i64),json(&s.launch_mode)?,s.pid.map(|x|x as i64),s.first_seen,s.last_seen,opt_json(&s.stopped_reason)?,Option::<String>::None,s.superseded_by.as_ref().map(|x|&x.0),s.reseeded_from.as_ref().map(|x|&x.0)])?;
         Ok(())
     }
+    pub fn upsert_session(&self, s: &SessionSummary) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO sessions(id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,stopped_window_kind,superseded_by,reseeded_from) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET harness=excluded.harness,model=COALESCE(excluded.model,sessions.model),account=COALESCE(excluded.account,sessions.account),cwd=excluded.cwd,state_path=COALESCE(excluded.state_path,sessions.state_path),context_window_size=COALESCE(excluded.context_window_size,sessions.context_window_size),last_known_token_count=COALESCE(excluded.last_known_token_count,sessions.last_known_token_count),pid=COALESCE(excluded.pid,sessions.pid),last_seen=MAX(sessions.last_seen,excluded.last_seen)",
+            params![s.id.0,json(&s.harness)?,opt_json(&s.model)?,opt_json(&s.account)?,s.cwd,s.state_path,s.context_window_size.map(|x|x as i64),s.last_known_token_count.map(|x|x as i64),json(&s.launch_mode)?,s.pid.map(|x|x as i64),s.first_seen,s.last_seen,opt_json(&s.stopped_reason)?,Option::<String>::None,s.superseded_by.as_ref().map(|x|&x.0),s.reseeded_from.as_ref().map(|x|&x.0)],
+        )?;
+        Ok(())
+    }
+    pub fn update_session_observation(
+        &self,
+        id: &SessionId,
+        last_seen: DateTime<Utc>,
+        pid: Option<u32>,
+        token_count: Option<u64>,
+        context_window_size: Option<u64>,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            "UPDATE sessions SET last_seen=?,pid=COALESCE(?,pid),last_known_token_count=COALESCE(?,last_known_token_count),context_window_size=COALESCE(?,context_window_size) WHERE id=?",
+            params![
+                last_seen,
+                pid.map(i64::from),
+                token_count.map(|value| value as i64),
+                context_window_size.map(|value| value as i64),
+                id.0
+            ],
+        )?;
+        Ok(())
+    }
+    pub fn update_session_stop(
+        &self,
+        id: &SessionId,
+        reason: Option<&StopReason>,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            "UPDATE sessions SET stopped_reason=? WHERE id=?",
+            params![reason.map(json).transpose()?, id.0],
+        )?;
+        Ok(())
+    }
     pub fn insert_reseed_summary(&self, summary: &ReseedSummary) -> StoreResult<()> {
         self.connection.execute("INSERT INTO idle_reseed_summaries(id,session_id,source_model,summary_text,token_count_before,token_count_after,created_at) VALUES(?,?,?,?,?,?,?)", params![summary.id.to_string(), summary.session_id.0, summary.source_model.0, summary.summary_text, summary.token_count_before as i64, summary.token_count_after as i64, summary.created_at])?;
         Ok(())
@@ -248,6 +293,13 @@ impl Store {
             })
         })
         .collect()
+    }
+    pub fn last_reseed_at(&self, id: &SessionId) -> StoreResult<Option<DateTime<Utc>>> {
+        Ok(self.connection.query_row(
+            "SELECT MAX(created_at) FROM idle_reseed_summaries WHERE session_id=?",
+            [id.0.as_str()],
+            |row| row.get(0),
+        )?)
     }
     pub fn link_reseeded_session(
         &self,
@@ -397,6 +449,69 @@ impl Store {
         self.connection.execute("UPDATE resume_markers SET status='cancelled',status_detail=NULL WHERE session_id=? AND status IN ('pending','scheduled')", [session_id.0.as_str()])?;
         Ok(())
     }
+    pub fn enqueue_hook_message(
+        &self,
+        session_id: &SessionId,
+        event: &str,
+        text: &str,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO hook_messages(id,session_id,event,text,created_at,delivered_at) VALUES(?,?,?,?,?,NULL)",
+            params![uuid::Uuid::new_v4().to_string(), session_id.0, event, text, Utc::now()],
+        )?;
+        Ok(())
+    }
+    pub fn record_hook_event(&self, session_id: &SessionId, event: &str) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO hook_events(id,session_id,event,created_at) VALUES(?,?,?,?)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                session_id.0,
+                event,
+                Utc::now()
+            ],
+        )?;
+        Ok(())
+    }
+    pub fn latest_hook_event(&self, session_id: &SessionId) -> StoreResult<Option<String>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT event FROM hook_events WHERE session_id=? ORDER BY created_at DESC,id DESC LIMIT 1",
+                [session_id.0.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+    pub fn take_hook_messages(
+        &self,
+        session_id: &SessionId,
+        event: &str,
+    ) -> StoreResult<Vec<String>> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let messages = {
+            let mut statement = transaction.prepare(
+                "SELECT id,text FROM hook_messages WHERE session_id=? AND event=? AND delivered_at IS NULL ORDER BY created_at,id",
+            )?;
+            statement
+                .query_map(params![session_id.0, event], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut claimed = Vec::new();
+        for (id, text) in messages {
+            if transaction.execute(
+                "UPDATE hook_messages SET delivered_at=? WHERE id=? AND delivered_at IS NULL",
+                params![Utc::now(), id],
+            )? == 1
+            {
+                claimed.push(text);
+            }
+        }
+        transaction.commit()?;
+        Ok(claimed)
+    }
 }
 #[derive(Clone, Debug)]
 pub struct ThresholdOverride {
@@ -496,7 +611,7 @@ fn decode_compaction_status(status: &str, detail: Option<String>) -> CompactionS
         _ => CompactionStatus::Failed(detail.unwrap_or_else(|| "unknown failure".into())),
     }
 }
-const SCHEMA: &str = r#"PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS usage_samples(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,account TEXT,window_kind TEXT NOT NULL,window_scope_value TEXT NOT NULL,pct REAL NOT NULL,resets_at TEXT,exceeded INTEGER NOT NULL,active INTEGER NOT NULL,source TEXT NOT NULL,at TEXT NOT NULL,fetched_at TEXT,credits_json TEXT);CREATE INDEX IF NOT EXISTS usage_samples_window_at ON usage_samples(provider,window_kind,window_scope_value,at);CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,harness TEXT NOT NULL,model TEXT,account TEXT,cwd TEXT NOT NULL,state_path TEXT,context_window_size INTEGER,last_known_token_count INTEGER,launch_mode TEXT NOT NULL,pid INTEGER,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,stopped_reason TEXT,stopped_window_kind TEXT,superseded_by TEXT,reseeded_from TEXT);CREATE TABLE IF NOT EXISTS resume_markers(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),reason TEXT NOT NULL,resume_at TEXT,created_at TEXT NOT NULL,status TEXT NOT NULL,status_detail TEXT);CREATE INDEX IF NOT EXISTS resume_markers_session_status ON resume_markers(session_id,status);CREATE UNIQUE INDEX IF NOT EXISTS resume_markers_active ON resume_markers(session_id) WHERE status IN ('pending','scheduled');CREATE TABLE IF NOT EXISTS compaction_requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL,prompt TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS compaction_requests_session_status ON compaction_requests(session_id,status);CREATE TABLE IF NOT EXISTS threshold_overrides(id TEXT PRIMARY KEY,scope_kind TEXT NOT NULL,provider TEXT NOT NULL,model_value TEXT,session_value TEXT,field TEXT NOT NULL,value_json TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS threshold_overrides_key ON threshold_overrides(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field);CREATE TABLE IF NOT EXISTS idle_reseed_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,source_model TEXT NOT NULL,summary_text TEXT NOT NULL,token_count_before INTEGER NOT NULL,token_count_after INTEGER NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS keepalive_config(session_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL,last_ping_at TEXT,ping_day TEXT,ping_count INTEGER NOT NULL DEFAULT 0);"#;
+const SCHEMA: &str = r#"PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS usage_samples(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,account TEXT,window_kind TEXT NOT NULL,window_scope_value TEXT NOT NULL,pct REAL NOT NULL,resets_at TEXT,exceeded INTEGER NOT NULL,active INTEGER NOT NULL,source TEXT NOT NULL,at TEXT NOT NULL,fetched_at TEXT,credits_json TEXT);CREATE INDEX IF NOT EXISTS usage_samples_window_at ON usage_samples(provider,window_kind,window_scope_value,at);CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,harness TEXT NOT NULL,model TEXT,account TEXT,cwd TEXT NOT NULL,state_path TEXT,context_window_size INTEGER,last_known_token_count INTEGER,launch_mode TEXT NOT NULL,pid INTEGER,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,stopped_reason TEXT,stopped_window_kind TEXT,superseded_by TEXT,reseeded_from TEXT);CREATE TABLE IF NOT EXISTS resume_markers(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),reason TEXT NOT NULL,resume_at TEXT,created_at TEXT NOT NULL,status TEXT NOT NULL,status_detail TEXT);CREATE INDEX IF NOT EXISTS resume_markers_session_status ON resume_markers(session_id,status);CREATE UNIQUE INDEX IF NOT EXISTS resume_markers_active ON resume_markers(session_id) WHERE status IN ('pending','scheduled');CREATE TABLE IF NOT EXISTS compaction_requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL,prompt TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS compaction_requests_session_status ON compaction_requests(session_id,status);CREATE TABLE IF NOT EXISTS threshold_overrides(id TEXT PRIMARY KEY,scope_kind TEXT NOT NULL,provider TEXT NOT NULL,model_value TEXT,session_value TEXT,field TEXT NOT NULL,value_json TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS threshold_overrides_key ON threshold_overrides(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field);CREATE TABLE IF NOT EXISTS idle_reseed_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,source_model TEXT NOT NULL,summary_text TEXT NOT NULL,token_count_before INTEGER NOT NULL,token_count_after INTEGER NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS keepalive_config(session_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL,last_ping_at TEXT,ping_day TEXT,ping_count INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS hook_messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,text TEXT NOT NULL,created_at TEXT NOT NULL,delivered_at TEXT);CREATE INDEX IF NOT EXISTS hook_messages_delivery ON hook_messages(session_id,event,delivered_at,created_at);CREATE TABLE IF NOT EXISTS hook_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,created_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS hook_events_session_created ON hook_events(session_id,created_at);"#;
 
 #[cfg(test)]
 mod tests {
@@ -629,5 +744,78 @@ mod tests {
         assert_eq!(s.list_sessions().unwrap().len(), 1);
         assert!(s.resume_markers_for_session(&id).unwrap().is_empty());
         assert!(s.compaction_requests_for_session(&id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn session_observations_upsert_without_losing_lineage() {
+        let s = Store::open_memory().unwrap();
+        let id = SessionId("observed".into());
+        let mut original = session(&id);
+        original.reseeded_from = Some(SessionId("parent".into()));
+        s.insert_session(&original).unwrap();
+
+        let seen_at = original.last_seen + chrono::Duration::minutes(2);
+        s.update_session_observation(&id, seen_at, Some(42), Some(123_456), Some(200_000))
+            .unwrap();
+        s.update_session_stop(&id, Some(&StopReason::UserQuit))
+            .unwrap();
+
+        let updated = s.read_session(&id).unwrap();
+        assert_eq!(updated.last_seen, seen_at);
+        assert_eq!(updated.pid, Some(42));
+        assert_eq!(updated.last_known_token_count, Some(123_456));
+        assert_eq!(updated.context_window_size, Some(200_000));
+        assert_eq!(updated.stopped_reason, Some(StopReason::UserQuit));
+        assert_eq!(updated.reseeded_from, original.reseeded_from);
+    }
+
+    #[test]
+    fn store_sets_busy_timeout_and_prunes_old_usage() {
+        let s = Store::open_memory().unwrap();
+        let timeout: i64 = s
+            .connection()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert!(timeout >= 5_000);
+
+        let old = UsageSample {
+            at: Utc::now() - chrono::Duration::days(31),
+            fetched_at: None,
+            source: UsageSource::ProviderReported,
+            provider: Provider::Codex,
+            account: None,
+            windows: HashMap::from([(
+                WindowKey {
+                    provider: Provider::Codex,
+                    kind: WindowKind::Rolling { minutes: 300 },
+                },
+                UsageWindowState::new(1.0, false, true, None, None),
+            )]),
+            credits: None,
+        };
+        s.insert_usage_sample(&old).unwrap();
+        assert_eq!(
+            s.prune_usage_before(Utc::now() - chrono::Duration::days(30))
+                .unwrap(),
+            1
+        );
+        assert!(s.all_usage_samples().unwrap().is_empty());
+    }
+
+    #[test]
+    fn hook_messages_are_claimed_once_by_session_and_event() {
+        let s = Store::open_memory().unwrap();
+        let id = SessionId("hooked".into());
+        s.enqueue_hook_message(&id, "Stop", "one").unwrap();
+        s.enqueue_hook_message(&id, "SessionStart", "two").unwrap();
+        assert_eq!(s.take_hook_messages(&id, "Stop").unwrap(), vec!["one"]);
+        assert!(s.take_hook_messages(&id, "Stop").unwrap().is_empty());
+        assert_eq!(
+            s.take_hook_messages(&id, "SessionStart").unwrap(),
+            vec!["two"]
+        );
+        s.record_hook_event(&id, "UserPromptSubmit").unwrap();
+        s.record_hook_event(&id, "Stop").unwrap();
+        assert_eq!(s.latest_hook_event(&id).unwrap().as_deref(), Some("Stop"));
     }
 }

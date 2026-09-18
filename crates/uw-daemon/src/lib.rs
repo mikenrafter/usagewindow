@@ -15,6 +15,49 @@ use uw_core::summarizer::{SummarizeTemplate, Summarizer};
 use uw_policy::{AdviseChannel, CacheCostObservation, WindowBlock};
 use uw_store::Store;
 
+struct StoreHookChannel {
+    db_path: String,
+}
+
+#[async_trait]
+impl uw_adapters::claude_code::HookChannel for StoreHookChannel {
+    async fn advise(
+        &self,
+        session_id: &SessionId,
+        text: &str,
+    ) -> uw_core::adapter::AdapterResult<DeliveryOutcome> {
+        let path = self.db_path.clone();
+        let session_id = session_id.clone();
+        let text = text.to_owned();
+        tokio::task::spawn_blocking(move || {
+            Store::open(&path)
+                .and_then(|store| store.enqueue_hook_message(&session_id, "Stop", &text))
+        })
+        .await
+        .map_err(|error| uw_core::adapter::AdapterError::Other(error.to_string()))?
+        .map_err(|error| uw_core::adapter::AdapterError::Other(error.to_string()))?;
+        Ok(DeliveryOutcome::QueuedForNextIdle)
+    }
+
+    async fn emit_status(
+        &self,
+        session_id: &SessionId,
+        text: &str,
+    ) -> uw_core::adapter::AdapterResult<DeliveryOutcome> {
+        let path = self.db_path.clone();
+        let session_id = session_id.clone();
+        let text = text.to_owned();
+        tokio::task::spawn_blocking(move || {
+            Store::open(&path)
+                .and_then(|store| store.enqueue_hook_message(&session_id, "SessionStart", &text))
+        })
+        .await
+        .map_err(|error| uw_core::adapter::AdapterError::Other(error.to_string()))?
+        .map_err(|error| uw_core::adapter::AdapterError::Other(error.to_string()))?;
+        Ok(DeliveryOutcome::QueuedForNextIdle)
+    }
+}
+
 pub const IDLE_COMPACT_PROMPT: &str = "/compact\nPreserve: the current goal, the step in progress and its exact next action, decisions already made and why, and every approach already tried and rejected.\nDiscard: file contents already read, superseded plans, and tool output that has been acted on.\nReason for compacting now: idle cache expiry";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,6 +116,8 @@ pub trait DaemonStore: Send + Sync {
 #[async_trait]
 pub trait ReseedStore: Send + Sync {
     async fn insert_reseed_summary(&self, summary: ReseedSummary) -> anyhow::Result<()>;
+    async fn insert_reseeded_session(&self, session: SessionSummary) -> anyhow::Result<()>;
+    async fn last_reseed_at(&self, id: &SessionId) -> anyhow::Result<Option<DateTime<Utc>>>;
     async fn link_reseeded_session(
         &self,
         new_id: &SessionId,
@@ -85,6 +130,21 @@ pub trait KeepaliveStore: Send + Sync {
     async fn keepalive_sessions(&self) -> anyhow::Result<Vec<SessionSummary>>;
     async fn keepalive_state(&self, id: &SessionId) -> anyhow::Result<KeepaliveState>;
     async fn record_keepalive_ping(&self, id: &SessionId, at: DateTime<Utc>) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+pub trait ObservationStore: Send + Sync {
+    async fn tracked_sessions(&self) -> anyhow::Result<Vec<SessionSummary>>;
+    async fn record_usage(&self, sample: UsageSample) -> anyhow::Result<()>;
+    async fn record_stop(&self, id: &SessionId, reason: StopReason) -> anyhow::Result<()>;
+    async fn last_hook_event(&self, id: &SessionId) -> anyhow::Result<Option<String>>;
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ObservationReport {
+    pub samples_recorded: u32,
+    pub stops_recorded: u32,
+    pub adapter_errors: u32,
 }
 
 /// Async facade for uw-store's `rusqlite::Connection` owner. Every operation
@@ -112,6 +172,68 @@ impl SqliteDaemonStore {
         })
         .await?
     }
+    pub async fn prune_usage_before(&self, cutoff: DateTime<Utc>) -> anyhow::Result<usize> {
+        self.blocking(move |store| Ok(store.prune_usage_before(cutoff)?))
+            .await
+    }
+    pub async fn resolved_profile(
+        &self,
+        session: &SessionSummary,
+        mut profile: ThresholdProfile,
+    ) -> anyhow::Result<ThresholdProfile> {
+        let provider = session.harness.clone();
+        let model = session.model.clone();
+        let session_id = session.id.clone();
+        self.blocking(move |store| {
+            for scope in [
+                None,
+                Some(ThresholdScope {
+                    provider: provider.clone(),
+                    model: None,
+                    session: None,
+                }),
+                model.clone().map(|model| ThresholdScope {
+                    provider: provider.clone(),
+                    model: Some(model),
+                    session: None,
+                }),
+                Some(ThresholdScope {
+                    provider,
+                    model,
+                    session: Some(session_id),
+                }),
+            ] {
+                apply_threshold_values(&mut profile, store.threshold_values(scope.as_ref())?)?;
+            }
+            Ok(profile)
+        })
+        .await
+    }
+}
+
+fn apply_threshold_values(
+    profile: &mut ThresholdProfile,
+    values: std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    for (field, raw) in values {
+        let raw = raw.trim_matches('"');
+        match field.as_str() {
+            "notice_pct" => profile.notice_pct = raw.parse()?,
+            "closing_pct" => profile.closing_pct = raw.parse()?,
+            "compact_pct" => profile.compact_pct = raw.parse()?,
+            "plan_pressure_pct" => profile.plan_pressure_pct = raw.parse()?,
+            "plan_pressure_min_tokens" => profile.plan_pressure_min_tokens = raw.parse()?,
+            "burn_multiplier" => profile.burn_multiplier = raw.parse()?,
+            "overhead_pct" => profile.overhead_pct = raw.parse()?,
+            "min_lead_minutes" => profile.min_lead_minutes = raw.parse()?,
+            "max_lead_minutes" => profile.max_lead_minutes = raw.parse()?,
+            "reask_delta_pct" => profile.reask_delta_pct = raw.parse()?,
+            "reask_max_per_epoch" => profile.reask_max_per_epoch = raw.parse()?,
+            "cache_write_fallback_pct" => profile.cache_write_fallback_pct = raw.parse()?,
+            _ => tracing::warn!(%field, "unsupported threshold override ignored"),
+        }
+    }
+    Ok(())
 }
 #[async_trait]
 impl DaemonStore for SqliteDaemonStore {
@@ -190,6 +312,15 @@ impl ReseedStore for SqliteDaemonStore {
         self.blocking(move |s| Ok(s.link_reseeded_session(&new_id, &source_id)?))
             .await
     }
+    async fn insert_reseeded_session(&self, session: SessionSummary) -> anyhow::Result<()> {
+        self.blocking(move |store| Ok(store.insert_session(&session)?))
+            .await
+    }
+    async fn last_reseed_at(&self, id: &SessionId) -> anyhow::Result<Option<DateTime<Utc>>> {
+        let id = id.clone();
+        self.blocking(move |store| Ok(store.last_reseed_at(&id)?))
+            .await
+    }
 }
 #[async_trait]
 impl KeepaliveStore for SqliteDaemonStore {
@@ -205,6 +336,81 @@ impl KeepaliveStore for SqliteDaemonStore {
         self.blocking(move |s| Ok(s.record_keepalive_ping(&id, at)?))
             .await
     }
+}
+
+#[async_trait]
+impl ObservationStore for SqliteDaemonStore {
+    async fn tracked_sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
+        self.blocking(|store| Ok(store.list_sessions()?)).await
+    }
+
+    async fn record_usage(&self, sample: UsageSample) -> anyhow::Result<()> {
+        self.blocking(move |store| {
+            store.insert_usage_sample(&sample)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn record_stop(&self, id: &SessionId, reason: StopReason) -> anyhow::Result<()> {
+        let id = id.clone();
+        self.blocking(move |store| Ok(store.update_session_stop(&id, Some(&reason))?))
+            .await
+    }
+    async fn last_hook_event(&self, id: &SessionId) -> anyhow::Result<Option<String>> {
+        let id = id.clone();
+        self.blocking(move |store| Ok(store.latest_hook_event(&id)?))
+            .await
+    }
+}
+
+/// Polls each registered provider once, then checks every tracked session for a
+/// structured stop signal. Adapter failures are isolated so one provider cannot
+/// prevent the others from being observed on the same cadence.
+pub async fn run_observation_tick(
+    store: &dyn ObservationStore,
+    adapters: &HashMap<Provider, Arc<dyn HarnessAdapter>>,
+) -> anyhow::Result<ObservationReport> {
+    let sessions = store.tracked_sessions().await?;
+    let mut report = ObservationReport::default();
+    for adapter in adapters.values() {
+        match adapter.fetch_usage(None).await {
+            Ok(sample) => {
+                store.record_usage(sample).await?;
+                report.samples_recorded += 1;
+            }
+            Err(error) => {
+                report.adapter_errors += 1;
+                tracing::warn!(provider = ?adapter.provider(), %error, "usage poll failed");
+            }
+        }
+    }
+    for session in sessions {
+        let Some(adapter) = adapters.get(&session.harness) else {
+            continue;
+        };
+        match adapter.detect_stop(&session.id).await {
+            Ok(Some(reason)) if session.stopped_reason.as_ref() != Some(&reason) => {
+                if session.harness == Provider::Codex
+                    && matches!(reason, StopReason::UsageLimit { .. })
+                    && !matches!(
+                        store.last_hook_event(&session.id).await?.as_deref(),
+                        Some("SessionEnd" | "Interrupt")
+                    )
+                {
+                    continue;
+                }
+                store.record_stop(&session.id, reason).await?;
+                report.stops_recorded += 1;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                report.adapter_errors += 1;
+                tracing::warn!(session = %session.id.0, %error, "stop detection failed");
+            }
+        }
+    }
+    Ok(report)
 }
 
 pub async fn run_reseed(
@@ -237,10 +443,30 @@ pub async fn run_reseed(
             &SeedContext {
                 from_session: Some(session.id.clone()),
                 summary,
-                model: cheap_model,
+                model: cheap_model.clone(),
                 cwd: session.cwd.clone(),
             },
         )
+        .await?;
+    store
+        .insert_reseeded_session(SessionSummary {
+            id: new_id.clone(),
+            harness: adapter.provider(),
+            model: Some(cheap_model),
+            account: session.account.clone(),
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+            cwd: session.cwd.clone(),
+            state_path: None,
+            context_window_size: None,
+            last_known_token_count: None,
+            launch_mode: LaunchMode::Headless,
+            pid: None,
+            stopped_reason: None,
+            resume_marker: None,
+            superseded_by: None,
+            reseeded_from: Some(session.id.clone()),
+        })
         .await?;
     store.link_reseeded_session(&new_id, &session.id).await?;
     Ok(new_id)
@@ -281,6 +507,88 @@ pub async fn run_reseed_auto_tick(
     }
 }
 
+pub struct AutoReseedRuntime {
+    pub cheap_model: ModelId,
+    pub summarizer: Arc<dyn Summarizer>,
+    pub estimated_reseed_cost_usd: f64,
+    pub estimated_wait_for_reset_cost_usd: f64,
+}
+
+pub async fn run_auto_reseed_ticks<S>(
+    store: &S,
+    adapters: &HashMap<Provider, Arc<dyn HarnessAdapter>>,
+    sessions: &[SessionSummary],
+    profiles: &HashMap<SessionId, ThresholdProfile>,
+    runtime: &AutoReseedRuntime,
+    now: DateTime<Utc>,
+) -> anyhow::Result<u32>
+where
+    S: ReseedStore + DaemonStore,
+{
+    let mut reseeded = 0;
+    for session in sessions {
+        let Some(profile) = profiles.get(&session.id) else {
+            continue;
+        };
+        let Some(cache_ttl) = profile.cache_ttl_by_provider.get(&session.harness) else {
+            continue;
+        };
+        let Some(adapter) = adapters.get(&session.harness) else {
+            continue;
+        };
+        let last = store.last_reseed_at(&session.id).await?;
+        let since = last.map_or(Duration::MAX, |at| now - at);
+        let should_reseed = uw_policy::should_auto_reseed(
+            now - session.last_seen,
+            *cache_ttl,
+            session.last_known_token_count.unwrap_or_default(),
+            runtime.estimated_reseed_cost_usd,
+            runtime.estimated_wait_for_reset_cost_usd,
+            since,
+            &profile.reseed_auto,
+            &adapter.capabilities(),
+        );
+        if !should_reseed {
+            continue;
+        }
+        let request = CompactionRequest {
+            id: uuid::Uuid::new_v4(),
+            session_id: session.id.clone(),
+            kind: CompactionKind::AltModelReseed,
+            prompt: String::new(),
+            reason: "automatic idle reseed".into(),
+            status: CompactionStatus::Pending,
+            created_at: now,
+        };
+        store.enqueue_compaction(request.clone()).await?;
+        if !store.claim_compaction(request.id).await? {
+            continue;
+        }
+        match run_reseed(
+            session,
+            runtime.cheap_model.clone(),
+            adapter.as_ref(),
+            runtime.summarizer.as_ref(),
+            store,
+        )
+        .await
+        {
+            Ok(_) => {
+                store
+                    .update_compaction(request.id, CompactionStatus::Sent)
+                    .await?;
+                reseeded += 1;
+            }
+            Err(error) => {
+                store
+                    .update_compaction(request.id, CompactionStatus::Failed(error.to_string()))
+                    .await?;
+            }
+        }
+    }
+    Ok(reseeded)
+}
+
 pub const KEEPALIVE_MARKER: &str = "[[uw-keepalive]] no action needed, acknowledge briefly";
 
 pub fn should_fire_keepalive(
@@ -299,10 +607,10 @@ pub fn should_fire_keepalive(
         return false;
     };
     let keepalive_margin = profile.idle_compact.margin + Duration::minutes(1);
-    if !state.enabled
-        || session.last_seen >= now
-        || now - session.last_seen < *ttl - keepalive_margin
-    {
+    let last_activity = state
+        .last_ping_at
+        .map_or(session.last_seen, |ping| ping.max(session.last_seen));
+    if !state.enabled || last_activity >= now || now - last_activity < *ttl - keepalive_margin {
         return false;
     }
     let today = now.date_naive().to_string();
@@ -453,6 +761,105 @@ pub enum NearLimitOutcome {
 
 pub struct IdleEpisodeTracker {
     enqueued: HashSet<SessionId>,
+}
+
+#[derive(Default)]
+pub struct PolicyRuntimeState {
+    idle: IdleEpisodeTracker,
+    asked: HashMap<AskEpoch, AskState>,
+}
+
+type AskEpoch = (SessionId, WindowKey, Option<DateTime<Utc>>);
+type AskState = (f32, u32);
+
+/// Runs the non-destructive policy decisions and queues any destructive work.
+/// Destructive delivery remains in `run_compaction_tick` and `run_resume_tick`,
+/// which both claim their rows before acting.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_policy_tick(
+    store: &(dyn DaemonStore + Send + Sync),
+    keepalive_store: &(dyn KeepaliveStore + Send + Sync),
+    adapters: &HashMap<Provider, Arc<dyn HarnessAdapter>>,
+    liveness: &dyn SessionLivenessChecker,
+    sessions: &[SessionSummary],
+    profiles: &HashMap<SessionId, ThresholdProfile>,
+    state: &mut PolicyRuntimeState,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    for session in sessions {
+        let Some(adapter) = adapters.get(&session.harness) else {
+            continue;
+        };
+        let Some(profile) = profiles.get(&session.id) else {
+            continue;
+        };
+        let samples = store.usage_samples(session).await?;
+        let mut keys = HashSet::new();
+        for sample in &samples {
+            keys.extend(sample.windows.keys().cloned());
+        }
+        for key in keys {
+            let blocks = uw_policy::segment_blocks(&samples, &key, session.account.as_ref());
+            let Some(block) = blocks.last() else {
+                continue;
+            };
+            let Some((_, current_pct)) = block.points.last() else {
+                continue;
+            };
+            let ask_key = (session.id.clone(), key.clone(), block.resets_at);
+            let previous = state.asked.get(&ask_key).copied();
+            let outcome = run_near_limit_tick(
+                store,
+                adapter.as_ref(),
+                session,
+                &key,
+                profile,
+                previous.map(|entry| entry.0),
+                previous.map_or(0, |entry| entry.1),
+            )
+            .await?;
+            if matches!(
+                outcome,
+                NearLimitOutcome::Advised | NearLimitOutcome::Checkpointed
+            ) {
+                state.asked.insert(
+                    ask_key,
+                    (*current_pct, previous.map_or(1, |entry| entry.1 + 1)),
+                );
+            }
+            if matches!(
+                session.stopped_reason.as_ref(),
+                Some(StopReason::UsageLimit { window }) if window == &key
+            ) {
+                schedule_resume_if_needed(
+                    store,
+                    session,
+                    block,
+                    now,
+                    profile,
+                    session.model.as_ref().map_or("", |model| model.0.as_str()),
+                    &[],
+                )
+                .await?;
+            }
+        }
+        if let Some(cache_ttl) = profile.cache_ttl_by_provider.get(&session.harness) {
+            state
+                .idle
+                .tick(
+                    store,
+                    session,
+                    now,
+                    liveness.is_idle(session).await,
+                    *cache_ttl,
+                    profile,
+                    adapter.as_ref(),
+                )
+                .await?;
+        }
+    }
+    run_keepalive_tick(keepalive_store, adapters, now, profiles).await?;
+    Ok(())
 }
 impl IdleEpisodeTracker {
     pub fn new() -> Self {
@@ -618,6 +1025,120 @@ pub async fn run_scheduling_ticks(
     }
 }
 
+pub async fn run_production_ticks(
+    store: Arc<SqliteDaemonStore>,
+    adapters: &HashMap<Provider, Arc<dyn HarnessAdapter>>,
+    liveness: &dyn SessionLivenessChecker,
+    interval: std::time::Duration,
+) -> anyhow::Result<()> {
+    let mut ticker = tokio::time::interval(interval);
+    let mut policy_state = PolicyRuntimeState::default();
+    let auto_reseed = auto_reseed_runtime_from_env();
+    loop {
+        ticker.tick().await;
+        run_observation_tick(store.as_ref(), adapters).await?;
+        let retention_days = std::env::var("UW_RETENTION_DAYS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|days| *days > 0)
+            .unwrap_or(30);
+        store
+            .prune_usage_before(Utc::now() - Duration::days(retention_days))
+            .await?;
+        let sessions = store.tracked_sessions().await?;
+        let mut profiles = HashMap::new();
+        for session in &sessions {
+            let mut profile = ThresholdProfile {
+                keepalive: Some(KeepaliveConfig {
+                    enabled: true,
+                    daily_cap: std::env::var("UW_KEEPALIVE_DAILY_CAP")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(24),
+                }),
+                ..Default::default()
+            };
+            if session.harness == Provider::ClaudeCode {
+                profile
+                    .cache_ttl_by_provider
+                    .insert(Provider::ClaudeCode, Duration::minutes(5));
+            }
+            if auto_reseed.is_some() {
+                profile.reseed_auto = ReseedAutoConfig {
+                    enabled: true,
+                    min_tokens: std::env::var("UW_RESEED_MIN_TOKENS")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(100_000),
+                    cooldown: Duration::minutes(
+                        std::env::var("UW_RESEED_COOLDOWN_MINUTES")
+                            .ok()
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(60),
+                    ),
+                    margin: Duration::minutes(1),
+                };
+            }
+            profiles.insert(
+                session.id.clone(),
+                store.resolved_profile(session, profile).await?,
+            );
+        }
+        run_policy_tick(
+            store.as_ref(),
+            store.as_ref(),
+            adapters,
+            liveness,
+            &sessions,
+            &profiles,
+            &mut policy_state,
+            Utc::now(),
+        )
+        .await?;
+        if let Some(runtime) = &auto_reseed {
+            run_auto_reseed_ticks(
+                store.as_ref(),
+                adapters,
+                &sessions,
+                &profiles,
+                runtime,
+                Utc::now(),
+            )
+            .await?;
+        }
+        run_compaction_tick(store.as_ref(), adapters, liveness).await?;
+        run_resume_tick(store.as_ref(), adapters, Utc::now()).await?;
+    }
+}
+
+fn auto_reseed_runtime_from_env() -> Option<AutoReseedRuntime> {
+    if std::env::var("UW_RESEED_AUTO").ok().as_deref() != Some("true") {
+        return None;
+    }
+    let base_url = std::env::var("UW_SUMMARIZER_BASE_URL").ok()?;
+    let summarizer_model = std::env::var("UW_SUMMARIZER_MODEL").ok()?;
+    let target_model = std::env::var("UW_RESEED_MODEL").ok()?;
+    let reseed_cost = std::env::var("UW_RESEED_ESTIMATED_COST_USD")
+        .ok()?
+        .parse()
+        .ok()?;
+    let wait_cost = std::env::var("UW_WAIT_FOR_RESET_ESTIMATED_COST_USD")
+        .ok()?
+        .parse()
+        .ok()?;
+    Some(AutoReseedRuntime {
+        cheap_model: ModelId(target_model),
+        summarizer: Arc::new(uw_adapters::summarizer::OpenAiCompatibleSummarizer::new(
+            base_url,
+            summarizer_model,
+            std::env::var("UW_SUMMARIZER_API_KEY").ok(),
+            Arc::new(uw_adapters::summarizer::ReqwestChatTransport::default()),
+        )),
+        estimated_reseed_cost_usd: reseed_cost,
+        estimated_wait_for_reset_cost_usd: wait_cost,
+    })
+}
+
 /// Entry point shared by the daemon binary and the Phase 6 CLI command. Service
 /// configuration (SQLite path and adapter registry) is intentionally still a later
 /// wiring concern; this preserves the same cadence/ownership point for Phase 7.
@@ -626,24 +1147,65 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
     let store = Store::open(&path)?;
     let daemon_store = Arc::new(SqliteDaemonStore::new(store));
     let app = uw_web::app(Store::open(&path)?);
-    let adapters: HashMap<Provider, Arc<dyn HarnessAdapter>> = HashMap::from([(
-        Provider::Codex,
-        Arc::new(uw_adapters::codex::CodexAdapter::real()) as Arc<dyn HarnessAdapter>,
-    )]);
-    let liveness = SystemSessionLivenessChecker;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:7878").await?; // TODO: make the API port configurable.
+    let cache_path = std::env::var("UW_CLAUDE_CACHE_PATH")
+        .unwrap_or_else(|_| format!("{path}.claude-usage-cache.json"));
+    let hook_channel = Arc::new(StoreHookChannel {
+        db_path: path.clone(),
+    });
+    let claude = uw_adapters::claude_code::ClaudeCodeAdapter::real(
+        cache_path,
+        std::env::var("UW_CLAUDE_VERSION").unwrap_or_else(|_| "unknown".into()),
+    )
+    .with_hook_channel(hook_channel.clone());
+    let codex = uw_adapters::codex::CodexAdapter::real().with_hook_channel(hook_channel);
+    let mut adapters: HashMap<Provider, Arc<dyn HarnessAdapter>> = HashMap::from([
+        (Provider::Codex, Arc::new(codex) as Arc<dyn HarnessAdapter>),
+        (
+            Provider::ClaudeCode,
+            Arc::new(claude) as Arc<dyn HarnessAdapter>,
+        ),
+    ]);
+    if let Ok(command) = std::env::var("UW_GENERIC_USAGE_COMMAND") {
+        let command: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
+        if !command.is_empty() {
+            adapters.insert(
+                Provider::Other("generic".into()),
+                Arc::new(uw_adapters::generic_hook::GenericHookAdapter::new(Some(
+                    command,
+                ))),
+            );
+        }
+    }
+    let liveness = SystemSessionLivenessChecker {
+        db_path: path.clone(),
+    };
+    let address = std::env::var("UW_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".into());
+    let listener = tokio::net::TcpListener::bind(address).await?;
     let server = async move { axum::serve(listener, app).await };
     tokio::select! {
         result = server => result.map_err(Into::into),
-        result = run_scheduling_ticks(daemon_store.as_ref(), &adapters, &liveness, std::time::Duration::from_secs(5)) => result,
+        result = run_production_ticks(daemon_store, &adapters, &liveness, std::time::Duration::from_secs(5)) => result,
     }
 }
 
-struct SystemSessionLivenessChecker;
+struct SystemSessionLivenessChecker {
+    db_path: String,
+}
 #[async_trait]
 impl SessionLivenessChecker for SystemSessionLivenessChecker {
     async fn is_idle(&self, session: &SessionSummary) -> bool {
-        session.pid.is_none()
+        let path = self.db_path.clone();
+        let id = session.id.clone();
+        tokio::task::spawn_blocking(move || {
+            Store::open(&path)
+                .and_then(|store| store.latest_hook_event(&id))
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some("Stop")
+        })
+        .await
+        .unwrap_or(false)
     }
 }
 
@@ -668,7 +1230,7 @@ where
         return serde_json::json!({});
     };
     tracing::debug!(payload = %payload, "hook ingress");
-    match tokio::time::timeout(std::time::Duration::from_millis(100), backend(payload)).await {
+    match tokio::time::timeout(std::time::Duration::from_millis(250), backend(payload)).await {
         Ok(Ok(response)) => response,
         _ => serde_json::json!({}),
     }
@@ -851,6 +1413,126 @@ mod tests {
         })
         .await;
         assert_eq!(result, serde_json::json!({}));
+    }
+
+    struct ObservationFake {
+        sessions: Vec<SessionSummary>,
+        samples: StdMutex<Vec<UsageSample>>,
+        stops: StdMutex<Vec<(SessionId, StopReason)>>,
+        last_hook_event: Option<String>,
+    }
+
+    #[async_trait]
+    impl ObservationStore for ObservationFake {
+        async fn tracked_sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
+            Ok(self.sessions.clone())
+        }
+        async fn record_usage(&self, sample: UsageSample) -> anyhow::Result<()> {
+            self.samples.lock().unwrap().push(sample);
+            Ok(())
+        }
+        async fn record_stop(&self, id: &SessionId, reason: StopReason) -> anyhow::Result<()> {
+            self.stops.lock().unwrap().push((id.clone(), reason));
+            Ok(())
+        }
+        async fn last_hook_event(&self, _: &SessionId) -> anyhow::Result<Option<String>> {
+            Ok(self.last_hook_event.clone())
+        }
+    }
+
+    struct ObservationAdapter {
+        sample: UsageSample,
+        stop: Option<StopReason>,
+    }
+
+    #[async_trait]
+    impl HarnessAdapter for ObservationAdapter {
+        fn provider(&self) -> Provider {
+            self.sample.provider.clone()
+        }
+        fn capabilities(&self) -> Capabilities {
+            caps(false, false, false)
+        }
+        async fn fetch_usage(&self, _: Option<&AccountId>) -> AdapterResult<UsageSample> {
+            Ok(self.sample.clone())
+        }
+        async fn detect_stop(&self, _: &SessionId) -> AdapterResult<Option<StopReason>> {
+            Ok(self.stop.clone())
+        }
+        async fn emit_status(
+            &self,
+            _: &SessionId,
+            _: StatusEvent,
+        ) -> AdapterResult<DeliveryOutcome> {
+            Err(AdapterError::Unsupported)
+        }
+        async fn advise(&self, _: &SessionId, _: &str) -> AdapterResult<DeliveryOutcome> {
+            Err(AdapterError::Unsupported)
+        }
+        async fn compact(
+            &self,
+            _: &SessionSummary,
+            _: &CompactionRequest,
+        ) -> AdapterResult<DeliveryOutcome> {
+            Err(AdapterError::Unsupported)
+        }
+        async fn resume_session(&self, _: &SessionSummary) -> AdapterResult<()> {
+            Err(AdapterError::Unsupported)
+        }
+    }
+
+    #[tokio::test]
+    async fn observation_tick_polls_usage_and_records_detected_stops() {
+        let now = Utc::now();
+        let key = WindowKey {
+            provider: Provider::Codex,
+            kind: WindowKind::Rolling { minutes: 300 },
+        };
+        let sample = UsageSample {
+            at: now,
+            fetched_at: Some(now),
+            source: UsageSource::ProviderReported,
+            provider: Provider::Codex,
+            account: None,
+            windows: HashMap::from([(
+                key.clone(),
+                UsageWindowState::new(100.0, true, true, None, None),
+            )]),
+            credits: None,
+        };
+        let store = ObservationFake {
+            sessions: vec![SessionSummary {
+                harness: Provider::Codex,
+                ..session()
+            }],
+            samples: StdMutex::new(vec![]),
+            stops: StdMutex::new(vec![]),
+            last_hook_event: Some("SessionEnd".into()),
+        };
+        let adapter = Arc::new(ObservationAdapter {
+            sample,
+            stop: Some(StopReason::UsageLimit {
+                window: key.clone(),
+            }),
+        });
+
+        let report = run_observation_tick(
+            &store,
+            &HashMap::from([(Provider::Codex, adapter as Arc<dyn HarnessAdapter>)]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.samples_recorded, 1);
+        assert_eq!(report.stops_recorded, 1);
+        assert_eq!(store.samples.lock().unwrap().len(), 1);
+        assert_eq!(
+            store.stops.lock().unwrap().as_slice(),
+            &[(
+                SessionId("s".into()),
+                StopReason::UsageLimit { window: key }
+            )]
+        );
     }
 
     #[tokio::test]
@@ -1263,6 +1945,21 @@ mod tests {
     }
 
     #[test]
+    fn stored_threshold_values_override_the_runtime_profile() {
+        let mut profile = ThresholdProfile::default();
+        apply_threshold_values(
+            &mut profile,
+            std::collections::BTreeMap::from([
+                ("closing_pct".into(), "77.5".into()),
+                ("reask_max_per_epoch".into(), "3".into()),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(profile.closing_pct, 77.5);
+        assert_eq!(profile.reask_max_per_epoch, 3);
+    }
+
+    #[test]
     fn keepalive_requires_enabled_and_daily_cap() {
         let now = Utc::now();
         let mut profile = ThresholdProfile {
@@ -1295,6 +1992,33 @@ mod tests {
             ping_count: 1,
         };
         assert!(!should_fire_keepalive(now, &session, &capped, &profile));
+    }
+
+    #[test]
+    fn keepalive_waits_a_full_cadence_after_the_last_ping() {
+        let now = Utc::now();
+        let mut profile = ThresholdProfile {
+            keepalive: Some(KeepaliveConfig {
+                enabled: true,
+                daily_cap: 10,
+            }),
+            ..Default::default()
+        };
+        profile
+            .cache_ttl_by_provider
+            .insert(Provider::ClaudeCode, Duration::minutes(5));
+        let session = SessionSummary {
+            last_seen: now - Duration::hours(1),
+            ..session()
+        };
+        let state = KeepaliveState {
+            session_id: session.id.clone(),
+            enabled: true,
+            last_ping_at: Some(now - Duration::minutes(1)),
+            ping_day: Some(now.date_naive().to_string()),
+            ping_count: 1,
+        };
+        assert!(!should_fire_keepalive(now, &session, &state, &profile));
     }
 
     #[tokio::test]

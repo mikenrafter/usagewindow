@@ -125,3 +125,29 @@ Claude Code 2.1.261+ defers MCP tool-schema loading, so an empty/short `tools/li
 response costs negligible tokens when the server has nothing relevant to offer for a
 given session (e.g. gate on a marker env var this adapter sets when it spawns/attaches
 to a session it's tracking, similar to Paseo's own `PASEO_AGENT_ID`-presence gate).
+
+## Local verification gaps (2026-09-17)
+
+- Session-id stability across a real `/compact` remains unverified on this machine. A
+  safe check requires a disposable live Claude Code session: record the `SessionStart`
+  and transcript UUID, send one claimed `/compact`, wait for the compact boundary, and
+  compare the following `SessionStart:compact` id. If it changes, persist the new id in
+  `sessions.superseded_by` before enabling automatic compaction for that installation.
+- Usage-limit stop detection also remains unverified because no local Claude Code
+  session was at a usage limit during this implementation pass. The concrete next test
+  is to capture the final transcript record and hook sequence from a session that
+  reaches a real provider limit, then correlate it with an OAuth usage response near
+  100%. Until that fixture exists, `ClaudeCodeAdapter::detect_stop` returns no reason and
+  automatic resume does not guess.
+- The documented Stop-hook advice channel only delivers while Claude Code is processing
+  that hook. A daemon tick that queues a keepalive after the Stop hook has returned
+  cannot make the current turn continue. Verifying a safe idle-time delivery primitive
+  without adding another unsolicited-send path is still required before keepalive can
+  claim full live-session coverage; the current queue is bounded and fail-open but may
+  wait for the next matching hook.
+- No verified external messenger for injecting `/compact` into an already-running idle
+  Claude Code process was available locally. Starting `claude --resume` against a live
+  session would create a competing process and is not documented as safe, so the real
+  adapter reports `can_trigger_compaction: false` unless a verified `SessionMessenger`
+  is supplied. The next step is a disposable-session test of the owning harness process'
+  supported message/steer interface; do not substitute a second resume process.

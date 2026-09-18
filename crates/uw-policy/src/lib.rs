@@ -255,8 +255,10 @@ pub fn should_auto_reseed(
     config: &ReseedAutoConfig,
     caps: &Capabilities,
 ) -> bool {
-    caps.can_trigger_compaction
-        && caps.reports_token_counts
+    caps.reports_token_counts
+        && caps
+            .seed_modes
+            .contains(&uw_core::adapter::SeedMode::InitialPrompt)
         && config.enabled
         && idle_for >= cache_ttl - config.margin
         && last_known_token_count >= config.min_tokens
@@ -605,6 +607,29 @@ mod tests {
     }
 
     #[test]
+    fn reseed_uses_seed_capability_not_compaction_capability() {
+        let mut capabilities = caps();
+        capabilities.can_trigger_compaction = false;
+        capabilities.seed_modes = vec![uw_core::adapter::SeedMode::InitialPrompt];
+        let config = ReseedAutoConfig {
+            enabled: true,
+            min_tokens: 100,
+            cooldown: Duration::minutes(30),
+            margin: Duration::minutes(1),
+        };
+        assert!(should_auto_reseed(
+            Duration::minutes(5),
+            Duration::minutes(5),
+            100,
+            1.0,
+            2.0,
+            Duration::minutes(30),
+            &config,
+            &capabilities,
+        ));
+    }
+
+    #[test]
     fn advise_channel_follows_capabilities() {
         let mut c = caps();
         assert_eq!(advise_channel_for(&c), AdviseChannel::MidTurn);
@@ -680,7 +705,7 @@ mod tests {
             can_observe_compaction: true,
             reports_token_counts: true,
             headless_resume: true,
-            seed_modes: vec![],
+            seed_modes: vec![uw_core::adapter::SeedMode::InitialPrompt],
         }
     }
 }

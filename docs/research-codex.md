@@ -246,9 +246,19 @@ directly rather than porting Claude Code's inference-based approach.
   under its own data dir, independent of Codex" rather than anything Codex-specific,
   since Codex has no hook-writable working-state convention to hook into.
 
+### Transport lifecycle implementation note (2026-09-17)
+
+The adapter now keeps one `codex app-server` child and sends the documented
+`initialize`, `account/read`, and `account/rateLimits/read` sequence over that child's
+stdin/stdout stream with monotonically increasing request ids. A process-boundary test
+drives two complete limit reads through a fake JSON-RPC server, proves only one child was
+started, and proves dropping the transport terminates and reaps it. No new claim about
+the live server protocol was added here: the request sequence and same-process stream
+were already the basis of the verified direct probe recorded in the Usage/quota API
+section.
+
 ## MCP scoping note
 
 codex mcp --help describes MCP as external-server management with list, get, add, remove, login, and logout. codex doctor reported zero MCP servers configured on this machine. codex plugin --help describes plugin installation and marketplace management; it does not expose a session-specific MCP scope flag.
 
 The local research found no Codex-specific MCP registration that would limit a server to usagewindow-managed sessions. A user-level MCP server should therefore be assumed to load into every Codex session where that config is active. If a future usagewindow MCP server is installed globally, gate its behavior on an adapter-set environment marker or session id and keep its tools read-only by default. The hook path is a better fit for short status injection because it can target SessionStart(source=compact) without adding an MCP tool schema to unrelated sessions.
-

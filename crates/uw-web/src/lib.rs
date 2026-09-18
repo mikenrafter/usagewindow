@@ -35,11 +35,117 @@ pub fn app(store: Store) -> Router {
         .route("/api/sessions/{id}/compact/ask", post(compact_ask))
         .route("/api/sessions/{id}/compact/status", get(compact_status))
         .route("/api/sessions/{id}/keepalive", post(keepalive))
+        .route("/api/hooks", post(hook_ingress))
         .route("/api/thresholds", get(thresholds_get).post(thresholds_set))
         .fallback(static_asset)
         .with_state(AppState {
             store: Arc::new(Mutex::new(store)),
         })
+}
+
+#[derive(Debug, Deserialize)]
+struct HookQuery {
+    provider: String,
+}
+
+async fn hook_ingress(
+    State(state): State<AppState>,
+    Query(query): Query<HookQuery>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let provider = query
+        .provider
+        .parse::<Provider>()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let event = payload
+        .get("hook_event_name")
+        .or_else(|| payload.get("hookEventName"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing hook event name".into()))?
+        .to_owned();
+    if !matches!(
+        event.as_str(),
+        "SessionStart"
+            | "UserPromptSubmit"
+            | "PreToolUse"
+            | "PostToolUse"
+            | "PermissionRequest"
+            | "Stop"
+            | "SubagentStart"
+            | "SubagentStop"
+            | "SessionEnd"
+            | "Interrupt"
+            | "PreCompact"
+            | "PostCompact"
+    ) {
+        return Err((StatusCode::BAD_REQUEST, "unsupported hook event".into()));
+    }
+    let id = payload
+        .get("session_id")
+        .or_else(|| payload.get("sessionId"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing session id".into()))?;
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err((StatusCode::BAD_REQUEST, "invalid session id".into()));
+    }
+    let id = SessionId(id.to_owned());
+    let cwd = payload
+        .get("cwd")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(".")
+        .to_owned();
+    let model = payload
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| ModelId(value.to_owned()));
+    let pid = payload
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    let now = Utc::now();
+    let output_event = event.clone();
+    let output_provider = provider.clone();
+    let messages = read(state, move |store| {
+        store.upsert_session(&SessionSummary {
+            id: id.clone(),
+            harness: provider,
+            model,
+            account: None,
+            first_seen: now,
+            last_seen: now,
+            cwd,
+            state_path: None,
+            context_window_size: None,
+            last_known_token_count: None,
+            launch_mode: LaunchMode::Interactive,
+            pid,
+            stopped_reason: None,
+            resume_marker: None,
+            superseded_by: None,
+            reseeded_from: None,
+        })?;
+        store.record_hook_event(&id, &event)?;
+        Ok(store.take_hook_messages(&id, &event)?)
+    })
+    .await?;
+    if messages.is_empty()
+        || !matches!(
+            (output_provider, output_event.as_str()),
+            (Provider::ClaudeCode, "Stop" | "SessionStart") | (Provider::Codex, "SessionStart")
+        )
+    {
+        return Ok(Json(serde_json::json!({})));
+    }
+    Ok(Json(serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": output_event,
+            "additionalContext": messages.join("\n")
+        }
+    })))
 }
 
 async fn read<T, F>(state: AppState, operation: F) -> Result<T, (StatusCode, String)>
@@ -473,6 +579,52 @@ mod tests {
             .await
             .unwrap();
         assert!(String::from_utf8_lossy(&body).contains("usagewindow"));
+    }
+
+    #[tokio::test]
+    async fn hook_ingress_routes_supported_session_events_and_rejects_unknown_events() {
+        let router = app(Store::open_memory().unwrap());
+        let start = serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "hook-session",
+            "cwd": "/work",
+            "source": "startup"
+        });
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/hooks?provider=codex")
+                    .header("content-type", "application/json")
+                    .body(Body::from(start.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/api/sessions/hook-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = router
+            .oneshot(
+                Request::post("/api/hooks?provider=codex")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"hook_event_name":"MadeUp"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

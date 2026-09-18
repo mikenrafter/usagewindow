@@ -117,7 +117,7 @@ impl HttpTransport for ReqwestHttpTransport {
         Ok(HttpResponse { status, body })
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CacheEntry {
     pub fetched_at: DateTime<Utc>,
     pub sample: UsageSample,
@@ -127,9 +127,56 @@ pub trait CacheStore: Send + Sync {
     async fn load(&self) -> AdapterResult<Option<CacheEntry>>;
     async fn save(&self, entry: CacheEntry) -> AdapterResult<()>;
 }
+
+pub struct FileCacheStore {
+    path: std::path::PathBuf,
+}
+
+impl FileCacheStore {
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+#[async_trait]
+impl CacheStore for FileCacheStore {
+    async fn load(&self) -> AdapterResult<Option<CacheEntry>> {
+        match tokio::fs::read(&self.path).await {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|error| AdapterError::Other(error.to_string())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(AdapterError::Other(error.to_string())),
+        }
+    }
+
+    async fn save(&self, entry: CacheEntry) -> AdapterResult<()> {
+        if let Some(parent) = self.path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|error| AdapterError::Other(error.to_string()))?;
+        }
+        let bytes =
+            serde_json::to_vec(&entry).map_err(|error| AdapterError::Other(error.to_string()))?;
+        let temporary = self.path.with_extension("tmp");
+        tokio::fs::write(&temporary, bytes)
+            .await
+            .map_err(|error| AdapterError::Other(error.to_string()))?;
+        tokio::fs::rename(temporary, &self.path)
+            .await
+            .map_err(|error| AdapterError::Other(error.to_string()))
+    }
+}
 #[async_trait]
 pub trait HookChannel: Send + Sync {
     async fn advise(&self, session_id: &SessionId, text: &str) -> AdapterResult<DeliveryOutcome>;
+    async fn emit_status(
+        &self,
+        session_id: &SessionId,
+        text: &str,
+    ) -> AdapterResult<DeliveryOutcome> {
+        self.advise(session_id, text).await
+    }
 }
 #[async_trait]
 pub trait SessionMessenger: Send + Sync {
@@ -148,6 +195,15 @@ pub struct ClaudeCodeAdapter {
     transcript_fs: Arc<dyn TranscriptFileSystem>,
 }
 impl ClaudeCodeAdapter {
+    pub fn real(cache_path: impl Into<std::path::PathBuf>, version: impl Into<String>) -> Self {
+        Self::with_dependencies(
+            Arc::new(FileCredentialsReader),
+            Arc::new(ReqwestHttpTransport::default()),
+            Arc::new(FileCacheStore::new(cache_path)),
+            version.into(),
+            Arc::new(Utc::now),
+        )
+    }
     pub fn with_dependencies(
         credentials: Arc<dyn CredentialsReader>,
         http: Arc<dyn HttpTransport>,
@@ -187,6 +243,10 @@ impl ClaudeCodeAdapter {
         self.hook = Some(hook);
         self.messenger = Some(messenger);
         self.spawner = spawner;
+        self
+    }
+    pub fn with_hook_channel(mut self, hook: Arc<dyn HookChannel>) -> Self {
+        self.hook = Some(hook);
         self
     }
     pub fn with_transcript_fs(mut self, fs: Arc<dyn TranscriptFileSystem>) -> Self {
@@ -283,7 +343,11 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         Provider::ClaudeCode
     }
     fn capabilities(&self) -> Capabilities {
-        Self::capabilities_static()
+        let mut capabilities = Self::capabilities_static();
+        capabilities.can_trigger_compaction = self.messenger.is_some();
+        capabilities.can_advise_mid_turn = self.hook.is_some();
+        capabilities.can_inject_at_session_start = self.hook.is_some();
+        capabilities
     }
     async fn fetch_usage(&self, _: Option<&AccountId>) -> AdapterResult<UsageSample> {
         if let Some(entry) = self.cache.load().await?
@@ -315,8 +379,16 @@ impl HarnessAdapter for ClaudeCodeAdapter {
     async fn detect_stop(&self, _: &SessionId) -> AdapterResult<Option<StopReason>> {
         Ok(None)
     }
-    async fn emit_status(&self, _: &SessionId, _: StatusEvent) -> AdapterResult<DeliveryOutcome> {
-        Err(AdapterError::Unsupported)
+    async fn emit_status(
+        &self,
+        session: &SessionId,
+        status: StatusEvent,
+    ) -> AdapterResult<DeliveryOutcome> {
+        self.hook
+            .as_ref()
+            .ok_or(AdapterError::Unsupported)?
+            .emit_status(session, &format!("{status:?}"))
+            .await
     }
     async fn advise(&self, session: &SessionId, text: &str) -> AdapterResult<DeliveryOutcome> {
         self.hook
@@ -330,20 +402,17 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         session: &SessionSummary,
         req: &CompactionRequest,
     ) -> AdapterResult<DeliveryOutcome> {
-        self.messenger
-            .as_ref()
-            .ok_or(AdapterError::Unsupported)?
-            .send(
-                &session.id,
-                &compact_instructions(&req.prompt, session_state_path(session)),
-            )
-            .await
+        let text = compact_instructions(&req.prompt, session_state_path(session));
+        if let Some(messenger) = &self.messenger {
+            return messenger.send(&session.id, &text).await;
+        }
+        Err(AdapterError::Unsupported)
     }
     async fn resume_session(&self, session: &SessionSummary) -> AdapterResult<()> {
         self.spawner
             .run(ProcessSpec {
                 program: "claude".into(),
-                args: vec!["--resume".into(), session.id.0.clone()],
+                args: vec!["--print".into(), "--resume".into(), session.id.0.clone()],
                 cwd: session.cwd.clone(),
             })
             .await
@@ -361,15 +430,20 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             .spawner
             .run(ProcessSpec {
                 program: "claude".into(),
-                args: vec!["-p".into(), seed.summary.clone()],
+                args: vec![
+                    "-p".into(),
+                    "--output-format".into(),
+                    "json".into(),
+                    seed.summary.clone(),
+                ],
                 cwd: seed.cwd.clone(),
             })
             .await?;
-        Ok(SessionId(
-            out.session_id
-                .or_else(|| (!out.stdout.trim().is_empty()).then(|| out.stdout.trim().to_owned()))
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-        ))
+        out.session_id.map(SessionId).ok_or_else(|| {
+            AdapterError::Other(
+                "Claude Code did not report the new session id in JSON output".into(),
+            )
+        })
     }
 
     async fn export_transcript(&self, session: &SessionSummary) -> AdapterResult<String> {
@@ -393,6 +467,34 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use std::sync::{Arc, Mutex};
     use uw_core::adapter::{Capabilities, HarnessAdapter};
+
+    #[tokio::test]
+    async fn file_cache_survives_adapter_reconstruction() {
+        let path = std::env::temp_dir().join(format!("uw-cache-{}.json", uuid::Uuid::new_v4()));
+        let cache = FileCacheStore::new(path.clone());
+        let at = Utc::now();
+        let entry = CacheEntry {
+            fetched_at: at,
+            sample: UsageSample {
+                at,
+                fetched_at: Some(at),
+                source: UsageSource::ProviderReported,
+                provider: Provider::ClaudeCode,
+                account: None,
+                windows: HashMap::new(),
+                credits: None,
+            },
+        };
+        cache.save(entry.clone()).await.unwrap();
+        let loaded = FileCacheStore::new(path.clone())
+            .load()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.fetched_at, entry.fetched_at);
+        assert_eq!(loaded.sample, entry.sample);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn transcript_export_filter_removes_keepalive_turns() {
@@ -626,7 +728,10 @@ mod tests {
     impl ProcessSpawner for Recorder {
         async fn run(&self, spec: ProcessSpec) -> AdapterResult<crate::process::ProcessOutput> {
             *self.0.lock().unwrap() = Some(spec);
-            Ok(Default::default())
+            Ok(crate::process::ProcessOutput {
+                session_id: Some("01a0aecd-181f-7491-90b1-d2cc8beaad3f".into()),
+                ..Default::default()
+            })
         }
     }
     fn session(mode: LaunchMode) -> SessionSummary {
@@ -668,7 +773,7 @@ mod tests {
             *record.lock().unwrap(),
             Some(ProcessSpec {
                 program: "claude".into(),
-                args: vec!["--resume".into(), "abc".into()],
+                args: vec!["--print".into(), "--resume".into(), "abc".into()],
                 cwd: "/work".into()
             })
         );
@@ -685,7 +790,12 @@ mod tests {
             *record.lock().unwrap(),
             Some(ProcessSpec {
                 program: "claude".into(),
-                args: vec!["-p".into(), "sum".into()],
+                args: vec![
+                    "-p".into(),
+                    "--output-format".into(),
+                    "json".into(),
+                    "sum".into()
+                ],
                 cwd: "/seed".into()
             })
         );

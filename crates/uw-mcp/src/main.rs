@@ -189,9 +189,24 @@ pub fn handle_request(request: Value, deps: &Deps) -> Value {
 
 fn main() -> anyhow::Result<()> {
     let path = std::env::var("UW_DB_PATH").unwrap_or_else(|_| "usagewindow.db".into());
+    let cache_path = std::env::var("UW_CLAUDE_CACHE_PATH")
+        .unwrap_or_else(|_| format!("{path}.claude-usage-cache.json"));
+    let adapters: HashMap<Provider, Arc<dyn HarnessAdapter>> = HashMap::from([
+        (
+            Provider::ClaudeCode,
+            Arc::new(uw_adapters::claude_code::ClaudeCodeAdapter::real(
+                cache_path,
+                std::env::var("UW_CLAUDE_VERSION").unwrap_or_else(|_| "unknown".into()),
+            )) as Arc<dyn HarnessAdapter>,
+        ),
+        (
+            Provider::Codex,
+            Arc::new(uw_adapters::codex::CodexAdapter::real()) as Arc<dyn HarnessAdapter>,
+        ),
+    ]);
     let deps = Deps {
         store: Arc::new(Mutex::new(Store::open(&path)?)),
-        adapters: HashMap::new(),
+        adapters,
     };
     let stdin = io::stdin();
     let mut stdout = io::BufWriter::new(io::stdout().lock());

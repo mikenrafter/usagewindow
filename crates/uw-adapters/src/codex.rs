@@ -14,42 +14,131 @@ use uw_core::model::*;
 pub trait AppServerTransport: Send + Sync {
     async fn call(&self, method: &str, params: Value) -> AdapterResult<Value>;
 }
-pub struct CodexProcessTransport;
-#[async_trait]
-impl AppServerTransport for CodexProcessTransport {
-    async fn call(&self, method: &str, params: Value) -> AdapterResult<Value> {
+/// Persistent app-server transport: spawns `codex app-server` at most once and
+/// reuses that single child process/stdio session for every subsequent
+/// JSON-RPC call, instead of spawning a new process per call.
+pub struct CodexAppServerTransport {
+    program: String,
+    args: Vec<String>,
+    session: tokio::sync::Mutex<Option<AppServerSession>>,
+}
+
+struct AppServerSession {
+    _child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::io::BufReader<tokio::process::ChildStdout>,
+    next_id: u64,
+}
+
+impl CodexAppServerTransport {
+    pub fn new() -> Self {
+        Self::spawn_with("codex", vec!["app-server".into()])
+    }
+
+    fn spawn_with(program: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            program: program.into(),
+            args,
+            session: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    async fn open_session(&self) -> AdapterResult<AppServerSession> {
         use std::process::Stdio;
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let mut child = tokio::process::Command::new("codex")
-            .arg("app-server")
+        let mut child = tokio::process::Command::new(&self.program)
+            .args(&self.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| AdapterError::Transient(e.to_string()))?;
-        let request = json!({"method":method,"id":1,"params":params});
-        child
+        let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| AdapterError::Other("app-server stdin unavailable".into()))?
-            .write_all(format!("{request}\n").as_bytes())
-            .await
-            .map_err(|e| AdapterError::Transient(e.to_string()))?;
+            .ok_or_else(|| AdapterError::Other("app-server stdin unavailable".into()))?;
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| AdapterError::Other("app-server stdout unavailable".into()))?;
-        let mut line = String::new();
-        BufReader::new(stdout)
-            .read_line(&mut line)
+        Ok(AppServerSession {
+            _child: child,
+            stdin,
+            stdout: tokio::io::BufReader::new(stdout),
+            next_id: 1,
+        })
+    }
+}
+
+impl Default for CodexAppServerTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CodexAppServerTransport {
+    /// Writes one JSON-RPC request and reads lines from the session's stdout
+    /// until the response carrying the matching `id` shows up, discarding any
+    /// unsolicited notification lines the app-server may interleave.
+    async fn roundtrip(
+        session: &mut AppServerSession,
+        method: &str,
+        params: Value,
+    ) -> AdapterResult<Value> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let id = session.next_id;
+        session.next_id += 1;
+        let request = json!({"method": method, "id": id, "params": params});
+        session
+            .stdin
+            .write_all(format!("{request}\n").as_bytes())
             .await
             .map_err(|e| AdapterError::Transient(e.to_string()))?;
-        serde_json::from_str(&line).map_err(|e| AdapterError::Other(e.to_string()))
+        session
+            .stdin
+            .flush()
+            .await
+            .map_err(|e| AdapterError::Transient(e.to_string()))?;
+        loop {
+            let mut line = String::new();
+            let bytes_read = session
+                .stdout
+                .read_line(&mut line)
+                .await
+                .map_err(|e| AdapterError::Transient(e.to_string()))?;
+            if bytes_read == 0 {
+                return Err(AdapterError::Transient("app-server closed stdout".into()));
+            }
+            let value: Value = serde_json::from_str(line.trim())
+                .map_err(|e| AdapterError::Other(e.to_string()))?;
+            if value.get("id").and_then(Value::as_u64) == Some(id) {
+                return Ok(value);
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl AppServerTransport for CodexAppServerTransport {
+    async fn call(&self, method: &str, params: Value) -> AdapterResult<Value> {
+        let mut guard = self.session.lock().await;
+        if guard.is_none() {
+            *guard = Some(self.open_session().await?);
+        }
+        let result = Self::roundtrip(guard.as_mut().unwrap(), method, params).await;
+        if result.is_err() {
+            // Drop the broken session so the next call respawns a fresh one
+            // instead of reusing a process that may be dead or desynced.
+            *guard = None;
+        }
+        result
     }
 }
 pub struct CodexAdapter {
     transport: Arc<dyn AppServerTransport>,
     spawner: Arc<dyn ProcessSpawner>,
     now: Arc<dyn Fn() -> chrono::DateTime<Utc> + Send + Sync>,
+    hook: Option<Arc<dyn crate::claude_code::HookChannel>>,
 }
 impl CodexAdapter {
     pub fn new(transport: Arc<dyn AppServerTransport>) -> Self {
@@ -57,13 +146,18 @@ impl CodexAdapter {
             transport,
             spawner: Arc::new(crate::process::TokioProcessSpawner),
             now: Arc::new(Utc::now),
+            hook: None,
         }
     }
     pub fn real() -> Self {
-        Self::new(Arc::new(CodexProcessTransport))
+        Self::new(Arc::new(CodexAppServerTransport::new()))
     }
     pub fn with_spawner(mut self, spawner: Arc<dyn ProcessSpawner>) -> Self {
         self.spawner = spawner;
+        self
+    }
+    pub fn with_hook_channel(mut self, hook: Arc<dyn crate::claude_code::HookChannel>) -> Self {
+        self.hook = Some(hook);
         self
     }
     pub fn capabilities_static() -> Capabilities {
@@ -174,8 +268,16 @@ impl HarnessAdapter for CodexAdapter {
         }
         Ok(None)
     }
-    async fn emit_status(&self, _: &SessionId, _: StatusEvent) -> AdapterResult<DeliveryOutcome> {
-        Err(AdapterError::Unsupported)
+    async fn emit_status(
+        &self,
+        session: &SessionId,
+        status: StatusEvent,
+    ) -> AdapterResult<DeliveryOutcome> {
+        self.hook
+            .as_ref()
+            .ok_or(AdapterError::Unsupported)?
+            .emit_status(session, &format!("{status:?}"))
+            .await
     }
     async fn advise(&self, _: &SessionId, _: &str) -> AdapterResult<DeliveryOutcome> {
         Err(AdapterError::Unsupported)
@@ -208,13 +310,21 @@ impl HarnessAdapter for CodexAdapter {
         seed: &SeedContext,
     ) -> AdapterResult<SessionId> {
         let args = match mode {
-            SeedMode::InitialPrompt => vec!["exec".into(), seed.summary.clone()],
+            SeedMode::InitialPrompt => {
+                vec!["exec".into(), "--json".into(), seed.summary.clone()]
+            }
             SeedMode::ForkWithHistory => {
                 let id = seed
                     .from_session
                     .as_ref()
                     .ok_or_else(|| AdapterError::Other("fork requires a source session".into()))?;
-                vec!["fork".into(), id.0.clone(), seed.summary.clone()]
+                vec![
+                    "exec".into(),
+                    "fork".into(),
+                    "--json".into(),
+                    id.0.clone(),
+                    seed.summary.clone(),
+                ]
             }
         };
         let out = self
@@ -225,11 +335,9 @@ impl HarnessAdapter for CodexAdapter {
                 cwd: seed.cwd.clone(),
             })
             .await?;
-        Ok(SessionId(
-            out.session_id
-                .or_else(|| (!out.stdout.trim().is_empty()).then(|| out.stdout.trim().to_owned()))
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-        ))
+        out.session_id.map(SessionId).ok_or_else(|| {
+            AdapterError::Other("Codex did not report the new session id in JSON output".into())
+        })
     }
 
     async fn export_transcript(
@@ -248,6 +356,117 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use uw_core::adapter::{Capabilities, HarnessAdapter};
+
+    /// A fake `codex app-server`: appends to a marker file once per process
+    /// start (not per request), then answers each JSON-RPC request line with
+    /// a canned response for the three methods `limits()` sends, echoing the
+    /// request id it was asked for.
+    const FAKE_APP_SERVER_SCRIPT: &str = r#"#!/bin/sh
+echo start >> "$1"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"account/rateLimits/read"'*)
+      printf '{"id":%s,"result":{"ordinaryUsageAllowed":true,"rateLimits":{"primary":{"usedPercent":1,"windowDurationMins":10080,"resetsAt":1800000000},"secondary":{"usedPercent":2,"windowDurationMins":300,"resetsAt":1800000100}}}}\n' "$id"
+      ;;
+    *'"method":"account/read"'*)
+      printf '{"id":%s,"result":{"id":"acct"}}\n' "$id"
+      ;;
+    *)
+      printf '{"id":%s,"result":{}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+    struct FakeAppServerScript {
+        script_path: std::path::PathBuf,
+        marker_path: std::path::PathBuf,
+    }
+
+    impl FakeAppServerScript {
+        fn write() -> Self {
+            let dir = std::env::temp_dir();
+            let unique = uuid::Uuid::new_v4();
+            let script_path = dir.join(format!("uw-codex-fake-app-server-{unique}.sh"));
+            let marker_path = dir.join(format!("uw-codex-fake-app-server-{unique}.marker"));
+            std::fs::write(&script_path, FAKE_APP_SERVER_SCRIPT).unwrap();
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+            Self {
+                script_path,
+                marker_path,
+            }
+        }
+
+        fn transport(&self) -> CodexAppServerTransport {
+            CodexAppServerTransport::spawn_with(
+                self.script_path.to_string_lossy().into_owned(),
+                vec![self.marker_path.to_string_lossy().into_owned()],
+            )
+        }
+
+        fn process_start_count(&self) -> usize {
+            std::fs::read_to_string(&self.marker_path)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        }
+    }
+
+    impl Drop for FakeAppServerScript {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.script_path);
+            let _ = std::fs::remove_file(&self.marker_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn app_server_transport_reuses_one_process_and_reaps_child_on_drop() {
+        let fake = FakeAppServerScript::write();
+        let transport = Arc::new(fake.transport());
+        let adapter = CodexAdapter::new(transport.clone() as Arc<dyn AppServerTransport>);
+
+        // fetch_usage alone drives three JSON-RPC calls (initialize,
+        // account/read, account/rateLimits/read) through `limits()`.
+        let sample = adapter.fetch_usage(None).await.unwrap();
+        assert_eq!(sample.windows.len(), 2);
+
+        // A second, independent high-level call must still reuse the same
+        // app-server session rather than spawning another process.
+        adapter.detect_stop(&SessionId("s".into())).await.unwrap();
+
+        assert_eq!(
+            fake.process_start_count(),
+            1,
+            "app-server process must be spawned once and reused across all JSON-RPC calls"
+        );
+
+        let pid = transport
+            .session
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|s| s._child.id())
+            .expect("an active app-server session should exist after calls");
+
+        drop(adapter);
+        drop(transport);
+
+        let proc_path = format!("/proc/{pid}");
+        let mut reaped = false;
+        for _ in 0..100 {
+            if !std::path::Path::new(&proc_path).exists() {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            reaped,
+            "app-server child process should be terminated and reaped once the transport is dropped"
+        );
+    }
 
     #[test]
     fn capabilities_match_codex_contract() {
@@ -379,7 +598,10 @@ mod tests {
     impl ProcessSpawner for Recorder {
         async fn run(&self, spec: ProcessSpec) -> AdapterResult<crate::process::ProcessOutput> {
             *self.0.lock().unwrap() = Some(spec);
-            Ok(Default::default())
+            Ok(crate::process::ProcessOutput {
+                session_id: Some("01a0aecd-181f-7491-90b1-d2cc8beaad3f".into()),
+                ..Default::default()
+            })
         }
     }
     #[tokio::test]
@@ -431,7 +653,7 @@ mod tests {
             *record.lock().unwrap(),
             Some(ProcessSpec {
                 program: "codex".into(),
-                args: vec!["exec".into(), "sum".into()],
+                args: vec!["exec".into(), "--json".into(), "sum".into()],
                 cwd: "/seed".into()
             })
         );
@@ -442,7 +664,13 @@ mod tests {
             *record.lock().unwrap(),
             Some(ProcessSpec {
                 program: "codex".into(),
-                args: vec!["fork".into(), "old".into(), "sum".into()],
+                args: vec![
+                    "exec".into(),
+                    "fork".into(),
+                    "--json".into(),
+                    "old".into(),
+                    "sum".into()
+                ],
                 cwd: "/seed".into()
             })
         );
