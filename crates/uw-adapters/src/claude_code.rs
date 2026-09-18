@@ -331,10 +331,15 @@ impl UsageResponse {
         UsageWindowState::new(w.utilization, false, true, w.resets_at, None)
     }
 }
-pub fn compact_instructions(prompt: &str, state_path: &str) -> String {
-    format!(
-        "{prompt}\n[Authoritative state lives at {state_path}. Re-read that file before acting; where it disagrees with this summary, the file wins.]"
-    )
+pub fn compact_instructions(prompt: &str) -> String {
+    let prompt = prompt.trim();
+    if prompt == "/compact" || prompt.starts_with("/compact ") {
+        prompt.to_owned()
+    } else if prompt.is_empty() {
+        "/compact".into()
+    } else {
+        format!("/compact {prompt}")
+    }
 }
 
 #[async_trait]
@@ -344,7 +349,6 @@ impl HarnessAdapter for ClaudeCodeAdapter {
     }
     fn capabilities(&self) -> Capabilities {
         let mut capabilities = Self::capabilities_static();
-        capabilities.can_trigger_compaction = self.messenger.is_some();
         capabilities.can_advise_mid_turn = self.hook.is_some();
         capabilities.can_inject_at_session_start = self.hook.is_some();
         capabilities
@@ -403,7 +407,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         req: &CompactionRequest,
     ) -> AdapterResult<DeliveryOutcome> {
         validate_session_owner(session)?;
-        let text = compact_instructions(&req.prompt, session_state_path(session));
+        let text = compact_instructions(&req.prompt);
         if let Some(messenger) = &self.messenger {
             return messenger.send(&session.id, &text).await;
         }
@@ -584,10 +588,6 @@ fn scan_transcript(path: &str, content: &str) -> Option<DiscoveredSession> {
     })
 }
 
-fn session_state_path(session: &SessionSummary) -> &str {
-    session.state_path.as_deref().unwrap_or("<not recorded>")
-}
-
 fn validate_session_owner(session: &SessionSummary) -> AdapterResult<()> {
     if uuid::Uuid::parse_str(&session.id.0).is_err() {
         return Err(AdapterError::Other(
@@ -742,6 +742,19 @@ mod tests {
                 seed_modes: vec![SeedMode::InitialPrompt],
             }
         );
+    }
+
+    #[test]
+    fn queued_compaction_capability_does_not_depend_on_local_delivery_wiring() {
+        let adapter = adapter(
+            200,
+            Arc::new(Cache {
+                entry: Mutex::new(None),
+            }),
+            Arc::new(Mutex::new(0)),
+        );
+
+        assert!(adapter.capabilities().can_trigger_compaction);
     }
 
     struct Credentials;
@@ -904,14 +917,16 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), 0);
     }
     #[test]
-    fn compact_message_uses_research_template() {
+    fn compact_message_uses_claude_command_shape() {
         assert_eq!(
-            compact_instructions("requested prompt", "/tmp/state"),
-            "requested prompt\n[Authoritative state lives at /tmp/state. Re-read that file before acting; where it disagrees with this summary, the file wins.]"
+            compact_instructions("requested prompt"),
+            "/compact requested prompt"
         );
+        assert_eq!(compact_instructions("/compact"), "/compact");
+        assert_eq!(compact_instructions(""), "/compact");
     }
     #[tokio::test]
-    async fn compact_sends_prompt_and_real_session_state_path() {
+    async fn compact_sends_only_the_compact_command_and_optional_message() {
         let sent = Arc::new(Mutex::new(None));
         let adapter = adapter(
             200,
@@ -925,8 +940,7 @@ mod tests {
             Arc::new(RecordingMessenger(sent.clone())),
             Arc::new(Recorder(Arc::new(Mutex::new(None)))),
         );
-        let mut session = session(LaunchMode::Headless);
-        session.state_path = Some("/real/state.json".into());
+        let session = session(LaunchMode::Headless);
         adapter
             .compact(
                 &session,
@@ -943,8 +957,7 @@ mod tests {
             .await
             .unwrap();
         let message = sent.lock().unwrap().clone().unwrap();
-        assert!(message.contains("actual prompt"));
-        assert!(message.contains("/real/state.json"));
+        assert_eq!(message, "/compact actual prompt");
         assert!(!message.contains("ignored routing metadata"));
     }
     struct Recorder(Arc<Mutex<Option<ProcessSpec>>>);

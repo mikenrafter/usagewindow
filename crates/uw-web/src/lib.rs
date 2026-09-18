@@ -491,11 +491,12 @@ async fn compact_ask(
             let request = CompactionRequest {
                 id: uuid::Uuid::new_v4(),
                 session_id: id.clone(),
-                kind: CompactionKind::AskNearLimit,
+                kind: CompactionKind::AgentRequested,
                 prompt: request
                     .reason
                     .clone()
-                    .unwrap_or_else(|| "Please compact the current context.".into()),
+                    .map(|message| format!("/compact {message}"))
+                    .unwrap_or_else(|| "/compact".into()),
                 reason: request.reason.unwrap_or_else(|| "manual request".into()),
                 status: CompactionStatus::Pending,
                 created_at: Utc::now(),
@@ -911,15 +912,17 @@ mod tests {
             .await
             .unwrap();
         let status = response.status();
-        let error_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         assert_eq!(
             status,
             StatusCode::OK,
             "{}",
-            String::from_utf8_lossy(&error_body)
+            String::from_utf8_lossy(&response_body)
         );
+        let compact_status: CompactStatusResponse = serde_json::from_slice(&response_body).unwrap();
+        assert_eq!(compact_status.requests.last().unwrap().prompt, "/compact test");
         let threshold = ThresholdSetRequest {
             scope: ThresholdScope {
                 provider: Provider::Codex,
