@@ -270,7 +270,7 @@ mod tests {
         ) -> AdapterResult<DeliveryOutcome> {
             unimplemented!()
         }
-        async fn resume_session(&self, _: &SessionSummary) -> AdapterResult<()> {
+        async fn resume_session(&self, _: &SessionSummary, _: Option<&str>) -> AdapterResult<()> {
             unimplemented!()
         }
         async fn seed_new_session(&self, _: SeedMode, _: &SeedContext) -> AdapterResult<SessionId> {

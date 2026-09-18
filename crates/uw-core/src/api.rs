@@ -52,6 +52,7 @@ pub struct ResumeControls {
 pub struct ResumeRequest {
     pub session_id: SessionId,
     pub at: Option<DateTime<Utc>>,
+    pub message: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeResponse {
@@ -166,6 +167,7 @@ mod tests {
         round_trip(ResumeRequest {
             session_id: SessionId("s".into()),
             at: None,
+            message: None,
         });
         round_trip(ResumeResponse { marker: None });
         round_trip(CancelResumeRequest {

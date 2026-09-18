@@ -293,6 +293,7 @@ async fn resume(
                 resume_at: request.at,
                 created_at: Utc::now(),
                 status: ResumeStatus::Pending,
+                message: request.message.clone(),
             };
             store.insert_resume_marker(&marker)?;
             Ok(ResumeResponse {
@@ -635,6 +636,7 @@ mod tests {
         let resume = ResumeRequest {
             session_id: SessionId("session-1".into()),
             at: None,
+            message: None,
         };
         let response = router
             .clone()

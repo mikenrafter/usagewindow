@@ -289,7 +289,11 @@ impl HarnessAdapter for CodexAdapter {
     ) -> AdapterResult<DeliveryOutcome> {
         Err(AdapterError::Unsupported)
     }
-    async fn resume_session(&self, session: &SessionSummary) -> AdapterResult<()> {
+    async fn resume_session(
+        &self,
+        session: &SessionSummary,
+        message: Option<&str>,
+    ) -> AdapterResult<()> {
         self.spawner
             .run(ProcessSpec {
                 program: "codex".into(),
@@ -297,7 +301,7 @@ impl HarnessAdapter for CodexAdapter {
                     "exec".into(),
                     "resume".into(),
                     session.id.0.clone(),
-                    "Continue from the saved state.".into(),
+                    message.unwrap_or("Continue from the saved state.").into(),
                 ],
                 cwd: session.cwd.clone(),
             })
@@ -626,7 +630,7 @@ done
             superseded_by: None,
             reseeded_from: None,
         };
-        a.resume_session(&session).await.unwrap();
+        a.resume_session(&session, None).await.unwrap();
         assert_eq!(
             *record.lock().unwrap(),
             Some(ProcessSpec {
@@ -636,6 +640,22 @@ done
                     "resume".into(),
                     "uuid".into(),
                     "Continue from the saved state.".into()
+                ],
+                cwd: "/work".into()
+            })
+        );
+        a.resume_session(&session, Some("custom message"))
+            .await
+            .unwrap();
+        assert_eq!(
+            *record.lock().unwrap(),
+            Some(ProcessSpec {
+                program: "codex".into(),
+                args: vec![
+                    "exec".into(),
+                    "resume".into(),
+                    "uuid".into(),
+                    "custom message".into()
                 ],
                 cwd: "/work".into()
             })

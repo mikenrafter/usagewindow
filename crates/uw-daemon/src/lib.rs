@@ -965,6 +965,7 @@ pub fn plan_resume_marker(
         resume_at: Some(now + Duration::minutes(lead as i64)),
         created_at: now,
         status: ResumeStatus::Scheduled,
+        message: None,
     })
 }
 
@@ -984,7 +985,7 @@ pub async fn run_resume_tick(
                 .await?;
             continue;
         };
-        let result = adapter.resume_session(&session).await;
+        let result = adapter.resume_session(&session, marker.message.as_deref()).await;
         store
             .update_resume(
                 marker.id,
@@ -1377,7 +1378,7 @@ mod tests {
             *self.compacted.lock().unwrap() += 1;
             Ok(DeliveryOutcome::Delivered)
         }
-        async fn resume_session(&self, _: &SessionSummary) -> AdapterResult<()> {
+        async fn resume_session(&self, _: &SessionSummary, _: Option<&str>) -> AdapterResult<()> {
             RESUME_CALLS.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -1476,7 +1477,7 @@ mod tests {
         ) -> AdapterResult<DeliveryOutcome> {
             Err(AdapterError::Unsupported)
         }
-        async fn resume_session(&self, _: &SessionSummary) -> AdapterResult<()> {
+        async fn resume_session(&self, _: &SessionSummary, _: Option<&str>) -> AdapterResult<()> {
             Err(AdapterError::Unsupported)
         }
     }
@@ -1903,6 +1904,7 @@ mod tests {
             resume_at: Some(Utc::now() - Duration::seconds(1)),
             created_at: Utc::now() - Duration::minutes(1),
             status: ResumeStatus::Scheduled,
+            message: None,
         };
         let store = Arc::new(ResumeFake {
             active: false,

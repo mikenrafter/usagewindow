@@ -408,11 +408,19 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         }
         Err(AdapterError::Unsupported)
     }
-    async fn resume_session(&self, session: &SessionSummary) -> AdapterResult<()> {
+    async fn resume_session(
+        &self,
+        session: &SessionSummary,
+        message: Option<&str>,
+    ) -> AdapterResult<()> {
+        let mut args = vec!["--print".to_string(), "--resume".into(), session.id.0.clone()];
+        if let Some(message) = message {
+            args.push(message.to_string());
+        }
         self.spawner
             .run(ProcessSpec {
                 program: "claude".into(),
-                args: vec!["--print".into(), "--resume".into(), session.id.0.clone()],
+                args,
                 cwd: session.cwd.clone(),
             })
             .await
@@ -766,7 +774,7 @@ mod tests {
             Arc::new(Mutex::new(0)),
         )
         .with_delivery(Arc::new(NoHook), Arc::new(NoMessenger), spawner);
-        a.resume_session(&session(LaunchMode::Headless))
+        a.resume_session(&session(LaunchMode::Headless), None)
             .await
             .unwrap();
         assert_eq!(

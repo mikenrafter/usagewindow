@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use uw_core::adapter::{
     AdapterError, AdapterResult, Capabilities, DeliveryOutcome, HarnessAdapter, SeedMode,
     StatusEvent,
@@ -12,6 +12,7 @@ use uw_store::Store;
 
 struct FakeAdapter {
     sample: UsageSample,
+    resumed_with: Mutex<Option<String>>,
 }
 
 #[async_trait]
@@ -58,7 +59,8 @@ impl HarnessAdapter for FakeAdapter {
         Err(AdapterError::Unsupported)
     }
 
-    async fn resume_session(&self, _: &SessionSummary) -> AdapterResult<()> {
+    async fn resume_session(&self, _: &SessionSummary, message: Option<&str>) -> AdapterResult<()> {
+        *self.resumed_with.lock().unwrap() = message.map(str::to_string);
         Ok(())
     }
 }
@@ -112,7 +114,9 @@ async fn observation_and_claimed_resume_cross_the_sqlite_boundary() {
             )]),
             credits: None,
         },
+        resumed_with: Mutex::new(None),
     });
+    let adapter_ref = adapter.clone();
     let adapters = HashMap::from([(Provider::Codex, adapter as Arc<dyn HarnessAdapter>)]);
     let store = Arc::new(SqliteDaemonStore::new(Store::open(&path_string).unwrap()));
 
@@ -129,6 +133,7 @@ async fn observation_and_claimed_resume_cross_the_sqlite_boundary() {
         resume_at: Some(now),
         created_at: now,
         status: ResumeStatus::Scheduled,
+        message: Some("what's the state of the project? You have been resumed".into()),
     };
     store.insert_resume_marker(marker.clone()).await.unwrap();
     run_resume_tick(store.as_ref(), &adapters, now)
@@ -144,6 +149,10 @@ async fn observation_and_claimed_resume_cross_the_sqlite_boundary() {
     assert_eq!(
         reader.resume_markers_for_session(&id).unwrap()[0].status,
         ResumeStatus::Fired
+    );
+    assert_eq!(
+        adapter_ref.resumed_with.lock().unwrap().as_deref(),
+        Some("what's the state of the project? You have been resumed")
     );
     drop(reader);
     for suffix in ["", "-wal", "-shm"] {

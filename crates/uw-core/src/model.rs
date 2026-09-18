@@ -175,6 +175,7 @@ pub struct ResumeMarker {
     pub resume_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub status: ResumeStatus,
+    pub message: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResumeReason {

@@ -24,6 +24,8 @@ pub enum Command {
         session_id: Option<SessionId>,
         #[arg(long)]
         at: Option<DateTime<Utc>>,
+        #[arg(long)]
+        message: Option<String>,
         #[command(subcommand)]
         command: Option<ResumeCommand>,
     },
@@ -199,8 +201,13 @@ pub fn execute<A: ApiClient, D: DirectReader>(
         Command::Resume {
             session_id: Some(session_id),
             at,
+            message,
             command: None,
-        } => serde_json::to_value(client.api.resume(ResumeRequest { session_id, at })?)?,
+        } => serde_json::to_value(client.api.resume(ResumeRequest {
+            session_id,
+            at,
+            message,
+        })?)?,
         Command::Resume {
             command: Some(ResumeCommand::Cancel { session_id }),
             ..

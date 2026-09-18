@@ -70,7 +70,7 @@ impl HarnessAdapter for GenericHookAdapter {
     ) -> AdapterResult<DeliveryOutcome> {
         Err(AdapterError::Unsupported)
     }
-    async fn resume_session(&self, _: &SessionSummary) -> AdapterResult<()> {
+    async fn resume_session(&self, _: &SessionSummary, _: Option<&str>) -> AdapterResult<()> {
         Err(AdapterError::Unsupported)
     }
 }
