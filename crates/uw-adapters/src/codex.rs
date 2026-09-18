@@ -1,12 +1,14 @@
 use crate::process::{ProcessSpawner, ProcessSpec};
 use async_trait::async_trait;
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::io::BufRead;
+use std::path::PathBuf;
 use std::sync::Arc;
 use uw_core::adapter::{
-    AdapterError, AdapterResult, Capabilities, DeliveryOutcome, HarnessAdapter, SeedContext,
-    SeedMode, StatusEvent,
+    AdapterError, AdapterResult, Capabilities, DeliveryOutcome, DiscoveredSession, HarnessAdapter,
+    SeedContext, SeedMode, StatusEvent, TurnPreview, TurnRole,
 };
 use uw_core::model::*;
 
@@ -139,6 +141,7 @@ pub struct CodexAdapter {
     spawner: Arc<dyn ProcessSpawner>,
     now: Arc<dyn Fn() -> chrono::DateTime<Utc> + Send + Sync>,
     hook: Option<Arc<dyn crate::claude_code::HookChannel>>,
+    sessions_root: Option<PathBuf>,
 }
 impl CodexAdapter {
     pub fn new(transport: Arc<dyn AppServerTransport>) -> Self {
@@ -147,6 +150,7 @@ impl CodexAdapter {
             spawner: Arc::new(crate::process::TokioProcessSpawner),
             now: Arc::new(Utc::now),
             hook: None,
+            sessions_root: None,
         }
     }
     pub fn real() -> Self {
@@ -159,6 +163,21 @@ impl CodexAdapter {
     pub fn with_hook_channel(mut self, hook: Arc<dyn crate::claude_code::HookChannel>) -> Self {
         self.hook = Some(hook);
         self
+    }
+    /// Overrides where `discover_sessions` looks for rollout files. Defaults to
+    /// `$CODEX_HOME/sessions` (or `~/.codex/sessions`); exists so tests don't touch a
+    /// real `$HOME`.
+    pub fn with_sessions_root(mut self, root: PathBuf) -> Self {
+        self.sessions_root = Some(root);
+        self
+    }
+    fn resolved_sessions_root(&self) -> PathBuf {
+        self.sessions_root.clone().unwrap_or_else(|| {
+            let home = std::env::var("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|_| {
+                PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".codex")
+            });
+            home.join("sessions")
+        })
     }
     pub fn capabilities_static() -> Capabilities {
         Capabilities {
@@ -352,6 +371,225 @@ impl HarnessAdapter for CodexAdapter {
         // documented research gap, so failing closed is safer than exporting wrong data.
         Err(uw_core::adapter::AdapterError::Unsupported)
     }
+
+    async fn discover_sessions(&self) -> AdapterResult<Vec<DiscoveredSession>> {
+        let root = self.resolved_sessions_root();
+        tokio::task::spawn_blocking(move || {
+            rollout_files(&root)
+                .into_iter()
+                .filter_map(|path| scan_rollout(&path))
+                .collect()
+        })
+        .await
+        .map_err(|e| AdapterError::Other(e.to_string()))
+    }
+
+    async fn session_preview(&self, session: &SessionSummary) -> AdapterResult<Vec<TurnPreview>> {
+        let known_path = session.state_path.clone();
+        let id = session.id.0.clone();
+        let root = self.resolved_sessions_root();
+        tokio::task::spawn_blocking(move || {
+            // A session tracked via hooks (not discovery) never had `state_path` set —
+            // find its rollout file by id so the preview still works for it.
+            let path = known_path
+                .map(PathBuf::from)
+                .or_else(|| rollout_files(&root).into_iter().find(|p| {
+                    p.file_stem()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|name| name.ends_with(&id))
+                }))?;
+            rollout_turn_preview(&path)
+        })
+        .await
+        .map_err(|e| AdapterError::Other(e.to_string()))?
+        .ok_or(AdapterError::Unsupported)
+    }
+}
+
+/// Every `*.jsonl` file under `root`, recursively (rollout files live under
+/// `sessions/YYYY/MM/DD/`). Best-effort: an unreadable directory is skipped, not fatal.
+fn rollout_files(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Streams an entire rollout file once, pulling together everything usagewindow can
+/// honestly know about the session from Codex's own on-disk record:
+/// - `session_meta` (first line): id, cwd, session start time.
+/// - `turn_context.payload.model`: the model actually in use (last one seen wins, in
+///   case the session ever switched models).
+/// - `event_msg{type:"task_started"}.payload.model_context_window`: the context window
+///   size Codex itself is using.
+/// - `token_usage_record.payload.usage.total_tokens`: the most recent single response's
+///   total tokens, used as a proxy for current context occupancy (the `thread_token_usage`
+///   field on the same record is a lifetime sum across every turn, not "how full is the
+///   context right now" — using it here would badly overstate usage).
+/// - The timestamp on the last record read, as `last_seen`.
+///
+/// A file that isn't valid JSONL or doesn't start with `session_meta` is skipped, not an
+/// error — most files under `sessions/` are unrelated or historical, and this only ever
+/// runs once per session at discovery time (not on every tick), so a full read here is
+/// an acceptable one-time cost.
+fn scan_rollout(path: &std::path::Path) -> Option<DiscoveredSession> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut lines = std::io::BufReader::new(file).lines();
+
+    let first: Value = serde_json::from_str(&lines.next()?.ok()?).ok()?;
+    if first.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = first.get("payload")?;
+    let id = payload.get("session_id").and_then(Value::as_str)?;
+    uuid::Uuid::parse_str(id).ok()?;
+    let cwd = payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .unwrap_or(".")
+        .to_owned();
+    let first_seen = first
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+        .map(|ts| ts.with_timezone(&Utc));
+
+    let mut model = None;
+    let mut context_window_size = None;
+    let mut last_known_token_count = None;
+    let mut last_seen = first_seen;
+    for line in lines.map_while(Result::ok) {
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if let Some(ts) = record
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+        {
+            last_seen = Some(ts.with_timezone(&Utc));
+        }
+        match record.get("type").and_then(Value::as_str) {
+            Some("turn_context") => {
+                if let Some(m) = record.pointer("/payload/model").and_then(Value::as_str) {
+                    model = Some(ModelId(m.to_owned()));
+                }
+            }
+            Some("event_msg")
+                if record.pointer("/payload/type").and_then(Value::as_str)
+                    == Some("task_started") =>
+            {
+                if let Some(w) = record
+                    .pointer("/payload/model_context_window")
+                    .and_then(Value::as_u64)
+                {
+                    context_window_size = Some(w);
+                }
+            }
+            Some("token_usage_record") => {
+                if let Some(t) = record
+                    .pointer("/payload/usage/total_tokens")
+                    .and_then(Value::as_u64)
+                {
+                    last_known_token_count = Some(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(DiscoveredSession {
+        id: SessionId(id.to_owned()),
+        cwd,
+        model,
+        context_window_size,
+        last_known_token_count,
+        first_seen,
+        last_seen,
+        state_path: Some(path.to_string_lossy().into_owned()),
+    })
+}
+
+/// The role- and text-bearing turns from an `item_completed` event: `UserMessage` and
+/// `AgentMessage` items. `Reasoning`/`CommandExecution` items are internal, not part of
+/// the conversation a user would want reminded of.
+fn turn_from_item_completed(record: &Value) -> Option<TurnPreview> {
+    let item = record.pointer("/payload/item")?;
+    let role = match item.get("type").and_then(Value::as_str)? {
+        "UserMessage" => TurnRole::User,
+        "AgentMessage" => TurnRole::Assistant,
+        _ => return None,
+    };
+    let text = item
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() {
+        return None;
+    }
+    const MAX_CHARS: usize = 2000;
+    let text = if text.len() > MAX_CHARS {
+        format!("{}…", &text[..MAX_CHARS])
+    } else {
+        text
+    };
+    Some(TurnPreview { role, text })
+}
+
+/// The first two and last two user/assistant turns in a rollout file, read in one
+/// forward streaming pass (no need to hold the whole file in memory — only a
+/// 2-entry front buffer and a 2-entry rolling tail buffer).
+fn rollout_turn_preview(path: &std::path::Path) -> Option<Vec<TurnPreview>> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut first_two = Vec::with_capacity(2);
+    let mut last_two: std::collections::VecDeque<TurnPreview> =
+        std::collections::VecDeque::with_capacity(2);
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("event_msg")
+            || record.pointer("/payload/type").and_then(Value::as_str) != Some("item_completed")
+        {
+            continue;
+        }
+        let Some(turn) = turn_from_item_completed(&record) else {
+            continue;
+        };
+        if first_two.len() < 2 {
+            first_two.push(turn.clone());
+        }
+        if last_two.len() == 2 {
+            last_two.pop_front();
+        }
+        last_two.push_back(turn);
+    }
+    if first_two.is_empty() {
+        return None;
+    }
+    // Avoid repeating the same turns in both halves for a short session.
+    let mut preview = first_two.clone();
+    for turn in last_two {
+        if !first_two.contains(&turn) {
+            preview.push(turn);
+        }
+    }
+    Some(preview)
 }
 
 #[cfg(test)]
@@ -694,5 +932,125 @@ done
                 cwd: "/seed".into()
             })
         );
+    }
+
+    #[tokio::test]
+    async fn discover_sessions_reads_rollout_headers_and_skips_junk() {
+        let script = FakeAppServerScript::write();
+        let root = std::env::temp_dir().join(format!("uw-codex-sessions-{}", uuid::Uuid::new_v4()));
+        let day_dir = root.join("2026/09/17");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        let id = "01a0b1b6-f024-7b73-a5fc-a6ea05f0a57f";
+        let rollout_path = day_dir.join(format!("rollout-2026-09-17T17-32-31-{id}.jsonl"));
+        std::fs::write(
+            &rollout_path,
+            format!(
+                r#"{{"timestamp":"2026-09-17T23:32:32Z","type":"session_meta","payload":{{"session_id":"{id}","cwd":"/home/v0id/Documents/repos/usagewindow"}}}}
+{{"timestamp":"2026-09-17T23:32:32.5Z","type":"event_msg","payload":{{"type":"task_started","model_context_window":258400}}}}
+{{"timestamp":"2026-09-17T23:32:33Z","type":"turn_context","payload":{{"model":"gpt-5.6-luna"}}}}
+{{"timestamp":"2026-09-17T23:32:34Z","type":"token_usage_record","payload":{{"usage":{{"total_tokens":14362}},"thread_token_usage":{{"total_tokens":4304079}}}}}}
+{{"timestamp":"2026-09-17T23:32:35Z","type":"event_msg","payload":{{"type":"item_completed","item":{{"type":"UserMessage","content":[{{"type":"text","text":"first question"}}]}}}}}}
+{{"timestamp":"2026-09-17T23:32:36Z","type":"event_msg","payload":{{"type":"item_completed","item":{{"type":"AgentMessage","content":[{{"type":"Text","text":"first answer"}}]}}}}}}
+{{"timestamp":"2026-09-18T00:23:18Z","type":"event_msg","payload":{{"type":"item_completed","item":{{"type":"UserMessage","content":[{{"type":"text","text":"last question"}}]}}}}}}
+{{"timestamp":"2026-09-18T00:23:19Z","type":"event_msg","payload":{{"type":"item_completed","item":{{"type":"AgentMessage","content":[{{"type":"Text","text":"last answer"}}]}}}}}}
+"#
+            ),
+        )
+        .unwrap();
+        // Not a session_meta first line — must be skipped, not mistaken for a session.
+        std::fs::write(
+            day_dir.join("rollout-not-a-session.jsonl"),
+            r#"{"type":"other","payload":{}}"#,
+        )
+        .unwrap();
+        // Malformed JSON — must be skipped without failing the whole scan.
+        std::fs::write(day_dir.join("rollout-broken.jsonl"), "not json\n").unwrap();
+
+        let a = CodexAdapter::new(Arc::new(script.transport())).with_sessions_root(root.clone());
+        let found = a.discover_sessions().await.unwrap();
+
+        assert_eq!(found.len(), 1);
+        let found = &found[0];
+        assert_eq!(found.id, SessionId(id.into()));
+        assert_eq!(found.cwd, "/home/v0id/Documents/repos/usagewindow");
+        assert_eq!(found.model, Some(ModelId("gpt-5.6-luna".into())));
+        assert_eq!(found.context_window_size, Some(258400));
+        // The last response's total, not thread_token_usage's lifetime sum.
+        assert_eq!(found.last_known_token_count, Some(14362));
+        assert_eq!(
+            found.first_seen.unwrap().to_rfc3339(),
+            "2026-09-17T23:32:32+00:00"
+        );
+        assert_eq!(
+            found.last_seen.unwrap().to_rfc3339(),
+            "2026-09-18T00:23:19+00:00"
+        );
+        assert_eq!(found.state_path.as_deref(), rollout_path.to_str());
+
+        let preview = a
+            .session_preview(&SessionSummary {
+                state_path: found.state_path.clone(),
+                ..session_summary(id)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            preview
+                .iter()
+                .map(|t| t.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first question", "first answer", "last question", "last answer"]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn session_preview_finds_the_rollout_file_by_id_when_state_path_is_unset() {
+        // A session tracked via hooks (not discovery) never got `state_path` filled
+        // in — the preview must still work by locating the file from the id alone.
+        let script = FakeAppServerScript::write();
+        let root = std::env::temp_dir().join(format!("uw-codex-sessions-{}", uuid::Uuid::new_v4()));
+        let day_dir = root.join("2026/09/17");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let id = "01a0b1b6-f024-7b73-a5fc-a6ea05f0a57f";
+        std::fs::write(
+            day_dir.join(format!("rollout-2026-09-17T17-32-31-{id}.jsonl")),
+            format!(
+                r#"{{"timestamp":"2026-09-17T23:32:32Z","type":"session_meta","payload":{{"session_id":"{id}","cwd":"/tmp"}}}}
+{{"timestamp":"2026-09-17T23:32:33Z","type":"event_msg","payload":{{"type":"item_completed","item":{{"type":"UserMessage","content":[{{"type":"text","text":"hi"}}]}}}}}}
+"#
+            ),
+        )
+        .unwrap();
+
+        let a = CodexAdapter::new(Arc::new(script.transport())).with_sessions_root(root.clone());
+        let preview = a.session_preview(&session_summary(id)).await.unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(preview.len(), 1);
+        assert_eq!(preview[0].text, "hi");
+    }
+
+    fn session_summary(id: &str) -> SessionSummary {
+        SessionSummary {
+            id: SessionId(id.into()),
+            harness: Provider::Codex,
+            model: None,
+            account: None,
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+            cwd: ".".into(),
+            state_path: None,
+            context_window_size: None,
+            last_known_token_count: None,
+            launch_mode: LaunchMode::Interactive,
+            pid: None,
+            stopped_reason: None,
+            resume_marker: None,
+            superseded_by: None,
+            reseeded_from: None,
+        }
     }
 }

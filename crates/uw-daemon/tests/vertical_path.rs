@@ -131,6 +131,7 @@ async fn observation_and_claimed_resume_cross_the_sqlite_boundary() {
         session_id: id.clone(),
         reason: ResumeReason::AutoDetectedLimit,
         resume_at: Some(now),
+        requested_at: None,
         created_at: now,
         status: ResumeStatus::Scheduled,
         message: Some("what's the state of the project? You have been resumed".into()),

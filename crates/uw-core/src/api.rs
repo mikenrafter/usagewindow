@@ -38,6 +38,19 @@ pub struct SessionDetail {
     pub compaction_log: Vec<CompactionRequest>,
     pub reseed_lineage: Vec<SessionId>,
 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateSessionRequest {
+    pub id: SessionId,
+    pub harness: Provider,
+    pub cwd: String,
+    pub model: Option<ModelId>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateSessionRequest {
+    pub cwd: String,
+    pub model: Option<ModelId>,
+    pub account: Option<AccountId>,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SparklinePoint {
     pub at: DateTime<Utc>,

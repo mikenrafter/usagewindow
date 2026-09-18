@@ -1,3 +1,343 @@
 <!doctype html>
-<html><head><meta charset="utf-8"><title>usagewindow</title></head>
-<body><main><h1>usagewindow</h1><p>Usage dashboard</p></main></body></html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>usagewindow</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --border: #2a2e38; --text: #e6e8ee;
+    --muted: #8b90a0; --accent: #5b8cff; --danger: #ff5b6e; --ok: #4cd77b;
+    --warn: #f5b642; font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-size: 14px; }
+  header { display: flex; align-items: center; gap: 1rem; padding: 0.9rem 1.2rem; border-bottom: 1px solid var(--border); }
+  header h1 { font-size: 1.1rem; margin: 0; font-weight: 600; }
+  header .spacer { flex: 1; }
+  header button { background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; }
+  header button:hover { border-color: var(--accent); }
+  main { display: grid; grid-template-columns: minmax(320px, 1fr) minmax(360px, 1.4fr); gap: 1rem; padding: 1rem; align-items: start; }
+  section.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }
+  h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin: 0 0 0.7rem; }
+  .row { display: flex; gap: 0.5rem; margin-bottom: 0.6rem; flex-wrap: wrap; }
+  input, select, textarea { background: #0d0f14; border: 1px solid var(--border); color: var(--text); padding: 0.4rem 0.6rem; border-radius: 6px; font: inherit; }
+  input[type=text], input[type=search] { flex: 1; min-width: 120px; }
+  label.chk { display: flex; align-items: center; gap: 0.3rem; color: var(--muted); font-size: 0.85rem; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: rgba(91,140,255,0.08); }
+  tbody tr.selected { background: rgba(91,140,255,0.16); }
+  .pill { display: inline-block; padding: 0.05rem 0.5rem; border-radius: 999px; font-size: 0.72rem; border: 1px solid var(--border); color: var(--muted); }
+  .pill.stopped { color: var(--danger); border-color: var(--danger); }
+  .pill.ok { color: var(--ok); border-color: var(--ok); }
+  .pill.pending { color: var(--warn); border-color: var(--warn); }
+  .muted { color: var(--muted); }
+  .kv { display: grid; grid-template-columns: 11rem 1fr; gap: 0.35rem 0.8rem; font-size: 0.85rem; margin-bottom: 1rem; }
+  .kv .k { color: var(--muted); }
+  .kv .v { word-break: break-word; }
+  .btnrow { display: flex; gap: 0.5rem; flex-wrap: wrap; margin: 0.6rem 0; }
+  button.action { background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; }
+  button.action:hover { border-color: var(--accent); }
+  button.action.danger:hover { border-color: var(--danger); color: var(--danger); }
+  button.action.primary { border-color: var(--accent); color: var(--accent); }
+  form.edit { display: grid; gap: 0.5rem; margin: 0.6rem 0 1rem; padding: 0.8rem; border: 1px dashed var(--border); border-radius: 6px; }
+  form.edit .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; }
+  .turn { border-left: 3px solid var(--border); padding: 0.4rem 0 0.4rem 0.6rem; margin-bottom: 0.5rem; white-space: pre-wrap; }
+  .turn.user { border-color: var(--accent); }
+  .turn.assistant { border-color: var(--ok); }
+  .turn .role { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; margin-bottom: 0.2rem; }
+  .empty { color: var(--muted); font-style: italic; padding: 0.5rem 0; }
+  .err { color: var(--danger); font-size: 0.85rem; margin: 0.4rem 0; }
+  pre.raw { background: #0d0f14; border: 1px solid var(--border); border-radius: 6px; padding: 0.6rem; font-size: 0.78rem; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 0.8rem; margin: 0.4rem 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>usagewindow</h1>
+  <span id="statusline" class="muted"></span>
+  <div class="spacer"></div>
+  <button id="refresh">Refresh</button>
+</header>
+<main>
+  <section class="panel">
+    <h2>Sessions</h2>
+    <div class="row">
+      <input id="q" type="search" placeholder="search id / cwd / model…">
+      <select id="harness">
+        <option value="">any harness</option>
+        <option value="Codex">Codex</option>
+        <option value="ClaudeCode">ClaudeCode</option>
+      </select>
+      <label class="chk"><input type="checkbox" id="stopped"> include stopped sessions</label>
+    </div>
+    <div id="err" class="err"></div>
+    <table>
+      <thead><tr><th>id</th><th>harness</th><th>model</th><th>account</th><th>last seen</th><th>status</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="6" class="empty">loading…</td></tr></tbody>
+    </table>
+    <h2 style="margin-top:1.2rem">New session</h2>
+    <form id="create" class="edit">
+      <div class="row2">
+        <input name="id" placeholder="session id" required>
+        <select name="harness"><option>Codex</option><option>ClaudeCode</option></select>
+      </div>
+      <input name="cwd" placeholder="cwd" required>
+      <input name="model" placeholder="model (optional)">
+      <div class="btnrow"><button class="action primary" type="submit">Create</button></div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <h2>Detail</h2>
+    <div id="detail"><p class="empty">Select a session on the left.</p></div>
+  </section>
+</main>
+
+<script>
+const $ = (sel, el = document) => el.querySelector(sel);
+const $$ = (sel, el = document) => Array.from(el.querySelectorAll(sel));
+
+let selectedId = null;
+
+async function api(path, options) {
+  const res = await fetch(path, options);
+  const text = await res.text();
+  const body = text ? JSON.parse(text) : null;
+  if (!res.ok) throw new Error(typeof body === 'string' ? body : (text || res.statusText));
+  return body;
+}
+
+function fmtDate(s) {
+  if (!s) return '-';
+  try { return new Date(s).toLocaleString(); } catch { return s; }
+}
+
+function pillFor(session) {
+  if (session.stopped_reason) return `<span class="pill stopped">stopped</span>`;
+  if (session.resume_status) return `<span class="pill pending">${escapeHtml(session.resume_status)}</span>`;
+  return `<span class="pill ok">tracked</span>`;
+}
+
+function escapeHtml(v) {
+  if (v == null) return '-';
+  const s = typeof v === 'string' ? v : JSON.stringify(v);
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function loadStatus() {
+  try {
+    const status = await api('/api/status');
+    const windows = status.usage.flatMap(u => u.windows.map(w => `${u.provider}${u.account ? '/' + u.account : ''} ${w.pct.toFixed(0)}%${w.exceeded ? ' (exceeded)' : ''}`));
+    $('#statusline').textContent = windows.length ? windows.join('  ·  ') : 'no usage recorded yet';
+  } catch (e) {
+    $('#statusline').textContent = '';
+  }
+}
+
+async function loadSessions() {
+  $('#err').textContent = '';
+  const params = new URLSearchParams();
+  const q = $('#q').value.trim();
+  const harness = $('#harness').value;
+  if (q) params.set('q', q);
+  if (harness) params.set('harness', harness);
+  if ($('#stopped').checked) params.set('stopped', 'true');
+  let items;
+  try {
+    items = await api('/api/sessions?' + params.toString());
+  } catch (e) {
+    $('#err').textContent = 'Failed to load sessions: ' + e.message;
+    return;
+  }
+  const rows = $('#rows');
+  if (!items.length) {
+    rows.innerHTML = '<tr><td colspan="6" class="empty">no sessions match</td></tr>';
+    return;
+  }
+  rows.innerHTML = items.map(s => `
+    <tr data-id="${escapeHtml(s.id)}" class="${s.id === selectedId ? 'selected' : ''}">
+      <td>${escapeHtml(s.id)}</td>
+      <td>${escapeHtml(s.harness)}</td>
+      <td>${escapeHtml(s.model || '-')}</td>
+      <td class="muted">${escapeHtml(s.account || '-')}</td>
+      <td>${fmtDate(s.last_seen)}</td>
+      <td>${pillFor(s)}</td>
+    </tr>`).join('');
+  $$('#rows tr').forEach(tr => tr.addEventListener('click', () => selectSession(tr.dataset.id)));
+}
+
+async function selectSession(id) {
+  selectedId = id;
+  $$('#rows tr').forEach(tr => tr.classList.toggle('selected', tr.dataset.id === id));
+  const detail = $('#detail');
+  detail.innerHTML = '<p class="empty">loading…</p>';
+  let d;
+  try {
+    d = await api('/api/sessions/' + encodeURIComponent(id));
+  } catch (e) {
+    detail.innerHTML = `<p class="err">${escapeHtml(e.message)}</p>`;
+    return;
+  }
+  const s = d.summary;
+  const marker = d.resume_controls.marker;
+  detail.innerHTML = `
+    <div class="kv">
+      <div class="k">id</div><div class="v">${escapeHtml(s.id)}</div>
+      <div class="k">harness</div><div class="v">${escapeHtml(s.harness)}</div>
+      <div class="k">model</div><div class="v">${escapeHtml(s.model)}</div>
+      <div class="k">account</div><div class="v">${escapeHtml(s.account)}</div>
+      <div class="k">cwd</div><div class="v">${escapeHtml(s.cwd)}</div>
+      <div class="k">state path</div><div class="v">${escapeHtml(s.state_path)}</div>
+      <div class="k">first seen</div><div class="v">${fmtDate(s.first_seen)}</div>
+      <div class="k">last seen</div><div class="v">${fmtDate(s.last_seen)}</div>
+      <div class="k">context window</div><div class="v">${escapeHtml(s.context_window_size)}</div>
+      <div class="k">last token count</div><div class="v">${escapeHtml(s.last_known_token_count)}</div>
+      <div class="k">pid</div><div class="v">${escapeHtml(s.pid)}</div>
+      <div class="k">stopped reason</div><div class="v">${escapeHtml(s.stopped_reason)}</div>
+      <div class="k">resume marker</div><div class="v">${marker
+        ? `${escapeHtml(marker.status)} · reason ${escapeHtml(marker.reason)} · resume_at ${fmtDate(marker.resume_at)}${marker.requested_at ? ' · requested_at ' + fmtDate(marker.requested_at) : ''}${marker.message ? '<br><span class="muted">' + escapeHtml(marker.message) + '</span>' : ''}`
+        : '<span class="muted">none</span>'}</div>
+    </div>
+
+    <div class="btnrow">
+      <button class="action primary" id="btn-resume">Queue resume</button>
+      ${marker ? '<button class="action" id="btn-cancel-resume">Cancel resume</button>' : ''}
+      <button class="action" id="btn-edit-toggle">Edit</button>
+      <button class="action" id="btn-preview">Load transcript preview</button>
+      <button class="action danger" id="btn-delete">Delete session</button>
+    </div>
+
+    <form id="edit-form" class="edit" style="display:none">
+      <input name="cwd" value="${escapeHtml(s.cwd) === '-' ? '' : escapeHtml(s.cwd)}" placeholder="cwd" required>
+      <div class="row2">
+        <input name="model" value="${s.model || ''}" placeholder="model">
+        <input name="account" value="${s.account || ''}" placeholder="account">
+      </div>
+      <div class="btnrow"><button class="action primary" type="submit">Save</button></div>
+    </form>
+
+    <form id="resume-form" class="edit" style="display:none">
+      <input name="at" type="datetime-local" placeholder="resume no earlier than (optional)">
+      <textarea name="message" placeholder="resume message" rows="2"></textarea>
+      <div class="btnrow"><button class="action primary" type="submit">Send</button></div>
+    </form>
+
+    <div id="preview"></div>
+
+    <details>
+      <summary>raw usage history (${d.history.length} points)</summary>
+      <pre class="raw">${escapeHtml(d.history.slice(-20))}</pre>
+    </details>
+  `;
+
+  $('#btn-edit-toggle').addEventListener('click', () => {
+    const f = $('#edit-form');
+    f.style.display = f.style.display === 'none' ? 'grid' : 'none';
+  });
+  $('#edit-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('/api/sessions/' + encodeURIComponent(id), {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          cwd: fd.get('cwd'),
+          model: fd.get('model') || null,
+          account: fd.get('account') || null,
+        }),
+      });
+      await loadSessions();
+      await selectSession(id);
+    } catch (err) { alert('Update failed: ' + err.message); }
+  });
+
+  $('#btn-resume').addEventListener('click', () => {
+    const f = $('#resume-form');
+    f.style.display = f.style.display === 'none' ? 'grid' : 'none';
+  });
+  $('#resume-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const at = fd.get('at') ? new Date(fd.get('at')).toISOString() : null;
+    try {
+      await api('/api/sessions/' + encodeURIComponent(id) + '/resume', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ session_id: id, at, message: fd.get('message') || null }),
+      });
+      await selectSession(id);
+    } catch (err) { alert('Resume failed: ' + err.message); }
+  });
+
+  const cancelBtn = $('#btn-cancel-resume');
+  if (cancelBtn) cancelBtn.addEventListener('click', async () => {
+    try {
+      await api('/api/sessions/' + encodeURIComponent(id) + '/resume/cancel', { method: 'POST' });
+      await selectSession(id);
+    } catch (err) { alert('Cancel failed: ' + err.message); }
+  });
+
+  $('#btn-delete').addEventListener('click', async () => {
+    if (!confirm(`Delete session ${id}? This removes its resume/compaction history too.`)) return;
+    try {
+      await api('/api/sessions/' + encodeURIComponent(id), { method: 'DELETE' });
+      selectedId = null;
+      $('#detail').innerHTML = '<p class="empty">Select a session on the left.</p>';
+      await loadSessions();
+    } catch (err) { alert('Delete failed: ' + err.message); }
+  });
+
+  $('#btn-preview').addEventListener('click', async () => {
+    const box = $('#preview');
+    box.innerHTML = '<p class="empty">loading…</p>';
+    try {
+      const turns = await api('/api/sessions/' + encodeURIComponent(id) + '/preview');
+      box.innerHTML = turns.length
+        ? turns.map(t => `<div class="turn ${t.role.toLowerCase()}"><div class="role">${escapeHtml(t.role)}</div>${escapeHtml(t.text)}</div>`).join('')
+        : '<p class="empty">no turns found</p>';
+    } catch (err) {
+      box.innerHTML = `<p class="empty">no transcript preview available (${escapeHtml(err.message)})</p>`;
+    }
+  });
+}
+
+$('#create').addEventListener('submit', async e => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  try {
+    await api('/api/sessions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: fd.get('id'),
+        harness: fd.get('harness'),
+        cwd: fd.get('cwd'),
+        model: fd.get('model') || null,
+      }),
+    });
+    e.target.reset();
+    await loadSessions();
+  } catch (err) { alert('Create failed: ' + err.message); }
+});
+
+$('#refresh').addEventListener('click', () => { loadStatus(); loadSessions(); });
+$('#q').addEventListener('input', debounce(loadSessions, 250));
+$('#harness').addEventListener('change', loadSessions);
+$('#stopped').addEventListener('change', loadSessions);
+
+function debounce(fn, ms) {
+  let t;
+  return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
+
+loadStatus();
+loadSessions();
+setInterval(loadStatus, 15000);
+</script>
+</body>
+</html>

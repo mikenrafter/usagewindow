@@ -10,10 +10,10 @@ use chrono::Utc;
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
 };
-use uw_core::{api::*, model::*};
+use uw_core::{adapter::HarnessAdapter, api::*, model::*};
 use uw_store::{Store, ThresholdOverride, ThresholdScopeKind};
 
 #[derive(RustEmbed)]
@@ -23,13 +23,27 @@ struct Assets;
 #[derive(Clone)]
 pub struct AppState {
     store: Arc<Mutex<Store>>,
+    adapters: Arc<HashMap<Provider, Arc<dyn HarnessAdapter>>>,
 }
 
+/// For callers with no live adapters to offer (tests, or read-only tooling) — every
+/// route works except `/preview`, which needs a real adapter to read a transcript from.
 pub fn app(store: Store) -> Router {
+    app_with_adapters(store, HashMap::new())
+}
+
+pub fn app_with_adapters(
+    store: Store,
+    adapters: HashMap<Provider, Arc<dyn HarnessAdapter>>,
+) -> Router {
     Router::new()
         .route("/api/status", get(status))
-        .route("/api/sessions", get(sessions))
-        .route("/api/sessions/{id}", get(session))
+        .route("/api/sessions", get(sessions).post(create_session))
+        .route(
+            "/api/sessions/{id}",
+            get(session).put(update_session).delete(delete_session),
+        )
+        .route("/api/sessions/{id}/preview", get(session_preview))
         .route("/api/sessions/{id}/resume", post(resume))
         .route("/api/sessions/{id}/resume/cancel", post(cancel_resume))
         .route("/api/sessions/{id}/compact/ask", post(compact_ask))
@@ -40,6 +54,7 @@ pub fn app(store: Store) -> Router {
         .fallback(static_asset)
         .with_state(AppState {
             store: Arc::new(Mutex::new(store)),
+            adapters: Arc::new(adapters),
         })
 }
 
@@ -206,6 +221,7 @@ async fn status(
 struct SessionsQuery {
     stopped: Option<bool>,
     harness: Option<String>,
+    q: Option<String>,
 }
 
 async fn sessions(
@@ -217,7 +233,7 @@ async fn sessions(
     Ok(Json(
         read(state, move |store| {
             let mut items = Vec::new();
-            for s in store.list_sessions()? {
+            for s in store.search_sessions(query.q.as_deref())? {
                 if !harness.as_ref().is_none_or(|h| h == &s.harness)
                     || (!include_stopped && s.stopped_reason.is_some())
                 {
@@ -278,6 +294,95 @@ async fn session(
     Ok(Json(read(state, move |store| detail(store, &id)).await?))
 }
 
+async fn create_session(
+    State(state): State<AppState>,
+    Json(request): Json<CreateSessionRequest>,
+) -> Result<Json<SessionDetail>, (StatusCode, String)> {
+    let id = request.id.clone();
+    read(state.clone(), move |store| {
+        let now = Utc::now();
+        Ok(store.insert_session(&SessionSummary {
+            id: request.id,
+            harness: request.harness,
+            model: request.model,
+            account: None,
+            first_seen: now,
+            last_seen: now,
+            cwd: request.cwd,
+            state_path: None,
+            context_window_size: None,
+            last_known_token_count: None,
+            launch_mode: LaunchMode::Interactive,
+            pid: None,
+            stopped_reason: None,
+            resume_marker: None,
+            superseded_by: None,
+            reseeded_from: None,
+        })?)
+    })
+    .await
+    .map_err(|(status, message)| {
+        if message.contains("UNIQUE constraint") {
+            (StatusCode::CONFLICT, "session already exists".into())
+        } else {
+            (status, message)
+        }
+    })?;
+    Ok(Json(read(state, move |store| detail(store, &id)).await?))
+}
+
+async fn update_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateSessionRequest>,
+) -> Result<Json<SessionDetail>, (StatusCode, String)> {
+    let id = session_id(id);
+    read(state.clone(), {
+        let id = id.clone();
+        move |store| {
+            Ok(store.update_session_editable(
+                &id,
+                &request.cwd,
+                request.model.as_ref(),
+                request.account.as_ref(),
+            )?)
+        }
+    })
+    .await?;
+    Ok(Json(read(state, move |store| detail(store, &id)).await?))
+}
+
+async fn delete_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let id = session_id(id);
+    read(state, move |store| Ok(store.delete_session(&id)?)).await?;
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+async fn session_preview(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<uw_core::adapter::TurnPreview>>, (StatusCode, String)> {
+    let id = session_id(id);
+    let session = read(state.clone(), move |store| Ok(store.read_session(&id)?)).await?;
+    let Some(adapter) = state.adapters.get(&session.harness) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "no live adapter registered for this harness".into(),
+        ));
+    };
+    match adapter.session_preview(&session).await {
+        Ok(turns) => Ok(Json(turns)),
+        Err(uw_core::adapter::AdapterError::Unsupported) => Err((
+            StatusCode::NOT_FOUND,
+            "no transcript preview available for this session".into(),
+        )),
+        Err(error) => Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string())),
+    }
+}
+
 async fn resume(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -290,7 +395,13 @@ async fn resume(
                 id: uuid::Uuid::new_v4(),
                 session_id: id.clone(),
                 reason: ResumeReason::ManuallyMarked,
-                resume_at: request.at,
+                // Resolved by the daemon's policy tick against the session's
+                // window/burn-rate floor — never fired on `request.at` alone,
+                // since that would let a manual resume jump ahead of the
+                // window boundary. `request.at` is kept as a floor override
+                // in `requested_at` and can only push the fire time later.
+                resume_at: None,
+                requested_at: request.at,
                 created_at: Utc::now(),
                 status: ResumeStatus::Pending,
                 message: request.message.clone(),
@@ -697,5 +808,228 @@ mod tests {
             .unwrap();
         let value: ThresholdResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(value.values.get("closing_pct"), Some(&"85".to_string()));
+    }
+
+    #[tokio::test]
+    async fn sessions_search_filters_by_q() {
+        let store = Store::open_memory().unwrap();
+        let mut alpha = session();
+        alpha.id = SessionId("alpha".into());
+        alpha.cwd = "/repos/usagewindow".into();
+        store.insert_session(&alpha).unwrap();
+        let mut beta = session();
+        beta.id = SessionId("beta".into());
+        beta.cwd = "/repos/other".into();
+        store.insert_session(&beta).unwrap();
+
+        let response = app(store)
+            .oneshot(
+                Request::get("/api/sessions?q=usagewindow")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let items: Vec<SessionListItem> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, SessionId("alpha".into()));
+    }
+
+    #[tokio::test]
+    async fn session_crud_create_update_delete_round_trip() {
+        let router = app(Store::open_memory().unwrap());
+
+        let create = CreateSessionRequest {
+            id: SessionId("crud-session".into()),
+            harness: Provider::Codex,
+            cwd: "/repos/x".into(),
+            model: None,
+        };
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&create).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Creating the same id again is a conflict, not a 500.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&create).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let update = UpdateSessionRequest {
+            cwd: "/repos/y".into(),
+            model: Some(ModelId("gpt-5.6-luna".into())),
+            account: None,
+        };
+        let response = router
+            .clone()
+            .oneshot(
+                Request::put("/api/sessions/crud-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&update).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let detail: SessionDetail = serde_json::from_slice(&body).unwrap();
+        assert_eq!(detail.summary.cwd, "/repos/y");
+        assert_eq!(detail.summary.model, Some(ModelId("gpt-5.6-luna".into())));
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::delete("/api/sessions/crud-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = router
+            .oneshot(
+                Request::get("/api/sessions/crud-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    struct FakePreviewAdapter {
+        turns: Vec<uw_core::adapter::TurnPreview>,
+    }
+    #[async_trait::async_trait]
+    impl HarnessAdapter for FakePreviewAdapter {
+        fn provider(&self) -> Provider {
+            Provider::Codex
+        }
+        fn capabilities(&self) -> uw_core::adapter::Capabilities {
+            uw_core::adapter::Capabilities {
+                can_trigger_compaction: false,
+                can_advise_mid_turn: false,
+                can_inject_at_session_start: true,
+                can_observe_compaction: true,
+                reports_token_counts: false,
+                headless_resume: true,
+                seed_modes: vec![],
+            }
+        }
+        async fn fetch_usage(
+            &self,
+            _: Option<&AccountId>,
+        ) -> uw_core::adapter::AdapterResult<UsageSample> {
+            Err(uw_core::adapter::AdapterError::Unsupported)
+        }
+        async fn detect_stop(
+            &self,
+            _: &SessionId,
+        ) -> uw_core::adapter::AdapterResult<Option<StopReason>> {
+            Err(uw_core::adapter::AdapterError::Unsupported)
+        }
+        async fn emit_status(
+            &self,
+            _: &SessionId,
+            _: uw_core::adapter::StatusEvent,
+        ) -> uw_core::adapter::AdapterResult<uw_core::adapter::DeliveryOutcome> {
+            Err(uw_core::adapter::AdapterError::Unsupported)
+        }
+        async fn advise(
+            &self,
+            _: &SessionId,
+            _: &str,
+        ) -> uw_core::adapter::AdapterResult<uw_core::adapter::DeliveryOutcome> {
+            Err(uw_core::adapter::AdapterError::Unsupported)
+        }
+        async fn compact(
+            &self,
+            _: &SessionSummary,
+            _: &CompactionRequest,
+        ) -> uw_core::adapter::AdapterResult<uw_core::adapter::DeliveryOutcome> {
+            Err(uw_core::adapter::AdapterError::Unsupported)
+        }
+        async fn resume_session(
+            &self,
+            _: &SessionSummary,
+            _: Option<&str>,
+        ) -> uw_core::adapter::AdapterResult<()> {
+            Err(uw_core::adapter::AdapterError::Unsupported)
+        }
+        async fn session_preview(
+            &self,
+            _: &SessionSummary,
+        ) -> uw_core::adapter::AdapterResult<Vec<uw_core::adapter::TurnPreview>> {
+            if self.turns.is_empty() {
+                Err(uw_core::adapter::AdapterError::Unsupported)
+            } else {
+                Ok(self.turns.clone())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_preview_returns_turns_or_404_without_a_live_adapter() {
+        let store = Store::open_memory().unwrap();
+        store.insert_session(&session()).unwrap();
+
+        // No adapters registered at all (the plain `app()` used everywhere else) — 404,
+        // not a 500, since this is an expected "nothing to preview" case.
+        let no_adapter_store = Store::open_memory().unwrap();
+        no_adapter_store.insert_session(&session()).unwrap();
+        let response = app(no_adapter_store)
+            .oneshot(
+                Request::get("/api/sessions/session-1/preview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let turns = vec![uw_core::adapter::TurnPreview {
+            role: uw_core::adapter::TurnRole::User,
+            text: "hello".into(),
+        }];
+        let adapters: HashMap<Provider, Arc<dyn HarnessAdapter>> = HashMap::from([(
+            Provider::Codex,
+            Arc::new(FakePreviewAdapter { turns }) as Arc<dyn HarnessAdapter>,
+        )]);
+        let response = app_with_adapters(store, adapters)
+            .oneshot(
+                Request::get("/api/sessions/session-1/preview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let preview: Vec<uw_core::adapter::TurnPreview> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(preview[0].text, "hello");
     }
 }

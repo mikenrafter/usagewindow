@@ -65,6 +65,35 @@ pub enum DeliveryOutcome {
     QueuedForNextIdle,
     Unsupported,
 }
+/// A session the harness itself knows about (e.g. an on-disk session record) that
+/// usagewindow hasn't necessarily seen via a hook yet. Fields beyond `id`/`cwd` are
+/// best-effort: an adapter fills in whatever its on-disk record actually carries and
+/// leaves the rest `None` rather than guessing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredSession {
+    pub id: SessionId,
+    pub cwd: String,
+    pub model: Option<ModelId>,
+    pub context_window_size: Option<u64>,
+    pub last_known_token_count: Option<u64>,
+    pub first_seen: Option<DateTime<Utc>>,
+    pub last_seen: Option<DateTime<Utc>>,
+    /// Path to the on-disk record backing this session, if any — lets later reads
+    /// (e.g. a transcript preview) go straight to it without re-scanning.
+    pub state_path: Option<String>,
+}
+/// One user- or assistant-authored turn, for a short "remind me what this session was
+/// about" preview — not a full transcript export.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnPreview {
+    pub role: TurnRole,
+    pub text: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TurnRole {
+    User,
+    Assistant,
+}
 
 #[async_trait]
 pub trait HarnessAdapter: Send + Sync {
@@ -99,6 +128,21 @@ pub trait HarnessAdapter: Send + Sync {
         seed: &SeedContext,
     ) -> AdapterResult<SessionId> {
         let _ = (mode, seed);
+        Err(AdapterError::Unsupported)
+    }
+    /// Finds sessions the harness already knows about independent of hooks (e.g. by
+    /// reading its own on-disk session records), so a session that was never wired up
+    /// to report `SessionStart` can still be tracked and later resumed. Adapters
+    /// without a discoverable session store return `Unsupported`; the daemon then
+    /// relies on hooks alone for that harness.
+    async fn discover_sessions(&self) -> AdapterResult<Vec<DiscoveredSession>> {
+        Err(AdapterError::Unsupported)
+    }
+    /// The first two and last two user/assistant turns, for a quick "what was this
+    /// session about" refresh — deliberately not a full transcript (see
+    /// `export_transcript`'s stability caveat). Adapters without a readable record
+    /// return `Unsupported`.
+    async fn session_preview(&self, _session: &SessionSummary) -> AdapterResult<Vec<TurnPreview>> {
         Err(AdapterError::Unsupported)
     }
 }

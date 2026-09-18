@@ -21,7 +21,6 @@
             cargoBuildFlags = [ "--workspace" "--bins" ];
             installPhase = ''
               runHook preInstall
-              cargo build --release --workspace --bins --locked
               install -Dm755 target/release/uw $out/bin/uw
               install -Dm755 target/release/uw-daemon $out/bin/uw-daemon
               install -Dm755 target/release/uw-hook $out/bin/uw-hook
@@ -44,6 +43,13 @@
               openssl
               stdenv.cc
             ];
+          };
+          # Prebuilt `uw`/`uw-daemon`/`uw-hook`/`uw-mcp` on PATH, no toolchain
+          # or local `cargo build` required — just the finished binaries from
+          # `packages.default`. Useful when you want to run the tool without
+          # depending on a working Rust build in the shell itself.
+          withBins = pkgs.mkShell {
+            packages = [ self.packages.${system}.default ];
           };
         });
 

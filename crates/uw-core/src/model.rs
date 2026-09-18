@@ -172,7 +172,15 @@ pub struct ResumeMarker {
     pub id: Uuid,
     pub session_id: SessionId,
     pub reason: ResumeReason,
+    /// The actual scheduled fire time. `None` until the policy engine has
+    /// resolved a manually queued resume against the session's window/burn
+    /// rate; never fires before that resolution happens.
     pub resume_at: Option<DateTime<Utc>>,
+    /// The user-supplied `--at` floor for a manual resume, if any. Combined
+    /// with the policy-computed window boundary as `max(requested_at, floor)`
+    /// when `resume_at` is resolved — it can only push the fire time later,
+    /// never earlier.
+    pub requested_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub status: ResumeStatus,
     pub message: Option<String>,

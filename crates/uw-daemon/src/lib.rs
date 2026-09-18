@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use uw_core::adapter::{
-    Capabilities, DeliveryOutcome, HarnessAdapter, SeedContext, SeedMode, StatusEvent,
+    AdapterError, Capabilities, DeliveryOutcome, DiscoveredSession, HarnessAdapter, SeedContext,
+    SeedMode, StatusEvent,
 };
 use uw_core::model::*;
 use uw_core::summarizer::{SummarizeTemplate, Summarizer};
@@ -103,8 +104,16 @@ pub trait DaemonStore: Send + Sync {
     ) -> anyhow::Result<()>;
     async fn enqueue_compaction(&self, request: CompactionRequest) -> anyhow::Result<()>;
     async fn usage_samples(&self, session: &SessionSummary) -> anyhow::Result<Vec<UsageSample>>;
-    async fn has_active_resume_marker(&self, session_id: &SessionId) -> anyhow::Result<bool>;
+    async fn active_resume_marker(
+        &self,
+        session_id: &SessionId,
+    ) -> anyhow::Result<Option<ResumeMarker>>;
     async fn insert_resume_marker(&self, marker: ResumeMarker) -> anyhow::Result<()>;
+    async fn set_resume_at(
+        &self,
+        id: uuid::Uuid,
+        resume_at: DateTime<Utc>,
+    ) -> anyhow::Result<()>;
     async fn due_resume_markers(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<ResumeMarker>>;
     async fn claim_resume_marker(&self, _id: uuid::Uuid) -> anyhow::Result<bool> {
         Ok(false)
@@ -138,6 +147,14 @@ pub trait ObservationStore: Send + Sync {
     async fn record_usage(&self, sample: UsageSample) -> anyhow::Result<()>;
     async fn record_stop(&self, id: &SessionId, reason: StopReason) -> anyhow::Result<()>;
     async fn last_hook_event(&self, id: &SessionId) -> anyhow::Result<Option<String>>;
+    /// Registers a session the adapter found on disk but that usagewindow has never
+    /// seen via a hook. A no-op if the session is already tracked.
+    async fn upsert_discovered_session(
+        &self,
+        provider: Provider,
+        found: DiscoveredSession,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<()>;
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -145,6 +162,7 @@ pub struct ObservationReport {
     pub samples_recorded: u32,
     pub stops_recorded: u32,
     pub adapter_errors: u32,
+    pub sessions_discovered: u32,
 }
 
 /// Async facade for uw-store's `rusqlite::Connection` owner. Every operation
@@ -271,13 +289,20 @@ impl DaemonStore for SqliteDaemonStore {
         })
         .await
     }
-    async fn has_active_resume_marker(&self, id: &SessionId) -> anyhow::Result<bool> {
+    async fn active_resume_marker(
+        &self,
+        id: &SessionId,
+    ) -> anyhow::Result<Option<ResumeMarker>> {
         let id = id.clone();
-        self.blocking(move |s| Ok(s.has_active_resume_marker(&id)?))
+        self.blocking(move |s| Ok(s.active_resume_marker(&id)?))
             .await
     }
     async fn insert_resume_marker(&self, marker: ResumeMarker) -> anyhow::Result<()> {
         self.blocking(move |s| Ok(s.insert_resume_marker(&marker)?))
+            .await
+    }
+    async fn set_resume_at(&self, id: uuid::Uuid, resume_at: DateTime<Utc>) -> anyhow::Result<()> {
+        self.blocking(move |s| Ok(s.set_resume_at(id, resume_at)?))
             .await
     }
     async fn due_resume_markers(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<ResumeMarker>> {
@@ -362,6 +387,34 @@ impl ObservationStore for SqliteDaemonStore {
         self.blocking(move |store| Ok(store.latest_hook_event(&id)?))
             .await
     }
+    async fn upsert_discovered_session(
+        &self,
+        provider: Provider,
+        found: DiscoveredSession,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        self.blocking(move |store| {
+            Ok(store.upsert_session(&SessionSummary {
+                id: found.id,
+                harness: provider,
+                model: found.model,
+                account: None,
+                first_seen: found.first_seen.unwrap_or(now),
+                last_seen: found.last_seen.unwrap_or(now),
+                cwd: found.cwd,
+                state_path: found.state_path,
+                context_window_size: found.context_window_size,
+                last_known_token_count: found.last_known_token_count,
+                launch_mode: LaunchMode::Interactive,
+                pid: None,
+                stopped_reason: None,
+                resume_marker: None,
+                superseded_by: None,
+                reseeded_from: None,
+            })?)
+        })
+        .await
+    }
 }
 
 /// Polls each registered provider once, then checks every tracked session for a
@@ -371,7 +424,7 @@ pub async fn run_observation_tick(
     store: &dyn ObservationStore,
     adapters: &HashMap<Provider, Arc<dyn HarnessAdapter>>,
 ) -> anyhow::Result<ObservationReport> {
-    let sessions = store.tracked_sessions().await?;
+    let known = store.tracked_sessions().await?;
     let mut report = ObservationReport::default();
     for adapter in adapters.values() {
         match adapter.fetch_usage(None).await {
@@ -384,18 +437,45 @@ pub async fn run_observation_tick(
                 tracing::warn!(provider = ?adapter.provider(), %error, "usage poll failed");
             }
         }
+        match adapter.discover_sessions().await {
+            Ok(found) => {
+                let now = Utc::now();
+                for session in found {
+                    if known.iter().any(|existing| existing.id == session.id) {
+                        continue;
+                    }
+                    store
+                        .upsert_discovered_session(adapter.provider(), session, now)
+                        .await?;
+                    report.sessions_discovered += 1;
+                }
+            }
+            Err(AdapterError::Unsupported) => {}
+            Err(error) => {
+                report.adapter_errors += 1;
+                tracing::warn!(provider = ?adapter.provider(), %error, "session discovery failed");
+            }
+        }
     }
+    // Re-read so newly discovered sessions get a stop check in this same tick.
+    let sessions = store.tracked_sessions().await?;
     for session in sessions {
         let Some(adapter) = adapters.get(&session.harness) else {
             continue;
         };
         match adapter.detect_stop(&session.id).await {
             Ok(Some(reason)) if session.stopped_reason.as_ref() != Some(&reason) => {
+                // Codex has no passive mid-turn channel, so a hook event that isn't
+                // SessionEnd/Interrupt is live contradicting evidence the session is
+                // still going (suppress the stop). A session with NO hook history at
+                // all — e.g. one that was only ever found via `discover_sessions`,
+                // never wired to hooks — has no such evidence to contradict `detect_stop`,
+                // so it must not be treated the same as "known to still be live".
                 if session.harness == Provider::Codex
                     && matches!(reason, StopReason::UsageLimit { .. })
-                    && !matches!(
+                    && matches!(
                         store.last_hook_event(&session.id).await?.as_deref(),
-                        Some("SessionEnd" | "Interrupt")
+                        Some(event) if !matches!(event, "SessionEnd" | "Interrupt")
                     )
                 {
                     continue;
@@ -827,11 +907,19 @@ pub async fn run_policy_tick(
                     (*current_pct, previous.map_or(1, |entry| entry.1 + 1)),
                 );
             }
-            if matches!(
+            let stopped_on_this_window = matches!(
                 session.stopped_reason.as_ref(),
                 Some(StopReason::UsageLimit { window }) if window == &key
-            ) {
-                schedule_resume_if_needed(
+            );
+            let manual_resume_waiting_for_schedule = store
+                .active_resume_marker(&session.id)
+                .await?
+                .is_some_and(|marker| {
+                    marker.reason == ResumeReason::ManuallyMarked
+                        && marker.resume_at.is_none()
+                });
+            if stopped_on_this_window || manual_resume_waiting_for_schedule {
+                reconcile_resume_marker(
                     store,
                     session,
                     block,
@@ -914,7 +1002,16 @@ impl IdleEpisodeTracker {
     }
 }
 
-pub async fn schedule_resume_if_needed(
+/// Reconciles the session's single active resume marker (the DB enforces at
+/// most one `pending`/`scheduled` marker per session) against the current
+/// window/burn-rate state:
+/// - No active marker and the session just hit its usage limit → auto-plan one.
+/// - An active marker still awaiting resolution (a manually queued resume with
+///   no `resume_at` yet) → resolve it to `max(requested_at, policy floor)`,
+///   so a manual resume can never fire before the window/burn-rate check says
+///   it's safe, only later if `--at` asked for more margin.
+/// - An already-resolved marker → leave it alone.
+pub async fn reconcile_resume_marker(
     store: &dyn DaemonStore,
     session: &SessionSummary,
     block: &WindowBlock,
@@ -923,19 +1020,80 @@ pub async fn schedule_resume_if_needed(
     model: &str,
     history: &[CacheCostObservation],
 ) -> anyhow::Result<bool> {
-    if store.has_active_resume_marker(&session.id).await? {
-        return Ok(false);
+    match store.active_resume_marker(&session.id).await? {
+        Some(marker) if marker.resume_at.is_none() => {
+            let Some(floor) = resume_floor(session, block, now, profile, model, history) else {
+                return Ok(false);
+            };
+            let resume_at = marker.requested_at.map_or(floor, |requested| requested.max(floor));
+            store.set_resume_at(marker.id, resume_at).await?;
+            Ok(true)
+        }
+        Some(_) => Ok(false),
+        None => {
+            let Some(marker) = plan_resume_marker(session, block, now, profile, model, history)
+            else {
+                return Ok(false);
+            };
+            store.insert_resume_marker(marker).await?;
+            Ok(true)
+        }
     }
-    let Some(marker) = plan_resume_marker(session, block, now, profile, model, history) else {
-        return Ok(false);
-    };
-    store.insert_resume_marker(marker).await?;
-    Ok(true)
 }
 impl Default for IdleEpisodeTracker {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The earliest the policy engine considers it safe to resume: the point at
+/// which remaining window budget, burn rate, and cache-write cost line up, per
+/// `uw_policy::resume_lead_minutes`. This is the invariant floor — nothing may
+/// resume before it, whether auto-detected or manually requested via `--at`.
+fn resume_floor(
+    session: &SessionSummary,
+    block: &WindowBlock,
+    now: DateTime<Utc>,
+    profile: &ThresholdProfile,
+    model: &str,
+    history: &[CacheCostObservation],
+) -> Option<DateTime<Utc>> {
+    let (_, pct) = *block.points.last()?;
+    let cache_ttl = profile
+        .cache_ttl_by_provider
+        .get(&session.harness)
+        .copied()
+        .unwrap_or_default();
+    if cache_ttl > Duration::zero() && now - session.last_seen <= cache_ttl {
+        return Some(now);
+    }
+    let lookback_minutes = match block.key.kind {
+        WindowKind::Rolling { minutes } => u64::from(minutes).min(30).max(1),
+        _ => 30,
+    };
+    let burn = uw_policy::burn_rate_pct_per_hour(
+        block,
+        Duration::minutes(lookback_minutes as i64),
+    )? / 60.0;
+    let cache = uw_policy::estimate_cache_write_pct(
+        session.last_known_token_count.unwrap_or_default(),
+        model,
+        profile,
+        history,
+    );
+    let remaining = 100.0 - pct;
+    if burn <= 0.0 {
+        return (remaining > cache).then_some(now);
+    }
+    let horizon_minutes = match block.key.kind {
+        WindowKind::Rolling { minutes } => minutes.min(30) as f32,
+        _ => 30.0,
+    };
+    if remaining / burn >= horizon_minutes {
+        return Some(now);
+    }
+    let lead = uw_policy::resume_lead_minutes(100.0 - pct, cache, burn, profile)?;
+    Some(now + Duration::minutes(lead as i64))
 }
 
 pub fn plan_resume_marker(
@@ -949,20 +1107,13 @@ pub fn plan_resume_marker(
     if !matches!(session.stopped_reason, Some(StopReason::UsageLimit { .. })) {
         return None;
     }
-    let (_, pct) = *block.points.last()?;
-    let burn = uw_policy::burn_rate_pct_per_hour(block, Duration::minutes(30))? / 60.0;
-    let cache = uw_policy::estimate_cache_write_pct(
-        session.last_known_token_count.unwrap_or_default(),
-        model,
-        profile,
-        history,
-    );
-    let lead = uw_policy::resume_lead_minutes(100.0 - pct, cache, burn, profile)?;
+    let resume_at = resume_floor(session, block, now, profile, model, history)?;
     Some(ResumeMarker {
         id: uuid::Uuid::new_v4(),
         session_id: session.id.clone(),
         reason: ResumeReason::AutoDetectedLimit,
-        resume_at: Some(now + Duration::minutes(lead as i64)),
+        resume_at: Some(resume_at),
+        requested_at: None,
         created_at: now,
         status: ResumeStatus::Scheduled,
         message: None,
@@ -1059,10 +1210,10 @@ pub async fn run_production_ticks(
                 }),
                 ..Default::default()
             };
-            if session.harness == Provider::ClaudeCode {
+            if matches!(session.harness, Provider::ClaudeCode | Provider::Codex) {
                 profile
                     .cache_ttl_by_provider
-                    .insert(Provider::ClaudeCode, Duration::minutes(5));
+                    .insert(session.harness.clone(), Duration::minutes(5));
             }
             if auto_reseed.is_some() {
                 profile.reseed_auto = ReseedAutoConfig {
@@ -1147,7 +1298,6 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
     let path = std::env::var("UW_DB_PATH").unwrap_or_else(|_| "usagewindow.db".into());
     let store = Store::open(&path)?;
     let daemon_store = Arc::new(SqliteDaemonStore::new(store));
-    let app = uw_web::app(Store::open(&path)?);
     let cache_path = std::env::var("UW_CLAUDE_CACHE_PATH")
         .unwrap_or_else(|_| format!("{path}.claude-usage-cache.json"));
     let hook_channel = Arc::new(StoreHookChannel {
@@ -1180,6 +1330,7 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
     let liveness = SystemSessionLivenessChecker {
         db_path: path.clone(),
     };
+    let app = uw_web::app_with_adapters(Store::open(&path)?, adapters.clone());
     let address = std::env::var("UW_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".into());
     let listener = tokio::net::TcpListener::bind(address).await?;
     let server = async move { axum::serve(listener, app).await };
@@ -1296,6 +1447,8 @@ mod tests {
         status: StdMutex<Vec<CompactionStatus>>,
         samples: Vec<UsageSample>,
         enqueues: Arc<StdMutex<u32>>,
+        active_resume: Option<ResumeMarker>,
+        resolved: Arc<StdMutex<Vec<(uuid::Uuid, DateTime<Utc>)>>>,
     }
     #[async_trait]
     impl DaemonStore for FakeStore {
@@ -1323,10 +1476,17 @@ mod tests {
         async fn usage_samples(&self, _: &SessionSummary) -> anyhow::Result<Vec<UsageSample>> {
             Ok(self.samples.clone())
         }
-        async fn has_active_resume_marker(&self, _: &SessionId) -> anyhow::Result<bool> {
-            Ok(false)
+        async fn active_resume_marker(
+            &self,
+            _: &SessionId,
+        ) -> anyhow::Result<Option<ResumeMarker>> {
+            Ok(self.active_resume.clone())
         }
         async fn insert_resume_marker(&self, _: ResumeMarker) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn set_resume_at(&self, id: uuid::Uuid, at: DateTime<Utc>) -> anyhow::Result<()> {
+            self.resolved.lock().unwrap().push((id, at));
             Ok(())
         }
         async fn due_resume_markers(&self, _: DateTime<Utc>) -> anyhow::Result<Vec<ResumeMarker>> {
@@ -1391,6 +1551,164 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl KeepaliveStore for FakeStore {
+        async fn keepalive_sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
+            Ok(vec![])
+        }
+
+        async fn keepalive_state(&self, _: &SessionId) -> anyhow::Result<KeepaliveState> {
+            Ok(KeepaliveState {
+                session_id: SessionId("s".into()),
+                enabled: false,
+                last_ping_at: None,
+                ping_day: None,
+                ping_count: 0,
+            })
+        }
+
+        async fn record_keepalive_ping(
+            &self,
+            _: &SessionId,
+            _: DateTime<Utc>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_resume_marker_is_reconciled_without_stopped_reason() {
+        let now = Utc::now();
+        let key = WindowKey {
+            provider: Provider::ClaudeCode,
+            kind: WindowKind::Rolling { minutes: 300 },
+        };
+        let marker = ResumeMarker {
+            id: uuid::Uuid::new_v4(),
+            session_id: SessionId("s".into()),
+            reason: ResumeReason::ManuallyMarked,
+            resume_at: None,
+            requested_at: None,
+            created_at: now,
+            status: ResumeStatus::Pending,
+            message: Some("continue".into()),
+        };
+        let store = FakeStore {
+            request: StdMutex::new(None),
+            owner: session(),
+            claim: true,
+            status: StdMutex::new(vec![]),
+            samples: vec![
+                UsageSample {
+                    at: now - Duration::minutes(31),
+                    fetched_at: None,
+                    source: UsageSource::ProviderReported,
+                    provider: Provider::ClaudeCode,
+                    account: None,
+                    windows: HashMap::from([(
+                        key.clone(),
+                        UsageWindowState::new(0.0, false, true, None, None),
+                    )]),
+                    credits: None,
+                },
+                UsageSample {
+                    at: now,
+                    fetched_at: None,
+                    source: UsageSource::ProviderReported,
+                    provider: Provider::ClaudeCode,
+                    account: None,
+                    windows: HashMap::from([(
+                        key,
+                        UsageWindowState::new(51.0, false, true, None, None),
+                    )]),
+                    credits: None,
+                },
+            ],
+            enqueues: Arc::new(StdMutex::new(0)),
+            active_resume: Some(marker.clone()),
+            resolved: Arc::new(StdMutex::new(vec![])),
+        };
+        let adapter = Arc::new(FakeAdapter {
+            capabilities: caps(false, false, false),
+            compacted: Arc::new(StdMutex::new(0)),
+            advised: Arc::new(StdMutex::new(0)),
+        });
+        let mut profiles = HashMap::new();
+        profiles.insert(marker.session_id.clone(), ThresholdProfile::default());
+        let mut policy_state = PolicyRuntimeState::default();
+
+        run_policy_tick(
+            &store,
+            &store,
+            &HashMap::from([(Provider::ClaudeCode, adapter as Arc<dyn HarnessAdapter>)]),
+            &AlwaysIdle,
+            &[session()],
+            &profiles,
+            &mut policy_state,
+            now,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(store.resolved.lock().unwrap().len(), 1);
+        assert_eq!(store.resolved.lock().unwrap()[0].0, marker.id);
+    }
+
+    #[test]
+    fn resume_floor_only_waits_for_uncached_fast_exhaustion() {
+        let now = Utc::now();
+        let (mut session, mut block) = near_limit_session_and_block();
+        let mut profile = ThresholdProfile::default();
+        profile
+            .cache_ttl_by_provider
+            .insert(Provider::ClaudeCode, Duration::minutes(5));
+
+        // A warm cache warrants an immediate resume even with a fast burn rate.
+        session.last_seen = now - Duration::minutes(1);
+        block.points = vec![
+            (now - Duration::minutes(10), 0.0),
+            (now, 50.0),
+        ];
+        block.point_resets_at = vec![None, None];
+        assert_eq!(
+            resume_floor(&session, &block, now, &profile, "claude", &[]),
+            Some(now)
+        );
+
+        // An uncached chat still resumes immediately when exhaustion is not
+        // expected within the 30-minute safety horizon.
+        session.last_seen = now - Duration::minutes(10);
+        block.points = vec![
+            (now - Duration::minutes(31), 0.0),
+            (now, 1.0),
+        ];
+        block.point_resets_at = vec![None, None];
+        assert_eq!(
+            resume_floor(&session, &block, now, &profile, "claude", &[]),
+            Some(now)
+        );
+
+        // A short rolling window uses its own duration as the horizon.
+        block.key.kind = WindowKind::Rolling { minutes: 5 };
+        block.points = vec![(now - Duration::minutes(6), 0.0), (now, 10.0)];
+        block.point_resets_at = vec![None, None];
+        assert_eq!(
+            resume_floor(&session, &block, now, &profile, "claude", &[]),
+            Some(now)
+        );
+
+        // Only an uncached chat expected to exhaust inside the horizon waits.
+        block.key.kind = WindowKind::Rolling { minutes: 300 };
+        block.points = vec![
+            (now - Duration::minutes(31), 0.0),
+            (now - Duration::minutes(10), 40.0),
+            (now, 90.0),
+        ];
+        block.point_resets_at = vec![None, None, None];
+        assert!(resume_floor(&session, &block, now, &profile, "claude", &[])
+            .is_some_and(|at| at > now));
+    }
+
     #[test]
     fn unsupported_compaction_is_failed_without_send_plan() {
         assert_eq!(
@@ -1438,6 +1756,14 @@ mod tests {
         }
         async fn last_hook_event(&self, _: &SessionId) -> anyhow::Result<Option<String>> {
             Ok(self.last_hook_event.clone())
+        }
+        async fn upsert_discovered_session(
+            &self,
+            _: Provider,
+            _: DiscoveredSession,
+            _: DateTime<Utc>,
+        ) -> anyhow::Result<()> {
+            Ok(())
         }
     }
 
@@ -1537,6 +1863,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_usage_limit_stop_is_recorded_for_a_session_with_no_hook_history() {
+        // A session that only ever surfaced via `discover_sessions` (never wired to
+        // hooks) has no hook evidence either way. It must not be treated as "known
+        // still live" just because it has never reported in.
+        let key = WindowKey {
+            provider: Provider::Codex,
+            kind: WindowKind::Rolling { minutes: 300 },
+        };
+        let now = Utc::now();
+        let store = ObservationFake {
+            sessions: vec![SessionSummary {
+                harness: Provider::Codex,
+                ..session()
+            }],
+            samples: StdMutex::new(vec![]),
+            stops: StdMutex::new(vec![]),
+            last_hook_event: None,
+        };
+        let adapter = Arc::new(ObservationAdapter {
+            sample: UsageSample {
+                at: now,
+                fetched_at: Some(now),
+                source: UsageSource::ProviderReported,
+                provider: Provider::Codex,
+                account: None,
+                windows: HashMap::from([(
+                    key.clone(),
+                    UsageWindowState::new(100.0, true, true, None, None),
+                )]),
+                credits: None,
+            },
+            stop: Some(StopReason::UsageLimit {
+                window: key.clone(),
+            }),
+        });
+
+        let report = run_observation_tick(
+            &store,
+            &HashMap::from([(Provider::Codex, adapter as Arc<dyn HarnessAdapter>)]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.stops_recorded, 1);
+        assert_eq!(
+            store.stops.lock().unwrap().as_slice(),
+            &[(SessionId("s".into()), StopReason::UsageLimit { window: key })]
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_usage_limit_stop_is_suppressed_by_live_non_terminal_hook_evidence() {
+        // A hook event that isn't SessionEnd/Interrupt is real, recent evidence the
+        // session is still going — this is the case the gate exists to protect.
+        let key = WindowKey {
+            provider: Provider::Codex,
+            kind: WindowKind::Rolling { minutes: 300 },
+        };
+        let now = Utc::now();
+        let store = ObservationFake {
+            sessions: vec![SessionSummary {
+                harness: Provider::Codex,
+                ..session()
+            }],
+            samples: StdMutex::new(vec![]),
+            stops: StdMutex::new(vec![]),
+            last_hook_event: Some("PostToolUse".into()),
+        };
+        let adapter = Arc::new(ObservationAdapter {
+            sample: UsageSample {
+                at: now,
+                fetched_at: Some(now),
+                source: UsageSource::ProviderReported,
+                provider: Provider::Codex,
+                account: None,
+                windows: HashMap::from([(
+                    key.clone(),
+                    UsageWindowState::new(100.0, true, true, None, None),
+                )]),
+                credits: None,
+            },
+            stop: Some(StopReason::UsageLimit { window: key }),
+        });
+
+        let report = run_observation_tick(
+            &store,
+            &HashMap::from([(Provider::Codex, adapter as Arc<dyn HarnessAdapter>)]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.stops_recorded, 0);
+        assert!(store.stops.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn unsupported_adapter_is_marked_failed_without_compact_call() {
         let compacted = Arc::new(StdMutex::new(0));
         let adapter = Arc::new(FakeAdapter {
@@ -1551,6 +1973,8 @@ mod tests {
             status: StdMutex::new(vec![]),
             samples: vec![],
             enqueues: Arc::new(StdMutex::new(0)),
+            active_resume: None,
+            resolved: Arc::new(StdMutex::new(vec![])),
         };
         run_compaction_tick(
             &store,
@@ -1582,6 +2006,8 @@ mod tests {
             status: StdMutex::new(vec![]),
             samples: vec![],
             enqueues: Arc::new(StdMutex::new(0)),
+            active_resume: None,
+            resolved: Arc::new(StdMutex::new(vec![])),
         };
         run_compaction_tick(
             &store,
@@ -1608,6 +2034,8 @@ mod tests {
             status: StdMutex::new(vec![]),
             samples: vec![],
             enqueues: Arc::new(StdMutex::new(0)),
+            active_resume: None,
+            resolved: Arc::new(StdMutex::new(vec![])),
         };
         run_compaction_tick(
             &raced,
@@ -1627,6 +2055,8 @@ mod tests {
             status: StdMutex::new(vec![]),
             samples: vec![],
             enqueues: Arc::new(StdMutex::new(0)),
+            active_resume: None,
+            resolved: Arc::new(StdMutex::new(vec![])),
         };
         run_compaction_tick(
             &sent,
@@ -1657,6 +2087,8 @@ mod tests {
             status: StdMutex::new(vec![]),
             samples: vec![],
             enqueues: Arc::new(StdMutex::new(0)),
+            active_resume: None,
+            resolved: Arc::new(StdMutex::new(vec![])),
         };
         let adapters = HashMap::from([(Provider::ClaudeCode, adapter as Arc<dyn HarnessAdapter>)]);
         let result = tokio::time::timeout(
@@ -1699,6 +2131,8 @@ mod tests {
             status: StdMutex::new(vec![]),
             samples: vec![make(now - Duration::minutes(31), 0.0), make(now, 99.0)],
             enqueues: Arc::new(StdMutex::new(0)),
+            active_resume: None,
+            resolved: Arc::new(StdMutex::new(vec![])),
         };
         let adapter = FakeAdapter {
             capabilities: caps(false, false, false),
@@ -1731,6 +2165,8 @@ mod tests {
             status: StdMutex::new(vec![]),
             samples: vec![],
             enqueues: enqueues.clone(),
+            active_resume: None,
+            resolved: Arc::new(StdMutex::new(vec![])),
         };
         let adapter = FakeAdapter {
             capabilities: caps(true, false, false),
@@ -1799,8 +2235,9 @@ mod tests {
     }
 
     struct ResumeFake {
-        active: bool,
+        active: Option<ResumeMarker>,
         inserts: StdMutex<u32>,
+        resolved: StdMutex<Vec<(uuid::Uuid, DateTime<Utc>)>>,
         owner: SessionSummary,
         due: Vec<ResumeMarker>,
         claim: Arc<StdMutex<bool>>,
@@ -1829,11 +2266,18 @@ mod tests {
         async fn usage_samples(&self, _: &SessionSummary) -> anyhow::Result<Vec<UsageSample>> {
             Ok(vec![])
         }
-        async fn has_active_resume_marker(&self, _: &SessionId) -> anyhow::Result<bool> {
-            Ok(self.active)
+        async fn active_resume_marker(
+            &self,
+            _: &SessionId,
+        ) -> anyhow::Result<Option<ResumeMarker>> {
+            Ok(self.active.clone())
         }
         async fn insert_resume_marker(&self, _: ResumeMarker) -> anyhow::Result<()> {
             *self.inserts.lock().unwrap() += 1;
+            Ok(())
+        }
+        async fn set_resume_at(&self, id: uuid::Uuid, resume_at: DateTime<Utc>) -> anyhow::Result<()> {
+            self.resolved.lock().unwrap().push((id, resume_at));
             Ok(())
         }
         async fn due_resume_markers(&self, _: DateTime<Utc>) -> anyhow::Result<Vec<ResumeMarker>> {
@@ -1850,8 +2294,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn resume_scheduler_does_not_attempt_duplicate_active_marker() {
+    fn near_limit_session_and_block() -> (SessionSummary, WindowBlock) {
         let mut stopped = session();
         let key = WindowKey {
             provider: Provider::ClaudeCode,
@@ -1871,15 +2314,32 @@ mod tests {
             ],
             point_resets_at: vec![None, None],
         };
+        (stopped, block)
+    }
+
+    #[tokio::test]
+    async fn resume_scheduler_does_not_attempt_duplicate_active_marker() {
+        let (stopped, block) = near_limit_session_and_block();
+        let already_scheduled = ResumeMarker {
+            id: uuid::Uuid::new_v4(),
+            session_id: stopped.id.clone(),
+            reason: ResumeReason::AutoDetectedLimit,
+            resume_at: Some(Utc::now() + Duration::minutes(10)),
+            requested_at: None,
+            created_at: Utc::now(),
+            status: ResumeStatus::Scheduled,
+            message: None,
+        };
         let store = ResumeFake {
-            active: true,
+            active: Some(already_scheduled),
             inserts: StdMutex::new(0),
+            resolved: StdMutex::new(vec![]),
             owner: stopped.clone(),
             due: vec![],
             claim: Arc::new(StdMutex::new(false)),
         };
         assert!(
-            !schedule_resume_if_needed(
+            !reconcile_resume_marker(
                 &store,
                 &stopped,
                 &block,
@@ -1892,6 +2352,89 @@ mod tests {
             .unwrap()
         );
         assert_eq!(*store.inserts.lock().unwrap(), 0);
+        assert!(store.resolved.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_resume_never_resolves_earlier_than_the_policy_floor() {
+        let (stopped, block) = near_limit_session_and_block();
+        let now = Utc::now();
+        let floor = resume_floor(
+            &stopped,
+            &block,
+            now,
+            &ThresholdProfile::default(),
+            "claude",
+            &[],
+        )
+        .expect("policy floor should be computable from the block above");
+
+        // An --at in the past (or before the floor) must not win: the marker
+        // resolves to the floor, never earlier.
+        let too_early = ResumeMarker {
+            id: uuid::Uuid::new_v4(),
+            session_id: stopped.id.clone(),
+            reason: ResumeReason::ManuallyMarked,
+            resume_at: None,
+            requested_at: Some(floor - Duration::hours(1)),
+            created_at: now,
+            status: ResumeStatus::Pending,
+            message: Some("resume now please".into()),
+        };
+        let store = ResumeFake {
+            active: Some(too_early.clone()),
+            inserts: StdMutex::new(0),
+            resolved: StdMutex::new(vec![]),
+            owner: stopped.clone(),
+            due: vec![],
+            claim: Arc::new(StdMutex::new(false)),
+        };
+        assert!(
+            reconcile_resume_marker(
+                &store,
+                &stopped,
+                &block,
+                now,
+                &ThresholdProfile::default(),
+                "claude",
+                &[]
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(store.resolved.lock().unwrap()[0], (too_early.id, floor));
+
+        // An --at further out than the floor is honored as extra margin.
+        let later = floor + Duration::hours(1);
+        let ask_for_more_margin = ResumeMarker {
+            requested_at: Some(later),
+            ..too_early
+        };
+        let store = ResumeFake {
+            active: Some(ask_for_more_margin.clone()),
+            inserts: StdMutex::new(0),
+            resolved: StdMutex::new(vec![]),
+            owner: stopped.clone(),
+            due: vec![],
+            claim: Arc::new(StdMutex::new(false)),
+        };
+        assert!(
+            reconcile_resume_marker(
+                &store,
+                &stopped,
+                &block,
+                now,
+                &ThresholdProfile::default(),
+                "claude",
+                &[]
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            store.resolved.lock().unwrap()[0],
+            (ask_for_more_margin.id, later)
+        );
     }
 
     #[tokio::test]
@@ -1902,13 +2445,15 @@ mod tests {
             session_id: SessionId("s".into()),
             reason: ResumeReason::AutoDetectedLimit,
             resume_at: Some(Utc::now() - Duration::seconds(1)),
+            requested_at: None,
             created_at: Utc::now() - Duration::minutes(1),
             status: ResumeStatus::Scheduled,
             message: None,
         };
         let store = Arc::new(ResumeFake {
-            active: false,
+            active: None,
             inserts: StdMutex::new(0),
+            resolved: StdMutex::new(vec![]),
             owner: session(),
             due: vec![marker],
             claim: Arc::new(StdMutex::new(true)),

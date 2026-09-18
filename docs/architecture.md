@@ -316,6 +316,13 @@ not a substitute for real installation).
   `cache_write_price_table: Vec<{model_prefix, usd_per_mtok}>` and
   `cache_write_fallback_pct: f32` to `ThresholdProfile` — this is the pricing-input gap
   the reseed cost-comparison gate below also depends on, so define it once here.
+  A resume request skips the lead-time wait when the chat cache is still warm, when the
+  current burn rate is zero or would take at least 30 minutes to exhaust the remaining
+  quota, or when a rolling window is shorter than 30 minutes and the burn rate would not
+  exhaust it within that window. The warm-cache approximation is five minutes since the
+  session's last agent activity for both Claude Code and Codex until usagewindow can emit
+  explicit cache-control markers. Only an uncached chat with projected exhaustion inside
+  that horizon waits for the calculated lead time.
 - **Opportunistic idle-compact** (auto-fires, no asking): tiered table
   `Vec<{window_size_floor: u64, token_threshold: u64}>` sorted ascending, pick the
   highest floor `<=` the session's context window size. Defaults: 100k tokens for the
