@@ -7,21 +7,21 @@ destination: ~/.config/kasetto
 
 skills:
   - source: https://github.com/mikenrafter/usagewindow
-    ref: 0b3d28fa0cabc035580bef7f9fd30d26f19dda06
+    ref: 9ce03aa70a7f20a30f743dcbac5370d6029f18e9
     sub-dir: agent-integration/skills
     skills:
       - usagewindow-status
 
 commands:
   - source: https://github.com/mikenrafter/usagewindow
-    ref: 0b3d28fa0cabc035580bef7f9fd30d26f19dda06
+    ref: 9ce03aa70a7f20a30f743dcbac5370d6029f18e9
     sub-dir: agent-integration
     commands:
       - uw-mark-resume
 
 mcps:
   - source: https://github.com/mikenrafter/usagewindow
-    ref: 0b3d28fa0cabc035580bef7f9fd30d26f19dda06
+    ref: 9ce03aa70a7f20a30f743dcbac5370d6029f18e9
     sub-dir: agent-integration
     mcps:
       - usagewindow
