@@ -28,12 +28,18 @@
             buildInputs = [ pkgs.openssl pkgs.stdenv.cc ];
             cargoBuildType = profile;
             cargoBuildFlags = [ "--workspace" "--bins" ];
-            installPhase = ''
+            installPhase =
+              let
+                # cargoBuildHook always passes an explicit --target, so
+                # binaries land under target/<triple>/<profile>/, not
+                # target/<profile>/.
+                targetDir = "target/${pkgs.stdenv.hostPlatform.rust.cargoShortTarget}/${profile}";
+              in ''
               runHook preInstall
-              install -Dm755 target/${profile}/uw $out/bin/uw
-              install -Dm755 target/${profile}/uw-daemon $out/bin/uw-daemon
-              install -Dm755 target/${profile}/uw-hook $out/bin/uw-hook
-              install -Dm755 target/${profile}/uw-mcp $out/bin/uw-mcp
+              install -Dm755 ${targetDir}/uw $out/bin/uw
+              install -Dm755 ${targetDir}/uw-daemon $out/bin/uw-daemon
+              install -Dm755 ${targetDir}/uw-hook $out/bin/uw-hook
+              install -Dm755 ${targetDir}/uw-mcp $out/bin/uw-mcp
               runHook postInstall
             '';
           };
