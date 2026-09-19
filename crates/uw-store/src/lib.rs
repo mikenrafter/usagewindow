@@ -104,6 +104,22 @@ impl Store {
         )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+    /// Return only the newest row for each usage window in a provider/account.
+    /// The daemon records one row per window per poll, so callers displaying
+    /// current status should never need to materialize the retention history.
+    pub fn latest_usage_samples_for(
+        &self,
+        provider: Option<&Provider>,
+        account: Option<&AccountId>,
+    ) -> StoreResult<Vec<UsageSample>> {
+        let sql = "SELECT provider,account,window_kind,window_scope_value,pct,resets_at,exceeded,active,source,at,fetched_at,credits_json FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY provider,account,window_kind,window_scope_value ORDER BY at DESC,id DESC) AS rank FROM usage_samples WHERE (?1 IS NULL OR provider=?1) AND (?2 IS NULL OR account IS ?2)) WHERE rank=1 ORDER BY provider,account,window_kind,window_scope_value";
+        let mut stmt = self.connection.prepare(sql)?;
+        let rows = stmt.query_map(
+            params![provider.map(json).transpose()?, account.map(json).transpose()?],
+            decode_usage_sample_row,
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
     pub fn prune_usage_before(&self, cutoff: DateTime<Utc>) -> StoreResult<usize> {
         Ok(self
             .connection

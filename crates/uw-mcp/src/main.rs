@@ -67,14 +67,10 @@ fn get_usage(args: &Value, deps: &Deps) -> Result<Value, String> {
         .lock()
         .map_err(|_| "store lock poisoned".to_string())?;
     let mut latest: HashMap<String, UsageSample> = HashMap::new();
-    for sample in store.all_usage_samples().map_err(|e| e.to_string())? {
-        if provider.as_ref().is_some_and(|p| p != &sample.provider)
-            || account
-                .as_ref()
-                .is_some_and(|a| Some(a) != sample.account.as_ref())
-        {
-            continue;
-        }
+    for sample in store
+        .latest_usage_samples_for(provider.as_ref(), account.as_ref())
+        .map_err(|e| e.to_string())?
+    {
         let key = format!("{:?}:{:?}", sample.provider, sample.account);
         if latest.get(&key).is_none_or(|old| old.at < sample.at) {
             latest.insert(key, sample);
@@ -649,6 +645,64 @@ mod tests {
             serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
                 .unwrap();
         assert_eq!(usage["usage"][0]["windows"][0]["pct"], 42.0);
+    }
+    #[test]
+    fn get_usage_decodes_only_the_latest_database_rows() {
+        let deps = deps();
+        let now = Utc::now();
+        let window = WindowKey {
+            provider: Provider::Codex,
+            kind: WindowKind::Rolling { minutes: 300 },
+        };
+        let old = UsageSample {
+            at: now - chrono::Duration::hours(1),
+            fetched_at: None,
+            source: UsageSource::ProviderReported,
+            provider: Provider::Codex,
+            account: None,
+            windows: HashMap::from([(
+                window.clone(),
+                UsageWindowState::new(10.0, false, true, None, None),
+            )]),
+            credits: None,
+        };
+        let latest = UsageSample {
+            at: now,
+            fetched_at: None,
+            source: UsageSource::ProviderReported,
+            provider: Provider::Codex,
+            account: None,
+            windows: HashMap::from([(
+                window,
+                UsageWindowState::new(84.0, false, true, None, None),
+            )]),
+            credits: None,
+        };
+        let store = deps.store.lock().unwrap();
+        let old_id = store.insert_usage_sample(&old).unwrap();
+        store
+            .connection()
+            .execute(
+                "UPDATE usage_samples SET source='not-json' WHERE id=?1",
+                [old_id],
+            )
+            .unwrap();
+        store.insert_usage_sample(&latest).unwrap();
+        drop(store);
+
+        let response = handle_request(
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_usage","arguments":{}}}),
+            &deps,
+        );
+
+        assert!(
+            response.get("error").is_none(),
+            "an unreadable historical row must not affect latest-only get_usage: {response}"
+        );
+        let usage: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(usage["usage"][0]["windows"][0]["pct"], 84.0);
     }
     #[test]
     fn request_compaction_reports_codex_unsupported_without_inserting() {

@@ -23,6 +23,20 @@ See `docs/architecture.md` for the design and the research notes for capability 
 nix develop --command cargo test --workspace
 nix develop --command cargo clippy --all-targets -- -D warnings
 nix build .#default
+nix flake check --no-build
+```
+
+The normal package output remains an optimized release build. The optional
+`dynamicPackages.x86_64-linux` output uses
+[cargo-dyndrv](https://github.com/obsidiansystems/cargo-dyndrv) to split the
+Cargo graph into content-addressed dynamic derivations, so unchanged crates can
+be reused across source changes. It requires a Nix daemon with
+`ca-derivations` and `dynamic-derivations` enabled; the current workstation Nix
+version is too old to build it. After upgrading Nix, build it with:
+
+```
+nix --extra-experimental-features 'ca-derivations dynamic-derivations recursive-nix' \
+  build .#dynamicPackages.x86_64-linux
 ```
 
 Run `result/bin/uw-daemon` with `UW_DB_PATH` set to the SQLite path. The daemon listens

@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::path::{Path, PathBuf};
+use std::time::{Duration as StdDuration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use uw_core::adapter::{
     AdapterError, Capabilities, DeliveryOutcome, DiscoveredSession, HarnessAdapter, SeedContext,
@@ -615,9 +616,11 @@ pub async fn run_observation_tick(
 ) -> anyhow::Result<ObservationReport> {
     let known = store.tracked_sessions().await?;
     let mut report = ObservationReport::default();
+    let mut fetched_samples = HashMap::new();
     for adapter in adapters.values() {
         match adapter.fetch_usage(None).await {
             Ok(sample) => {
+                fetched_samples.insert(adapter.provider(), sample.clone());
                 store
                     .record_fetch_result(adapter.provider(), None, Ok(()), Utc::now())
                     .await?;
@@ -662,7 +665,21 @@ pub async fn run_observation_tick(
         let Some(adapter) = adapters.get(&session.harness) else {
             continue;
         };
-        match adapter.detect_stop(&session.id).await {
+        let sampled_stop = fetched_samples
+            .get(&session.harness)
+            .and_then(|sample| {
+                sample
+                    .windows
+                    .iter()
+                    .find(|(_, window)| window.exceeded)
+                    .map(|(window, _)| StopReason::UsageLimit { window: window.clone() })
+            });
+        let detected = match (sampled_stop, fetched_samples.contains_key(&session.harness)) {
+            (Some(stop), _) => Ok(Some(stop)),
+            (None, true) => Ok(None),
+            (None, false) => adapter.detect_stop(&session.id).await,
+        };
+        match detected {
             Ok(Some(reason)) if session.stopped_reason.as_ref() != Some(&reason) => {
                 // Codex has no passive mid-turn channel, so a hook event that isn't
                 // SessionEnd/Interrupt is live contradicting evidence the session is
@@ -1509,20 +1526,39 @@ pub async fn run_production_ticks(
     let mut ticker = tokio::time::interval(interval);
     let mut policy_state = PolicyRuntimeState::default();
     let auto_reseed = auto_reseed_runtime_from_env();
+    let observation_interval = env_duration_or("UW_OBSERVATION_INTERVAL_SECS", interval);
+    let policy_interval = env_duration_secs("UW_POLICY_INTERVAL_SECS", 30);
+    let maintenance_interval = env_duration_secs("UW_MAINTENANCE_INTERVAL_SECS", 3600);
+    let started = Instant::now();
+    let mut last_observation = started - observation_interval;
+    let mut last_policy = started - policy_interval;
+    let mut last_maintenance = started - maintenance_interval;
     loop {
         ticker.tick().await;
         // Explicit compaction requests are destructive and user-directed. Dispatch
         // them before provider observation, which may block on a harness transport.
         run_compaction_tick(store.as_ref(), adapters, liveness).await?;
-        run_observation_tick(store.as_ref(), adapters).await?;
-        let retention_days = std::env::var("UW_RETENTION_DAYS")
-            .ok()
-            .and_then(|value| value.parse::<i64>().ok())
-            .filter(|days| *days > 0)
-            .unwrap_or(30);
-        store
-            .prune_usage_before(Utc::now() - Duration::days(retention_days))
-            .await?;
+        let now = Instant::now();
+        if now.duration_since(last_observation) >= observation_interval {
+            run_observation_tick(store.as_ref(), adapters).await?;
+            last_observation = now;
+        }
+        if now.duration_since(last_maintenance) >= maintenance_interval {
+            let retention_days = std::env::var("UW_RETENTION_DAYS")
+                .ok()
+                .and_then(|value| value.parse::<i64>().ok())
+                .filter(|days| *days > 0)
+                .unwrap_or(30);
+            store
+                .prune_usage_before(Utc::now() - Duration::days(retention_days))
+                .await?;
+            last_maintenance = now;
+        }
+        if now.duration_since(last_policy) < policy_interval {
+            run_resume_tick(store.as_ref(), adapters, Utc::now()).await?;
+            continue;
+        }
+        last_policy = now;
         let sessions = store.tracked_sessions().await?;
         let mut profiles = HashMap::new();
         for session in &sessions {
@@ -1586,6 +1622,24 @@ pub async fn run_production_ticks(
         }
         run_resume_tick(store.as_ref(), adapters, Utc::now()).await?;
     }
+}
+
+fn env_duration_secs(name: &str, default_secs: u64) -> StdDuration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(StdDuration::from_secs)
+        .unwrap_or_else(|| StdDuration::from_secs(default_secs))
+}
+
+fn env_duration_or(name: &str, default: StdDuration) -> StdDuration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(StdDuration::from_secs)
+        .unwrap_or(default)
 }
 
 fn auto_reseed_runtime_from_env() -> Option<AutoReseedRuntime> {
@@ -1714,7 +1768,7 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
     let server = async move { axum::serve(listener, app).await };
     tokio::select! {
         result = server => result.map_err(Into::into),
-        result = run_production_ticks(daemon_store, &adapters, &liveness, std::time::Duration::from_secs(5)) => result,
+        result = run_production_ticks(daemon_store, &adapters, &liveness, std::time::Duration::from_secs(60)) => result,
     }
 }
 
@@ -2230,6 +2284,50 @@ mod tests {
         }
     }
 
+    struct ProviderRequestCountingAdapter {
+        sample: UsageSample,
+        stop: Option<StopReason>,
+        provider_requests: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl HarnessAdapter for ProviderRequestCountingAdapter {
+        fn provider(&self) -> Provider {
+            self.sample.provider.clone()
+        }
+        fn capabilities(&self) -> Capabilities {
+            caps(false, false, false)
+        }
+        async fn fetch_usage(&self, _: Option<&AccountId>) -> AdapterResult<UsageSample> {
+            self.provider_requests.fetch_add(1, Ordering::SeqCst);
+            Ok(self.sample.clone())
+        }
+        async fn detect_stop(&self, _: &SessionId) -> AdapterResult<Option<StopReason>> {
+            self.provider_requests.fetch_add(1, Ordering::SeqCst);
+            Ok(self.stop.clone())
+        }
+        async fn emit_status(
+            &self,
+            _: &SessionId,
+            _: StatusEvent,
+        ) -> AdapterResult<DeliveryOutcome> {
+            Err(AdapterError::Unsupported)
+        }
+        async fn advise(&self, _: &SessionId, _: &str) -> AdapterResult<DeliveryOutcome> {
+            Err(AdapterError::Unsupported)
+        }
+        async fn compact(
+            &self,
+            _: &SessionSummary,
+            _: &CompactionRequest,
+        ) -> AdapterResult<DeliveryOutcome> {
+            Err(AdapterError::Unsupported)
+        }
+        async fn resume_session(&self, _: &SessionSummary, _: Option<&str>) -> AdapterResult<()> {
+            Err(AdapterError::Unsupported)
+        }
+    }
+
     #[tokio::test]
     async fn observation_tick_polls_usage_and_records_detected_stops() {
         let now = Utc::now();
@@ -2281,6 +2379,58 @@ mod tests {
                 SessionId("s".into()),
                 StopReason::UsageLimit { window: key }
             )]
+        );
+    }
+
+    #[tokio::test]
+    async fn observation_tick_reuses_one_provider_fetch_for_every_session_stop_check() {
+        let key = WindowKey {
+            provider: Provider::Codex,
+            kind: WindowKind::Rolling { minutes: 300 },
+        };
+        let now = Utc::now();
+        let mut first = session();
+        first.id = SessionId("first".into());
+        first.harness = Provider::Codex;
+        let mut second = first.clone();
+        second.id = SessionId("second".into());
+        let store = ObservationFake {
+            sessions: vec![first, second],
+            samples: StdMutex::new(vec![]),
+            stops: StdMutex::new(vec![]),
+            last_hook_event: None,
+        };
+        let provider_requests = Arc::new(AtomicUsize::new(0));
+        let adapter = Arc::new(ProviderRequestCountingAdapter {
+            sample: UsageSample {
+                at: now,
+                fetched_at: Some(now),
+                source: UsageSource::ProviderReported,
+                provider: Provider::Codex,
+                account: None,
+                windows: HashMap::from([(
+                    key.clone(),
+                    UsageWindowState::new(100.0, true, true, None, None),
+                )]),
+                credits: None,
+            },
+            stop: Some(StopReason::UsageLimit { window: key }),
+            provider_requests: provider_requests.clone(),
+        });
+
+        let report = run_observation_tick(
+            &store,
+            &HashMap::from([(Provider::Codex, adapter as Arc<dyn HarnessAdapter>)]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.samples_recorded, 1);
+        assert_eq!(report.stops_recorded, 2);
+        assert_eq!(
+            provider_requests.load(Ordering::SeqCst),
+            1,
+            "the provider sample fetched at the start of the tick must drive all stop checks"
         );
     }
 
@@ -2570,6 +2720,100 @@ mod tests {
         .await;
         assert!(result.is_err(), "the scheduler should keep running");
         assert!(*compacted.lock().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn production_hot_ticks_do_not_repeat_usage_pruning() {
+        let path = std::env::temp_dir().join(format!(
+            "uw-maintenance-cadence-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let path_string = path.to_string_lossy().into_owned();
+        let daemon_store = Arc::new(SqliteDaemonStore::new(Store::open(&path_string).unwrap()));
+        let provider = Provider::Other("cadence-probe".into());
+        let window = WindowKey {
+            provider: provider.clone(),
+            kind: WindowKind::Rolling { minutes: 60 },
+        };
+        let now = Utc::now();
+        let provider_requests = Arc::new(AtomicUsize::new(0));
+        let adapter = Arc::new(ProviderRequestCountingAdapter {
+            sample: UsageSample {
+                at: now,
+                fetched_at: Some(now),
+                source: UsageSource::ProviderReported,
+                provider: provider.clone(),
+                account: None,
+                windows: HashMap::from([(
+                    window.clone(),
+                    UsageWindowState::new(5.0, false, true, None, None),
+                )]),
+                credits: None,
+            },
+            stop: None,
+            provider_requests: provider_requests.clone(),
+        });
+        let adapters = HashMap::from([(provider.clone(), adapter as Arc<dyn HarnessAdapter>)]);
+        let daemon = tokio::spawn(async move {
+            run_production_ticks(
+                daemon_store,
+                &adapters,
+                &AlwaysIdle,
+                std::time::Duration::from_millis(10),
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while provider_requests.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the hot observation loop did not start");
+
+        let old_at = now - Duration::days(31);
+        let old = UsageSample {
+            at: old_at,
+            fetched_at: Some(old_at),
+            source: UsageSource::ProviderReported,
+            provider,
+            account: None,
+            windows: HashMap::from([(
+                window,
+                UsageWindowState::new(1.0, false, true, None, None),
+            )]),
+            credits: None,
+        };
+        Store::open(&path_string)
+            .unwrap()
+            .insert_usage_sample(&old)
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while provider_requests.load(Ordering::SeqCst) < 5 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the hot observation loop did not advance");
+        daemon.abort();
+        let _ = daemon.await;
+
+        let old_sample_survived = Store::open(&path_string)
+            .unwrap()
+            .all_usage_samples()
+            .unwrap()
+            .into_iter()
+            .any(|sample| sample.at == old_at);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+
+        assert!(
+            old_sample_survived,
+            "pruning must not run again during successive hot observation ticks"
+        );
     }
 
     #[tokio::test]

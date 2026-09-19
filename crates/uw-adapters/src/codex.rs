@@ -5,12 +5,28 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::LazyLock;
 use uw_core::adapter::{
     AdapterError, AdapterResult, Capabilities, DeliveryOutcome, DiscoveredSession, HarnessAdapter,
     SeedContext, SeedMode, StatusEvent, TokenUsageRecord, TurnPreview, TurnRole,
 };
 use uw_core::model::*;
+
+#[cfg(test)]
+static ROLLOUT_SCAN_COUNTS: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn rollout_scan_count(path: &std::path::Path) -> usize {
+    ROLLOUT_SCAN_COUNTS
+        .lock()
+        .unwrap()
+        .get(path)
+        .copied()
+        .unwrap_or_default()
+}
 
 #[async_trait]
 pub trait AppServerTransport: Send + Sync {
@@ -142,6 +158,12 @@ pub struct CodexAdapter {
     now: Arc<dyn Fn() -> chrono::DateTime<Utc> + Send + Sync>,
     hook: Option<Arc<dyn crate::claude_code::HookChannel>>,
     sessions_root: Option<PathBuf>,
+    discovery_cache: Mutex<HashMap<PathBuf, CachedRollout>>,
+}
+
+struct CachedRollout {
+    fingerprint: (u64, Option<std::time::SystemTime>),
+    session: DiscoveredSession,
 }
 impl CodexAdapter {
     pub fn new(transport: Arc<dyn AppServerTransport>) -> Self {
@@ -151,6 +173,7 @@ impl CodexAdapter {
             now: Arc::new(Utc::now),
             hook: None,
             sessions_root: None,
+            discovery_cache: Mutex::new(HashMap::new()),
         }
     }
     pub fn real() -> Self {
@@ -226,6 +249,10 @@ impl HarnessAdapter for CodexAdapter {
     async fn fetch_usage(&self, _: Option<&AccountId>) -> AdapterResult<UsageSample> {
         let result = self.limits().await?;
         let limits = Self::rate_limits(&result)?;
+        let limited = limits
+            .get("rateLimitReachedType")
+            .is_some_and(|v| !v.is_null())
+            || result.get("ordinaryUsageAllowed").and_then(Value::as_bool) == Some(false);
         let mut windows = HashMap::new();
         for name in ["primary", "secondary"] {
             if let Some(w) = limits.get(name) {
@@ -248,7 +275,7 @@ impl HarnessAdapter for CodexAdapter {
                         provider: Provider::Codex,
                         kind: WindowKind::Rolling { minutes: mins },
                     },
-                    UsageWindowState::new(pct, false, true, reset, None),
+                    UsageWindowState::new(pct, limited, true, reset, None),
                 );
             }
         }
@@ -286,6 +313,20 @@ impl HarnessAdapter for CodexAdapter {
             }));
         }
         Ok(None)
+    }
+    async fn detect_stop_with_usage(
+        &self,
+        session_id: &SessionId,
+        sample: Option<&UsageSample>,
+    ) -> AdapterResult<Option<StopReason>> {
+        let Some(sample) = sample else {
+            return self.detect_stop(session_id).await;
+        };
+        Ok(sample
+            .windows
+            .iter()
+            .find(|(_, window)| window.exceeded)
+            .map(|(window, _)| StopReason::UsageLimit { window: window.clone() }))
     }
     async fn emit_status(
         &self,
@@ -407,14 +448,40 @@ impl HarnessAdapter for CodexAdapter {
 
     async fn discover_sessions(&self) -> AdapterResult<Vec<DiscoveredSession>> {
         let root = self.resolved_sessions_root();
-        tokio::task::spawn_blocking(move || {
-            rollout_files(&root)
-                .into_iter()
-                .filter_map(|path| scan_rollout(&path))
-                .collect()
-        })
-        .await
-        .map_err(|e| AdapterError::Other(e.to_string()))
+        let mut cache = self
+            .discovery_cache
+            .lock()
+            .map_err(|_| AdapterError::Other("discovery cache poisoned".into()))?;
+        let mut found = Vec::new();
+        for path in rollout_files(&root) {
+            let metadata = match std::fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            let fingerprint = (metadata.len(), metadata.modified().ok());
+            if let Some(cached) = cache.get(&path) {
+                if cached.fingerprint == fingerprint {
+                    found.push(cached.session.clone());
+                    continue;
+                }
+            }
+            let Some(session) = scan_rollout(&path) else {
+                cache.remove(&path);
+                continue;
+            };
+            let returned = cache
+                .get(&path)
+                .map(|old| {
+                    let old_count = old.session.token_usage.len();
+                    let mut delta = session.clone();
+                    delta.token_usage = session.token_usage[old_count.min(session.token_usage.len())..].to_vec();
+                    delta
+                })
+                .unwrap_or_else(|| session.clone());
+            cache.insert(path, CachedRollout { fingerprint, session });
+            found.push(returned);
+        }
+        Ok(found)
     }
 
     async fn session_preview(&self, session: &SessionSummary) -> AdapterResult<Vec<TurnPreview>> {
@@ -477,6 +544,15 @@ fn rollout_files(root: &std::path::Path) -> Vec<PathBuf> {
 /// error — most files under `sessions/` are unrelated or historical. The daemon uses this
 /// scan both to discover new sessions and to refresh token history for known sessions.
 fn scan_rollout(path: &std::path::Path) -> Option<DiscoveredSession> {
+    #[cfg(test)]
+    {
+        *ROLLOUT_SCAN_COUNTS
+            .lock()
+            .unwrap()
+            .entry(path.to_path_buf())
+            .or_default() += 1;
+    }
+
     let file = std::fs::File::open(path).ok()?;
     let mut lines = std::io::BufReader::new(file).lines();
 
@@ -669,6 +745,23 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use uw_core::adapter::{Capabilities, HarnessAdapter};
+
+    fn write_incremental_rollout(root: &std::path::Path, id: &str) -> std::path::PathBuf {
+        let day_dir = root.join("2026/09/17");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join(format!("rollout-2026-09-17T17-32-31-{id}.jsonl"));
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"timestamp":"2026-09-17T23:32:32Z","type":"session_meta","payload":{{"session_id":"{id}","cwd":"/tmp/project"}}}}
+{{"timestamp":"2026-09-17T23:32:33Z","type":"turn_context","payload":{{"model":"gpt-5.6-luna"}}}}
+{{"timestamp":"2026-09-17T23:32:34Z","type":"token_usage_record","payload":{{"usage":{{"input_tokens":10,"total_tokens":11}}}}}}
+"#
+            ),
+        )
+        .unwrap();
+        path
+    }
 
     /// A fake `codex app-server`: appends to a marker file once per process
     /// start (not per request), then answers each JSON-RPC request line with
@@ -1154,6 +1247,73 @@ done
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn discover_sessions_does_not_reparse_an_unchanged_rollout() {
+        let script = FakeAppServerScript::write();
+        let root = std::env::temp_dir().join(format!("uw-codex-sessions-{}", uuid::Uuid::new_v4()));
+        let id = "01a0b1b6-f024-7b73-a5fc-a6ea05f0a580";
+        let rollout_path = write_incremental_rollout(&root, id);
+        let adapter =
+            CodexAdapter::new(Arc::new(script.transport())).with_sessions_root(root.clone());
+
+        adapter.discover_sessions().await.unwrap();
+        let scans_after_first_discovery = rollout_scan_count(&rollout_path);
+        adapter.discover_sessions().await.unwrap();
+        let scans_after_second_discovery = rollout_scan_count(&rollout_path);
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(scans_after_first_discovery, 1);
+        assert_eq!(
+            scans_after_second_discovery, scans_after_first_discovery,
+            "an unchanged rollout must be served from discovery state without reparsing"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_sessions_parses_only_content_appended_since_the_previous_scan() {
+        use std::io::Write as _;
+
+        let script = FakeAppServerScript::write();
+        let root = std::env::temp_dir().join(format!("uw-codex-sessions-{}", uuid::Uuid::new_v4()));
+        let id = "01a0b1b6-f024-7b73-a5fc-a6ea05f0a581";
+        let rollout_path = write_incremental_rollout(&root, id);
+        let adapter =
+            CodexAdapter::new(Arc::new(script.transport())).with_sessions_root(root.clone());
+
+        let initial = adapter.discover_sessions().await.unwrap();
+        assert_eq!(initial[0].token_usage.len(), 1);
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&rollout_path)
+                .unwrap(),
+            r#"{{"timestamp":"2026-09-17T23:33:00Z","type":"token_usage_record","payload":{{"usage":{{"input_tokens":20,"total_tokens":22}}}}}}"#
+        )
+        .unwrap();
+
+        let appended = adapter.discover_sessions().await.unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(appended.len(), 1);
+        assert_eq!(
+            appended[0].token_usage,
+            vec![TokenUsageRecord {
+                at: DateTime::parse_from_rfc3339("2026-09-17T23:33:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                model: Some(ModelId("gpt-5.6-luna".into())),
+                input_tokens: 20,
+                cached_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                output_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 22,
+            }],
+            "a growing rollout must emit only records beyond the saved byte offset"
+        );
+        assert_eq!(appended[0].last_known_token_count, Some(22));
     }
 
     #[tokio::test]

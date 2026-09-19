@@ -117,6 +117,15 @@ pub trait HarnessAdapter: Send + Sync {
     fn capabilities(&self) -> Capabilities;
     async fn fetch_usage(&self, account: Option<&AccountId>) -> AdapterResult<UsageSample>;
     async fn detect_stop(&self, session_id: &SessionId) -> AdapterResult<Option<StopReason>>;
+    /// Check for a stop using a provider sample already fetched in this tick.
+    /// Adapters that need a separate signal may fall back to `detect_stop`.
+    async fn detect_stop_with_usage(
+        &self,
+        session_id: &SessionId,
+        _sample: Option<&UsageSample>,
+    ) -> AdapterResult<Option<StopReason>> {
+        self.detect_stop(session_id).await
+    }
     async fn emit_status(
         &self,
         session_id: &SessionId,

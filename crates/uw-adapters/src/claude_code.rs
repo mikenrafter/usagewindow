@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use uw_core::adapter::{
     AdapterError, AdapterResult, Capabilities, DeliveryOutcome, DiscoveredSession,
     HarnessAdapter, SeedContext, SeedMode, StatusEvent, TokenUsageRecord,
@@ -193,6 +194,12 @@ pub struct ClaudeCodeAdapter {
     messenger: Option<Arc<dyn SessionMessenger>>,
     spawner: Arc<dyn ProcessSpawner>,
     transcript_fs: Arc<dyn TranscriptFileSystem>,
+    discovery_cache: Mutex<HashMap<String, CachedTranscript>>,
+}
+
+struct CachedTranscript {
+    fingerprint: (u64, Option<std::time::SystemTime>),
+    session: DiscoveredSession,
 }
 impl ClaudeCodeAdapter {
     pub fn real(cache_path: impl Into<std::path::PathBuf>, version: impl Into<String>) -> Self {
@@ -221,6 +228,7 @@ impl ClaudeCodeAdapter {
             messenger: None,
             spawner: Arc::new(crate::process::TokioProcessSpawner),
             transcript_fs: Arc::new(ClaudeTranscriptFileSystem),
+            discovery_cache: Mutex::new(HashMap::new()),
         }
     }
     pub fn capabilities_static() -> Capabilities {
@@ -474,8 +482,31 @@ impl HarnessAdapter for ClaudeCodeAdapter {
     async fn discover_sessions(&self) -> AdapterResult<Vec<DiscoveredSession>> {
         let mut discovered = Vec::new();
         for path in self.transcript_fs.jsonl_files().await? {
+            let fingerprint = tokio::fs::metadata(&path)
+                .await
+                .ok()
+                .map(|metadata| (metadata.len(), metadata.modified().ok()));
+            if let Some(fingerprint) = fingerprint {
+                let cached = self
+                    .discovery_cache
+                    .lock()
+                    .map_err(|_| AdapterError::Other("discovery cache poisoned".into()))?;
+                if cached
+                    .get(&path)
+                    .is_some_and(|entry| entry.fingerprint == fingerprint)
+                {
+                    discovered.push(cached.get(&path).unwrap().session.clone());
+                    continue;
+                }
+            }
             let content = self.transcript_fs.read_to_string(&path).await?;
             if let Some(session) = scan_transcript(&path, &content) {
+                if let Some(fingerprint) = fingerprint {
+                    self.discovery_cache
+                        .lock()
+                        .map_err(|_| AdapterError::Other("discovery cache poisoned".into()))?
+                        .insert(path, CachedTranscript { fingerprint, session: session.clone() });
+                }
                 discovered.push(session);
             }
         }

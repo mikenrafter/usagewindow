@@ -95,6 +95,13 @@ impl HarnessAdapter for FallbackCompactionAdapter {
     async fn detect_stop(&self, session_id: &SessionId) -> AdapterResult<Option<StopReason>> {
         self.native.detect_stop(session_id).await
     }
+    async fn detect_stop_with_usage(
+        &self,
+        session_id: &SessionId,
+        sample: Option<&UsageSample>,
+    ) -> AdapterResult<Option<StopReason>> {
+        self.native.detect_stop_with_usage(session_id, sample).await
+    }
     async fn emit_status(
         &self,
         session_id: &SessionId,
