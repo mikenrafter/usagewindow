@@ -1,5 +1,7 @@
 # usagewindow
 
+> This is currently a W.I.P. If you choose to try it out, there may be bugs, security or performance issues, or unintuitive UX. You have been warned.
+
 Harness-agnostic usage-window tracking, resume scheduling, and compaction assistance for
 coding-agent CLIs (Claude Code, Codex, and others via a pluggable adapter).
 
