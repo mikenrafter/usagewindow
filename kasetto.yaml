@@ -22,6 +22,6 @@ commands:
 mcps:
   - source: https://github.com/mikenrafter/usagewindow
     ref: 9ce03aa70a7f20a30f743dcbac5370d6029f18e9
-    sub-dir: agent-integration
     mcps:
-      - usagewindow
+      - name: usagewindow
+        path: agent-integration/mcps
