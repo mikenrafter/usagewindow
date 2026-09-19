@@ -1,8 +1,11 @@
 {
   "mcpServers": {
     "usagewindow": {
-      "type": "http",
-      "url": "http://127.0.0.1:7880/mcp"
+      "command": "uw-mcp",
+      "args": ["--stdio"],
+      "env": {
+        "UW_DB_PATH": "/home/v0id/.usagewindow/usagewindow.db"
+      }
     }
   }
 }
