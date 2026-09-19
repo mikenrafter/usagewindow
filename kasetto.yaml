@@ -6,13 +6,16 @@ agent:
 destination: ~/.config/kasetto
 
 skills:
-  - name: usagewindow-status
-    source: ./agent-integration/skills/usagewindow-status
+  - source: ./agent-integration/skills
+    skills:
+      - usagewindow-status
 
 commands:
-  - name: uw-mark-resume
-    source: ./agent-integration/commands/uw-mark-resume
+  - source: ./agent-integration/commands
+    commands:
+      - uw-mark-resume
 
-mcp:
-  - name: usagewindow
-    source: ./agent-integration/mcp/usagewindow
+mcps:
+  - source: ./agent-integration/mcp/usagewindow
+    mcps:
+      - usagewindow

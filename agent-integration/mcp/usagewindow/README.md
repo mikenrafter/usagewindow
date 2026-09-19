@@ -1,13 +1,18 @@
 # usagewindow MCP server
 
-Kasetto should register the long-running `uw-mcp` HTTP endpoint. The executable is in
+Kasetto registers the long-running `uw-mcp` HTTP endpoint. The executable is in
 this repository's `packages.${system}.default` Nix output and listens on
 `127.0.0.1:7880` by default.
 
-```yaml
-name: usagewindow
-transport: http
-url: http://127.0.0.1:7880/mcp
+```json
+{
+  "mcpServers": {
+    "usagewindow": {
+      "type": "http",
+      "url": "http://127.0.0.1:7880/mcp"
+    }
+  }
+}
 ```
 
 It exposes `get_usage`, `get_resume_state`, and the capability-gated
