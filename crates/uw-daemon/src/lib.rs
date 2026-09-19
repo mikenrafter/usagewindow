@@ -451,13 +451,8 @@ impl DaemonStore for SqliteDaemonStore {
     async fn usage_samples(&self, session: &SessionSummary) -> anyhow::Result<Vec<UsageSample>> {
         let provider = session.harness.clone();
         let account = session.account.clone();
-        self.blocking(move |s| {
-            Ok(s.all_usage_samples()?
-                .into_iter()
-                .filter(|sample| sample.provider == provider && sample.account == account)
-                .collect())
-        })
-        .await
+        self.blocking(move |s| Ok(s.usage_samples_for(&provider, account.as_ref())?))
+            .await
     }
     async fn token_usage(&self, id: &SessionId) -> anyhow::Result<Vec<TokenUsageRecord>> {
         let id = id.clone();
@@ -992,7 +987,7 @@ pub async fn run_compaction_tick(
 }
 
 pub async fn run_near_limit_tick(
-    store: &dyn DaemonStore,
+    samples: &[UsageSample],
     adapter: &dyn HarnessAdapter,
     session: &SessionSummary,
     key: &WindowKey,
@@ -1000,8 +995,7 @@ pub async fn run_near_limit_tick(
     last_asked_pct: Option<f32>,
     asks_this_epoch: u32,
 ) -> anyhow::Result<NearLimitOutcome> {
-    let samples = store.usage_samples(session).await?;
-    let blocks = uw_policy::segment_blocks(&samples, key, session.account.as_ref());
+    let blocks = uw_policy::segment_blocks(samples, key, session.account.as_ref());
     let Some(block) = blocks.last() else {
         return Ok(NearLimitOutcome::NoData);
     };
@@ -1116,7 +1110,7 @@ pub async fn run_policy_tick(
             let ask_key = (session.id.clone(), key.clone(), block.resets_at);
             let previous = state.asked.get(&ask_key).copied();
             let outcome = run_near_limit_tick(
-                store,
+                &samples,
                 adapter.as_ref(),
                 session,
                 &key,
@@ -2597,23 +2591,14 @@ mod tests {
             )]),
             credits: None,
         };
-        let store = FakeStore {
-            request: StdMutex::new(None),
-            owner: session(),
-            claim: true,
-            status: StdMutex::new(vec![]),
-            samples: vec![make(now - Duration::minutes(31), 0.0), make(now, 99.0)],
-            enqueues: Arc::new(StdMutex::new(0)),
-            active_resume: None,
-            resolved: Arc::new(StdMutex::new(vec![])),
-        };
+        let samples = vec![make(now - Duration::minutes(31), 0.0), make(now, 99.0)];
         let adapter = FakeAdapter {
             capabilities: caps(false, false, false),
             compacted: Arc::new(StdMutex::new(0)),
             advised: Arc::new(StdMutex::new(0)),
         };
         let result = run_near_limit_tick(
-            &store,
+            &samples,
             &adapter,
             &session(),
             &key,

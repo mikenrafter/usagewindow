@@ -70,43 +70,39 @@ impl Store {
         Ok(id)
     }
     pub fn read_usage_sample(&self, id: i64) -> StoreResult<UsageSample> {
-        let r=self.connection.query_row("SELECT provider,account,window_kind,window_scope_value,pct,resets_at,exceeded,active,source,at,fetched_at,credits_json FROM usage_samples WHERE id=?",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,f32>(4)?,r.get(5)?,r.get::<_,i64>(6)?,r.get::<_,i64>(7)?,r.get::<_,String>(8)?,r.get(9)?,r.get(10)?,r.get::<_,Option<String>>(11)?))).optional()?.ok_or(StoreError::NotFound)?;
-        let provider: Provider = serde_json::from_str(&r.0)?;
-        let account: Option<AccountId> = r.1.map(|x| serde_json::from_str(&x)).transpose()?;
-        let at: DateTime<Utc> = r.9;
-        let fetched_at: Option<DateTime<Utc>> = r.10;
-        Ok(UsageSample {
-            at,
-            fetched_at,
-            source: serde_json::from_str(&r.8)?,
-            provider: provider.clone(),
-            account,
-            windows: std::collections::HashMap::from([(
-                WindowKey {
-                    provider,
-                    kind: decode_kind(&r.2, &r.3),
-                },
-                UsageWindowState {
-                    pct: r.4,
-                    resets_at: r.5,
-                    exceeded: r.6 != 0,
-                    active: r.7 != 0,
-                    scope: None,
-                },
-            )]),
-            credits: r.11.map(|x| serde_json::from_str(&x)).transpose()?,
-        })
+        self.connection
+            .query_row(
+                "SELECT provider,account,window_kind,window_scope_value,pct,resets_at,exceeded,active,source,at,fetched_at,credits_json FROM usage_samples WHERE id=?",
+                [id],
+                decode_usage_sample_row,
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)
     }
+    /// Single query, decoded row-by-row — replaces the old id-then-refetch (N+1) path.
     pub fn all_usage_samples(&self) -> StoreResult<Vec<UsageSample>> {
-        let mut stmt = self
-            .connection
-            .prepare("SELECT id FROM usage_samples ORDER BY at,id")?;
-        let ids: Vec<i64> = stmt
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
-        ids.into_iter()
-            .map(|id| self.read_usage_sample(id))
-            .collect()
+        let mut stmt = self.connection.prepare(
+            "SELECT provider,account,window_kind,window_scope_value,pct,resets_at,exceeded,active,source,at,fetched_at,credits_json FROM usage_samples ORDER BY at,id",
+        )?;
+        let rows = stmt.query_map([], decode_usage_sample_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+    /// Same rows as `all_usage_samples`, filtered at the SQL layer (hits the
+    /// `(provider,window_kind,window_scope_value,at)` index) instead of loading every
+    /// provider's/account's history just to discard most of it in Rust afterward.
+    pub fn usage_samples_for(
+        &self,
+        provider: &Provider,
+        account: Option<&AccountId>,
+    ) -> StoreResult<Vec<UsageSample>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT provider,account,window_kind,window_scope_value,pct,resets_at,exceeded,active,source,at,fetched_at,credits_json FROM usage_samples WHERE provider=?1 AND account IS ?2 ORDER BY at,id",
+        )?;
+        let rows = stmt.query_map(
+            params![json(provider)?, account.map(json).transpose()?],
+            decode_usage_sample_row,
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
     pub fn prune_usage_before(&self, cutoff: DateTime<Utc>) -> StoreResult<usize> {
         Ok(self
@@ -809,6 +805,52 @@ fn decode_resume_status(status: &str, detail: Option<String>) -> ResumeStatus {
         "cancelled" => ResumeStatus::Cancelled,
         _ => ResumeStatus::Failed(detail.unwrap_or_else(|| "unknown failure".into())),
     }
+}
+fn json_err(e: serde_json::Error) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+}
+fn decode_usage_sample_row(row: &rusqlite::Row) -> rusqlite::Result<UsageSample> {
+    let provider: String = row.get(0)?;
+    let account: Option<String> = row.get(1)?;
+    let window_kind: String = row.get(2)?;
+    let window_scope_value: String = row.get(3)?;
+    let pct: f32 = row.get(4)?;
+    let resets_at = row.get(5)?;
+    let exceeded: i64 = row.get(6)?;
+    let active: i64 = row.get(7)?;
+    let source: String = row.get(8)?;
+    let at: DateTime<Utc> = row.get(9)?;
+    let fetched_at: Option<DateTime<Utc>> = row.get(10)?;
+    let credits_json: Option<String> = row.get(11)?;
+    let provider: Provider = serde_json::from_str(&provider).map_err(json_err)?;
+    let account: Option<AccountId> = account
+        .map(|x| serde_json::from_str(&x))
+        .transpose()
+        .map_err(json_err)?;
+    Ok(UsageSample {
+        at,
+        fetched_at,
+        source: serde_json::from_str(&source).map_err(json_err)?,
+        provider: provider.clone(),
+        account,
+        windows: std::collections::HashMap::from([(
+            WindowKey {
+                provider,
+                kind: decode_kind(&window_kind, &window_scope_value),
+            },
+            UsageWindowState {
+                pct,
+                resets_at,
+                exceeded: exceeded != 0,
+                active: active != 0,
+                scope: None,
+            },
+        )]),
+        credits: credits_json
+            .map(|x| serde_json::from_str(&x))
+            .transpose()
+            .map_err(json_err)?,
+    })
 }
 fn decode_resume_marker_row(row: &rusqlite::Row) -> rusqlite::Result<ResumeMarker> {
     let id: String = row.get(0)?;
