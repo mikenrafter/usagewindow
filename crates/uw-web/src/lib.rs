@@ -2,10 +2,12 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{Path, Query, State},
-    http::{StatusCode, header},
-    response::Response,
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use chrono::{Duration, Utc};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
@@ -24,6 +26,99 @@ struct Assets;
 pub struct AppState {
     store: Arc<Mutex<Store>>,
     adapters: Arc<HashMap<Provider, Arc<dyn HarnessAdapter>>>,
+    auth: Arc<WebAuth>,
+}
+
+const SESSION_COOKIE: &str = "uw_session";
+const MAX_FAILED_LOGINS: u8 = 4;
+
+struct WebAuth {
+    password_hash: Option<String>,
+    state: Mutex<AuthState>,
+}
+
+struct AuthState {
+    failed_logins: u8,
+    sessions: std::collections::HashSet<String>,
+}
+
+impl WebAuth {
+    fn new(password_hash: Option<String>) -> anyhow::Result<Self> {
+        if let Some(hash) = &password_hash {
+            PasswordHash::new(hash).map_err(|error| anyhow::anyhow!("invalid password verifier: {error:?}"))?;
+        }
+        Ok(Self {
+            password_hash,
+            state: Mutex::new(AuthState {
+                failed_logins: 0,
+                sessions: std::collections::HashSet::new(),
+            }),
+        })
+    }
+
+    fn enabled(&self) -> bool {
+        self.password_hash.is_some()
+    }
+
+    fn authenticated(&self, headers: &HeaderMap) -> bool {
+        if !self.enabled() {
+            return true;
+        }
+        let Some(token) = cookie(headers, SESSION_COOKIE) else {
+            return false;
+        };
+        self.state
+            .lock()
+            .is_ok_and(|state| state.sessions.contains(token))
+    }
+
+    fn login(&self, password: &str) -> LoginResult {
+        let valid = self.password_hash.as_ref().is_some_and(|hash| {
+            PasswordHash::new(hash)
+                .ok()
+                .is_some_and(|parsed| Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok())
+        });
+        let Ok(mut state) = self.state.lock() else {
+            return LoginResult::Locked;
+        };
+        if !valid {
+            state.failed_logins = state.failed_logins.saturating_add(1);
+            return if state.failed_logins >= MAX_FAILED_LOGINS {
+                LoginResult::Locked
+            } else {
+                LoginResult::Invalid
+            };
+        }
+        state.failed_logins = 0;
+        let token = uuid::Uuid::new_v4().to_string();
+        state.sessions.insert(token.clone());
+        LoginResult::Authenticated(token)
+    }
+
+    fn logout(&self, headers: &HeaderMap) {
+        let Some(token) = cookie(headers, SESSION_COOKIE) else {
+            return;
+        };
+        if let Ok(mut state) = self.state.lock() {
+            state.sessions.remove(token);
+        }
+    }
+}
+
+enum LoginResult {
+    Authenticated(String),
+    Invalid,
+    Locked,
+}
+
+fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix(&format!("{name}=")))
 }
 
 /// For callers with no live adapters to offer (tests, or read-only tooling) — every
@@ -36,7 +131,16 @@ pub fn app_with_adapters(
     store: Store,
     adapters: HashMap<Provider, Arc<dyn HarnessAdapter>>,
 ) -> Router {
-    Router::new()
+    app_with_adapters_and_auth(store, adapters, None).expect("disabled web auth is valid")
+}
+
+pub fn app_with_adapters_and_auth(
+    store: Store,
+    adapters: HashMap<Provider, Arc<dyn HarnessAdapter>>,
+    password_hash: Option<String>,
+) -> anyhow::Result<Router> {
+    let auth = Arc::new(WebAuth::new(password_hash)?);
+    let protected = Router::new()
         .route("/api/status", get(status))
         .route("/api/sessions", get(sessions).post(create_session))
         .route(
@@ -52,11 +156,83 @@ pub fn app_with_adapters(
         .route("/api/hooks", post(hook_ingress))
         .route("/api/thresholds", get(thresholds_get).post(thresholds_set))
         .route("/api/compactions/recent", get(compactions_recent))
+        .route("/api/actions/recent", get(actions_recent))
+        .layer(middleware::from_fn_with_state(Arc::clone(&auth), authorize));
+    Ok(Router::new()
+        .route("/api/auth/status", get(auth_status))
+        .route("/api/auth/login", post(auth_login))
+        .route("/api/auth/logout", post(auth_logout))
+        .merge(protected)
         .fallback(static_asset)
         .with_state(AppState {
             store: Arc::new(Mutex::new(store)),
             adapters: Arc::new(adapters),
-        })
+            auth,
+        }))
+}
+
+async fn authorize(
+    State(auth): State<Arc<WebAuth>>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    // Harness hook processes call this local endpoint directly and do not have
+    // a browser session. The handler only validates and records hook payloads;
+    // all model-control UI routes remain behind auth.
+    if request.uri().path() == "/api/hooks" || auth.authenticated(request.headers()) {
+        next.run(request).await
+    } else {
+        (StatusCode::UNAUTHORIZED, "authentication required").into_response()
+    }
+}
+
+async fn auth_status(State(state): State<AppState>, headers: HeaderMap) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "enabled": state.auth.enabled(),
+        "authenticated": state.auth.authenticated(&headers),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginRequest {
+    password: String,
+}
+
+async fn auth_login(
+    State(state): State<AppState>,
+    Json(request): Json<LoginRequest>,
+) -> Response {
+    if !state.auth.enabled() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    match state.auth.login(&request.password) {
+        LoginResult::Authenticated(token) => {
+            let mut response = Json(serde_json::json!({"authenticated": true})).into_response();
+            let value = format!(
+                "{SESSION_COOKIE}={token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=86400"
+            );
+            if let Ok(value) = HeaderValue::from_str(&value) {
+                response.headers_mut().insert(header::SET_COOKIE, value);
+            }
+            response
+        }
+        LoginResult::Invalid => (StatusCode::UNAUTHORIZED, "invalid password").into_response(),
+        LoginResult::Locked => {
+            // A clean exit is intentional: systemd's Restart=on-failure will not
+            // restart a manually locked service. An operator must restart it.
+            std::process::exit(0);
+        }
+    }
+}
+
+async fn auth_logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    state.auth.logout(&headers);
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_static("uw_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0"),
+    );
+    response
 }
 
 #[derive(Debug, Deserialize)]
@@ -379,6 +555,7 @@ const MAX_SESSIONS_LIMIT: u32 = 200;
 
 #[derive(Debug, Deserialize, Default)]
 struct SessionsQuery {
+    inactive: Option<bool>,
     stopped: Option<bool>,
     harness: Option<String>,
     q: Option<String>,
@@ -391,26 +568,32 @@ async fn sessions(
     Query(query): Query<SessionsQuery>,
 ) -> Result<Json<SessionsPage>, (StatusCode, String)> {
     let harness: Option<Provider> = query.harness.and_then(|value| value.parse().ok());
-    let include_stopped = query.stopped.unwrap_or(false);
+    let include_inactive = query.inactive.or(query.stopped).unwrap_or(false);
     let offset = query.offset.unwrap_or(0);
     let limit = query.limit.unwrap_or(DEFAULT_SESSIONS_LIMIT).min(MAX_SESSIONS_LIMIT);
     Ok(Json(
         read(state, move |store| {
             let mut matching = Vec::new();
+            let now = Utc::now();
             for s in store.search_sessions(query.q.as_deref())? {
+                let active = s.stopped_reason.is_none()
+                    && store
+                        .token_usage_for_session(&s.id)?
+                        .into_iter()
+                        .any(|record| record.at >= now - Duration::minutes(30) && record.total_tokens > 0);
                 if !harness.as_ref().is_none_or(|h| h == &s.harness)
-                    || (!include_stopped && s.stopped_reason.is_some())
+                    || (!include_inactive && !active)
                 {
                     continue;
                 }
-                matching.push(s);
+                matching.push((s, active));
             }
             let total = matching.len() as u32;
             // Filtering (harness/stopped/q) happens above in Rust rather than SQL, so
             // pagination is a plain slice here too — this DB is small/local and doing
             // it in SQL would require duplicating those filters in the query.
             let mut items = Vec::new();
-            for s in matching
+            for (s, active) in matching
                 .into_iter()
                 .skip(offset as usize)
                 .take(limit as usize)
@@ -427,6 +610,7 @@ async fn sessions(
                     .keepalive_config(&s.id)
                     .map(|k| k.enabled)
                     .unwrap_or(false);
+                let cached = store.session_cache_warm(&s.id, now)?;
                 items.push(SessionListItem {
                     id: s.id,
                     harness: s.harness,
@@ -437,6 +621,8 @@ async fn sessions(
                     resume_status,
                     compaction_status,
                     keepalive,
+                    active,
+                    cached,
                 });
             }
             Ok(SessionsPage { items, total, offset, limit })
@@ -460,6 +646,18 @@ fn detail(store: &Store, id: &SessionId) -> anyhow::Result<SessionDetail> {
             })
         })
         .collect();
+    let compaction_log = store.compaction_requests_for_session(id)?;
+    let mut errors = compaction_log
+        .iter()
+        .filter_map(|request| match &request.status {
+            CompactionStatus::Failed(reason) => Some(format!("Compaction failed: {reason}")),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    errors.extend(markers.iter().filter_map(|marker| match &marker.status {
+        ResumeStatus::Failed(reason) => Some(format!("Resume failed: {reason}")),
+        _ => None,
+    }));
     Ok(SessionDetail {
         summary,
         history,
@@ -467,8 +665,9 @@ fn detail(store: &Store, id: &SessionId) -> anyhow::Result<SessionDetail> {
             can_resume: marker.is_some(),
             marker,
         },
-        compaction_log: store.compaction_requests_for_session(id)?,
+        compaction_log,
         reseed_lineage: vec![],
+        errors,
     })
 }
 
@@ -768,6 +967,79 @@ async fn compactions_recent(
     ))
 }
 
+fn compact_action_status(status: &CompactionStatus) -> (String, Option<String>) {
+    match status {
+        CompactionStatus::Pending => ("pending".into(), None),
+        CompactionStatus::Sending => ("sending".into(), None),
+        CompactionStatus::Sent => ("successful".into(), None),
+        CompactionStatus::Failed(reason) => ("failed".into(), Some(reason.clone())),
+        CompactionStatus::Cancelled => ("cancelled".into(), None),
+    }
+}
+
+fn resume_status(status: &ResumeStatus) -> (String, Option<String>) {
+    match status {
+        ResumeStatus::Pending => ("queued".into(), None),
+        ResumeStatus::Scheduled => ("scheduled".into(), None),
+        ResumeStatus::Fired => ("resumed".into(), None),
+        ResumeStatus::Cancelled => ("cancelled".into(), None),
+        ResumeStatus::Failed(reason) => ("failed".into(), Some(reason.clone())),
+    }
+}
+
+async fn actions_recent(
+    State(state): State<AppState>,
+    Query(query): Query<CompactionsQuery>,
+) -> Result<Json<Vec<RecentAction>>, (StatusCode, String)> {
+    let limit = query.limit.unwrap_or(DEFAULT_COMPACTIONS_LIMIT).min(MAX_COMPACTIONS_LIMIT);
+    Ok(Json(read(state, move |store| {
+        let mut actions = Vec::new();
+        for session in store.list_sessions()? {
+            for request in store.compaction_requests_for_session(&session.id)? {
+                let (status, error) = compact_action_status(&request.status);
+                actions.push(RecentAction {
+                    session_id: session.id.clone(), kind: "compaction".into(),
+                    status, at: request.created_at,
+                    detail: Some(request.reason),
+                    error,
+                });
+            }
+            for event in store.compaction_events_for_session(&session.id)? {
+                actions.push(RecentAction {
+                    session_id: session.id.clone(), kind: "compaction".into(),
+                    status: if event.completed_at.is_some() { "successful".into() } else { "in progress".into() },
+                    at: event.started_at,
+                    detail: event.trigger,
+                    error: None,
+                });
+            }
+            for marker in store.resume_markers_for_session(&session.id)? {
+                let (status, error) = resume_status(&marker.status);
+                actions.push(RecentAction {
+                    session_id: session.id.clone(), kind: "resume".into(),
+                    status, at: marker.created_at,
+                    detail: marker.message,
+                    error,
+                });
+            }
+            if let Ok(keepalive) = store.keepalive_config(&session.id)
+                && keepalive.enabled
+            {
+                actions.push(RecentAction {
+                    session_id: session.id.clone(), kind: "keepalive".into(),
+                    status: "active".into(),
+                    at: keepalive.last_ping_at.unwrap_or(session.last_seen),
+                    detail: None,
+                    error: None,
+                });
+            }
+        }
+        actions.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.session_id.0.cmp(&b.session_id.0)));
+        actions.truncate(limit as usize);
+        Ok(actions)
+    }).await?))
+}
+
 async fn static_asset() -> Response<Body> {
     let Some(asset) = Assets::get("index.html") else {
         return Response::builder()
@@ -785,6 +1057,7 @@ async fn static_asset() -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use argon2::password_hash::{PasswordHasher, SaltString};
     use axum::http::Request;
     use chrono::Utc;
     use std::collections::HashMap;
@@ -868,6 +1141,49 @@ mod tests {
             value.items[0].compaction_status,
             Some(CompactionStatus::Failed("adapter error".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn configured_auth_protects_api_until_password_login() {
+        let hash = Argon2::default()
+            .hash_password(
+                b"correct horse battery staple",
+                &SaltString::encode_b64(b"0123456789abcdef").unwrap(),
+            )
+            .unwrap()
+            .to_string();
+        let router = app_with_adapters_and_auth(Store::open_memory().unwrap(), HashMap::new(), Some(hash)).unwrap();
+
+        let response = router
+            .clone()
+            .oneshot(Request::get("/api/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"password":"correct horse battery staple"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response.headers().get(header::SET_COOKIE).unwrap().clone();
+
+        let response = router
+            .oneshot(
+                Request::get("/api/status")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1328,7 +1644,7 @@ mod tests {
 
         let response = app(store)
             .oneshot(
-                Request::get("/api/sessions?q=usagewindow")
+                Request::get("/api/sessions?q=usagewindow&inactive=true")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1345,6 +1661,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sessions_default_to_active_and_report_cache_state() {
+        let store = Store::open_memory().unwrap();
+        let active = session();
+        let mut inactive = session();
+        inactive.id = SessionId("inactive".into());
+        inactive.last_seen = Utc::now() - chrono::Duration::minutes(31);
+        store.insert_session(&active).unwrap();
+        store.insert_session(&inactive).unwrap();
+        store
+            .insert_token_usage_records(
+                &active.id,
+                &[TokenUsageRecord {
+                    at: Utc::now(),
+                    model: active.model.clone(),
+                    input_tokens: 10,
+                    cached_input_tokens: 5,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 1,
+                    reasoning_output_tokens: 0,
+                    total_tokens: 11,
+                }],
+            )
+            .unwrap();
+
+        let router = app(store);
+        let response = router
+            .clone()
+            .oneshot(Request::get("/api/sessions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let page: SessionsPage = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, active.id);
+        assert!(page.items[0].active);
+        assert!(page.items[0].cached);
+
+        let response = router
+            .oneshot(
+                Request::get("/api/sessions?inactive=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let page: SessionsPage = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page.total, 2);
+    }
+
+    #[tokio::test]
     async fn sessions_are_paginated_with_a_sane_default_and_cap() {
         let store = Store::open_memory().unwrap();
         for i in 0..3 {
@@ -1356,7 +1723,7 @@ mod tests {
         let response = router
             .clone()
             .oneshot(
-                Request::get("/api/sessions?limit=2")
+                Request::get("/api/sessions?limit=2&inactive=true")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1373,7 +1740,7 @@ mod tests {
 
         let response = router
             .oneshot(
-                Request::get("/api/sessions?offset=2&limit=2")
+                Request::get("/api/sessions?offset=2&limit=2&inactive=true")
                     .body(Body::empty())
                     .unwrap(),
             )

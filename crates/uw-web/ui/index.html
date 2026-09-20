@@ -12,7 +12,7 @@
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text); font-size: 14px; }
-  header { display: flex; align-items: center; gap: 1rem; padding: 0.9rem 1.2rem; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  header { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 1rem; padding: 0.9rem 1.2rem; background: var(--bg); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
   header h1 { font-size: 1.1rem; margin: 0; font-weight: 600; }
   header .spacer { flex: 1; }
   header button { background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; }
@@ -41,6 +41,8 @@
   .pill.ok { color: var(--ok); border-color: var(--ok); }
   .pill.pending { color: var(--warn); border-color: var(--warn); }
   .pill.keepalive { color: var(--accent); border-color: var(--accent); }
+  .pill.cached { color: var(--ok); border-color: var(--ok); }
+  .pill.uncached { color: var(--muted); border-color: var(--border); }
   .pill.inline { color: var(--ok); border-color: var(--ok); }
   .pill.external { color: var(--warn); border-color: var(--warn); }
   .muted { color: var(--muted); }
@@ -89,11 +91,24 @@
   .barrow .meta { display: flex; gap: 0.8rem; font-size: 0.72rem; color: var(--muted); margin-top: 0.25rem; flex-wrap: wrap; }
   .barrow .meta b { color: var(--text); }
 
-  .compactrow { border-bottom: 1px solid var(--border); padding: 0.5rem 0; font-size: 0.82rem; }
-  .compactrow:last-child { border-bottom: none; }
-  .compactrow .top { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.2rem; }
-  .compactrow .sid { font-weight: 600; }
-  .compactrow .meta { color: var(--muted); font-size: 0.78rem; display: flex; gap: 0.9rem; flex-wrap: wrap; }
+  .actionrow { border-bottom: 1px solid var(--border); padding: 0.5rem 0; font-size: 0.82rem; }
+  .actionrow:last-child { border-bottom: none; }
+  .actionrow .top { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.2rem; flex-wrap: wrap; }
+  .actionrow .sid { font-weight: 600; }
+  .actionrow .meta { color: var(--muted); font-size: 0.78rem; display: flex; gap: 0.9rem; flex-wrap: wrap; }
+  .actionrow { cursor: pointer; }
+  .actionrow:hover { background: rgba(91,140,255,0.08); }
+  .action-error { color: var(--danger); margin-top: 0.35rem; font-size: 0.78rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .errorbox { border: 1px solid var(--danger); border-radius: 6px; background: rgba(255,91,110,0.08); padding: 0.65rem 0.8rem; margin: 0 0 1rem; }
+  .errorbox h3 { color: var(--danger); font-size: 0.78rem; margin: 0 0 0.4rem; text-transform: uppercase; letter-spacing: 0.04em; }
+  .errorbox ul { margin: 0; padding-left: 1.1rem; color: var(--danger); font-size: 0.82rem; }
+  .usage-layout { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(280px, 1fr); gap: 1rem; align-items: start; }
+  @media (max-width: 800px) { .usage-layout { grid-template-columns: 1fr; } }
+  #login { display: none; position: fixed; inset: 0; z-index: 20; place-items: center; background: rgba(15,17,21,0.92); }
+  #login.show { display: grid; }
+  #login form { width: min(22rem, calc(100vw - 2rem)); background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }
+  #login h2 { margin-bottom: 0.8rem; }
+  #login input { width: 100%; margin-bottom: 0.6rem; }
 </style>
 </head>
 <body>
@@ -103,13 +118,27 @@
   <button id="refresh">Refresh</button>
 </header>
 <div id="banner"></div>
+<div id="login">
+  <form id="login-form">
+    <h2>Authentication required</h2>
+    <input name="password" type="password" autocomplete="current-password" placeholder="password" required autofocus>
+    <div id="login-error" class="err"></div>
+    <button class="action primary" type="submit">Sign in</button>
+  </form>
+</div>
 <main>
   <section class="panel full">
     <div class="panelhead">
       <h2>Usage</h2>
       <span id="usagemeta" class="muted"></span>
     </div>
-    <div id="usagecards" class="cardgrid"><p class="empty">loading…</p></div>
+    <div class="usage-layout">
+      <div id="usagecards" class="cardgrid"><p class="empty">loading…</p></div>
+      <div>
+        <div class="panelhead"><h2>Recent actions</h2><span class="muted" style="font-size:.78rem">latest 20</span></div>
+        <div id="actions"><p class="empty">loading…</p></div>
+      </div>
+    </div>
   </section>
 
   <section class="panel">
@@ -121,7 +150,7 @@
         <option value="Codex">Codex</option>
         <option value="ClaudeCode">ClaudeCode</option>
       </select>
-      <label class="chk"><input type="checkbox" id="stopped"> include stopped sessions</label>
+      <label class="chk"><input type="checkbox" id="inactive"> include inactive sessions</label>
     </div>
     <div id="err" class="err"></div>
     <table>
@@ -150,10 +179,6 @@
     <div id="detail"><p class="empty">Select a session on the left.</p></div>
   </section>
 
-  <section class="panel full">
-    <h2>Recently compacted</h2>
-    <div id="compactions"><p class="empty">loading…</p></div>
-  </section>
 </main>
 
 <script>
@@ -171,9 +196,21 @@ let totalSessions = 0;
 async function api(path, options) {
   const res = await fetch(path, options);
   const text = await res.text();
-  const body = text ? JSON.parse(text) : null;
+  let body = null;
+  try { body = text ? JSON.parse(text) : null; } catch { body = text; }
+  if (res.status === 401 && path !== '/api/auth/login') showLogin();
   if (!res.ok) throw new Error(typeof body === 'string' ? body : (text || res.statusText));
   return body;
+}
+
+function showLogin() {
+  $('#login').classList.add('show');
+  $('#login-form input').focus();
+}
+
+function hideLogin() {
+  $('#login').classList.remove('show');
+  $('#login-error').textContent = '';
 }
 
 function fmtDate(s) {
@@ -206,6 +243,8 @@ function countdown(iso) {
 
 function pillFor(session) {
   const pills = [];
+  pills.push(`<span class="pill ${session.active ? 'ok' : 'stopped'}">${session.active ? 'active' : 'inactive'}</span>`);
+  pills.push(`<span class="pill ${session.cached ? 'cached' : 'uncached'}">${session.cached ? 'cached' : 'uncached'}</span>`);
   if (session.stopped_reason) pills.push('<span class="pill stopped">stopped</span>');
   if (session.resume_status) {
     pills.push(`<span class="pill pending">resume-${escapeHtml(statusName(session.resume_status))}</span>`);
@@ -347,33 +386,27 @@ async function loadStatus() {
   }
 }
 
-async function loadCompactions() {
-  const box = $('#compactions');
+async function loadActions() {
+  const box = $('#actions');
   try {
-    const events = await api('/api/compactions/recent?limit=20');
-    if (!events.length) { box.innerHTML = '<p class="empty">no compactions recorded yet</p>'; return; }
+    const events = await api('/api/actions/recent?limit=20');
+    if (!events.length) { box.innerHTML = '<p class="empty">no recent actions</p>'; return; }
     box.innerHTML = events.map(e => {
-      const sourcePill = e.source === 'Inline' ? '<span class="pill inline">inline</span>' : '<span class="pill external">external</span>';
-      const tokens = (e.tokens_before != null || e.tokens_after != null)
-        ? `${e.tokens_before ?? '?'} → ${e.tokens_after ?? '?'} tokens`
-        : 'tokens unknown';
       return `
-        <div class="compactrow">
+        <div class="actionrow" data-id="${escapeHtml(e.session_id)}">
           <div class="top">
             <span class="sid">${escapeHtml(e.session_id)}</span>
-            ${sourcePill}
-            ${e.trigger ? `<span class="pill">${escapeHtml(e.trigger)}</span>` : ''}
-            ${!e.completed_at ? '<span class="pill pending">in progress</span>' : ''}
+            <span class="pill">${escapeHtml(e.kind)}</span>
+            <span class="pill ${e.status === 'failed' ? 'stopped' : e.status === 'active' || e.status === 'successful' || e.status === 'resumed' ? 'ok' : 'pending'}">${escapeHtml(e.status)}</span>
           </div>
           <div class="meta">
-            <span>context ${e.context_pct_before != null ? e.context_pct_before.toFixed(1) + '%' : '-'}</span>
-            <span>usage window ${e.usage_window_pct_before != null ? e.usage_window_pct_before.toFixed(1) + '%' : '-'}</span>
-            <span>${tokens}</span>
-            <span>started ${fmtDate(e.started_at)}</span>
-            ${e.completed_at ? `<span>completed ${fmtDate(e.completed_at)}</span>` : ''}
+            ${e.detail ? `<span>${escapeHtml(e.detail)}</span>` : ''}
+            <span>${fmtDate(e.at)}</span>
           </div>
+          ${e.error ? `<div class="action-error">${escapeHtml(e.error)}</div>` : ''}
         </div>`;
     }).join('');
+    $$('#actions .actionrow').forEach(row => row.addEventListener('click', () => selectSession(row.dataset.id)));
   } catch (e) {
     // Same rule as loadStatus: a failed poll keeps whatever was last rendered.
   }
@@ -386,7 +419,7 @@ async function loadSessions() {
   const harness = $('#harness').value;
   if (q) params.set('q', q);
   if (harness) params.set('harness', harness);
-  if ($('#stopped').checked) params.set('stopped', 'true');
+  if ($('#inactive').checked) params.set('inactive', 'true');
   params.set('offset', String(page * PAGE_SIZE));
   params.set('limit', String(PAGE_SIZE));
   let result;
@@ -437,6 +470,7 @@ async function selectSession(id) {
   const listItem = sessionsById.get(id);
   const keptAlive = listItem ? listItem.keepalive : false;
   detail.innerHTML = `
+    ${d.errors.length ? `<div class="errorbox"><h3>Errors</h3><ul>${d.errors.map(error => `<li>${escapeHtml(error)}</li>`).join('')}</ul></div>` : ''}
     <div class="kv">
       <div class="k">id</div><div class="v">${escapeHtml(s.id)}</div>
       <div class="k">harness</div><div class="v">${escapeHtml(s.harness)}</div>
@@ -577,6 +611,25 @@ async function selectSession(id) {
   });
 }
 
+$('#login-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const password = new FormData(e.target).get('password');
+  try {
+    await api('/api/auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ password }),
+    });
+    e.target.reset();
+    hideLogin();
+    loadStatus();
+    loadSessions();
+    loadActions();
+  } catch (err) {
+    $('#login-error').textContent = err.message;
+  }
+});
+
 $('#create').addEventListener('submit', async e => {
   e.preventDefault();
   const fd = new FormData(e.target);
@@ -597,10 +650,10 @@ $('#create').addEventListener('submit', async e => {
   } catch (err) { alert('Create failed: ' + err.message); }
 });
 
-$('#refresh').addEventListener('click', () => { loadStatus(); loadSessions(); loadCompactions(); });
+$('#refresh').addEventListener('click', () => { loadStatus(); loadSessions(); loadActions(); });
 $('#q').addEventListener('input', debounce(() => { page = 0; loadSessions(); }, 250));
 $('#harness').addEventListener('change', () => { page = 0; loadSessions(); });
-$('#stopped').addEventListener('change', () => { page = 0; loadSessions(); });
+$('#inactive').addEventListener('change', () => { page = 0; loadSessions(); });
 $('#pg-prev').addEventListener('click', () => { if (page > 0) { page--; loadSessions(); } });
 $('#pg-next').addEventListener('click', () => { page++; loadSessions(); });
 
@@ -609,11 +662,20 @@ function debounce(fn, ms) {
   return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
 }
 
-loadStatus();
-loadSessions();
-loadCompactions();
+async function bootstrap() {
+  try {
+    const auth = await api('/api/auth/status');
+    if (auth.enabled && !auth.authenticated) { showLogin(); return; }
+    loadStatus();
+    loadSessions();
+    loadActions();
+  } catch (e) {
+    setBanner(`Failed to initialize: ${e.message}`);
+  }
+}
+bootstrap();
 setInterval(loadStatus, 15000);
-setInterval(loadCompactions, 30000);
+setInterval(loadActions, 30000);
 </script>
 </body>
 </html>

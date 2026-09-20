@@ -208,7 +208,7 @@ impl CodexAdapter {
             can_advise_mid_turn: false,
             can_inject_at_session_start: true,
             can_observe_compaction: true,
-            reports_token_counts: false,
+            reports_token_counts: true,
             headless_resume: true,
             seed_modes: vec![SeedMode::InitialPrompt, SeedMode::ForkWithHistory],
         }
@@ -459,11 +459,11 @@ impl HarnessAdapter for CodexAdapter {
                 Err(_) => continue,
             };
             let fingerprint = (metadata.len(), metadata.modified().ok());
-            if let Some(cached) = cache.get(&path) {
-                if cached.fingerprint == fingerprint {
-                    found.push(cached.session.clone());
-                    continue;
-                }
+            if let Some(cached) = cache.get(&path)
+                && cached.fingerprint == fingerprint
+            {
+                found.push(cached.session.clone());
+                continue;
             }
             let Some(session) = scan_rollout(&path) else {
                 cache.remove(&path);
@@ -883,7 +883,7 @@ done
                 can_advise_mid_turn: false,
                 can_inject_at_session_start: true,
                 can_observe_compaction: true,
-                reports_token_counts: false,
+                reports_token_counts: true,
                 headless_resume: true,
                 seed_modes: vec![SeedMode::InitialPrompt, SeedMode::ForkWithHistory]
             }

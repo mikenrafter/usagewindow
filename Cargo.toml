@@ -36,6 +36,7 @@ tracing-subscriber = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
 clap = { version = "4", features = ["derive"] }
 axum = "0.8"
+argon2 = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 rust-embed = "8"
 tower = "0.5"

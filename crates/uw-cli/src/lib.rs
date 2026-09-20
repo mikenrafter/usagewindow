@@ -530,7 +530,7 @@ impl DirectReader for StoreReader {
         stopped: bool,
         harness: Option<&Provider>,
     ) -> Result<Vec<SessionListItem>> {
-        Ok(self
+        self
             .store
             .list_sessions()?
             .into_iter()
@@ -564,9 +564,11 @@ impl DirectReader for StoreReader {
                     resume_status,
                     compaction_status,
                     keepalive,
+                    active: false,
+                    cached: false,
                 })
             })
-            .collect::<Result<Vec<_>>>()?)
+            .collect::<Result<Vec<_>>>()
     }
     fn sessions_show(&mut self, id: &SessionId) -> Result<SessionDetail> {
         let summary = self.store.read_session(id)?;
@@ -593,6 +595,7 @@ impl DirectReader for StoreReader {
             },
             compaction_log: self.store.compaction_requests_for_session(id)?,
             reseed_lineage: vec![],
+            errors: vec![],
         })
     }
     fn thresholds_get(&mut self, request: ThresholdGetRequest) -> Result<ThresholdResponse> {

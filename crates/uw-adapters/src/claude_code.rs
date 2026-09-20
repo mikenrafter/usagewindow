@@ -524,6 +524,7 @@ fn scan_transcript(path: &str, content: &str) -> Option<DiscoveredSession> {
     let mut cwd = None;
     let mut model = None;
     let mut context_window_size = None;
+    let mut extended_context_model = false;
     let mut first_seen = None;
     let mut last_seen = None;
     let mut last_known_token_count = None;
@@ -557,16 +558,19 @@ fn scan_transcript(path: &str, content: &str) -> Option<DiscoveredSession> {
             last_seen = Some(at);
         }
         if let Some(value) = record.pointer("/message/model").and_then(Value::as_str) {
+            extended_context_model |= value.to_ascii_lowercase().contains("[1m]");
             model = Some(ModelId(value.to_owned()));
+        }
+        if let Some(value) = record
+            .pointer("/message/model_context_window")
+            .and_then(Value::as_u64)
+        {
+            context_window_size = Some(value);
         }
         if let Some(value) = record
             .pointer("/message/usage/input_tokens")
             .and_then(Value::as_u64)
         {
-            context_window_size = record
-                .pointer("/message/model_context_window")
-                .and_then(Value::as_u64)
-                .or(context_window_size);
             let cache_read = record
                 .pointer("/message/usage/cache_read_input_tokens")
                 .and_then(Value::as_u64)
@@ -606,6 +610,13 @@ fn scan_transcript(path: &str, content: &str) -> Option<DiscoveredSession> {
         return None;
     }
     let id = filename_id.or(record_id)?;
+    let context_window_size = context_window_size.or({
+        Some(if extended_context_model {
+            1_000_000
+        } else {
+            200_000
+        })
+    });
     Some(DiscoveredSession {
         id: SessionId(id),
         cwd: cwd.unwrap_or_else(|| ".".into()),
@@ -673,12 +684,41 @@ mod tests {
         assert_eq!(found[0].id, SessionId(id.into()));
         assert_eq!(found[0].cwd, "/work");
         assert_eq!(found[0].model, Some(ModelId("claude-sonnet-5".into())));
+        assert_eq!(found[0].context_window_size, Some(200_000));
         assert_eq!(found[0].last_known_token_count, Some(175));
         assert_eq!(found[0].token_usage.len(), 2);
         assert_eq!(found[0].token_usage[0].input_tokens, 2100);
         assert_eq!(found[0].token_usage[0].cached_input_tokens, 800);
         assert_eq!(found[0].token_usage[0].cache_write_input_tokens, 100);
         assert_eq!(found[0].token_usage[0].total_tokens, 2400);
+    }
+
+    #[test]
+    fn transcript_context_metadata_overrides_the_model_suffix() {
+        let id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b41";
+        let session = scan_transcript(
+            &format!("/tmp/{id}.jsonl"),
+            &format!(
+                r#"{{"timestamp":"2026-09-17T23:32:32Z","sessionId":"{id}"}}
+{{"timestamp":"2026-09-17T23:32:34Z","type":"assistant","message":{{"model":"claude-sonnet-5[1m]","model_context_window":200000,"usage":{{"input_tokens":10}}}}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(session.context_window_size, Some(200_000));
+    }
+
+    #[test]
+    fn transcript_model_suffix_selects_extended_context_when_metadata_is_absent() {
+        let id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b42";
+        let session = scan_transcript(
+            &format!("/tmp/{id}.jsonl"),
+            &format!(
+                r#"{{"timestamp":"2026-09-17T23:32:32Z","sessionId":"{id}"}}
+{{"timestamp":"2026-09-17T23:32:34Z","type":"assistant","message":{{"model":"claude-sonnet-5[1m]","usage":{{"input_tokens":10}}}}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(session.context_window_size, Some(1_000_000));
     }
 
     #[tokio::test]

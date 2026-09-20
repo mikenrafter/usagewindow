@@ -231,11 +231,12 @@ directly rather than porting Claude Code's inference-based approach.
 
 ## Open items (flagged by Fable review 1, unresolved as of this revision)
 
-- **Token counts / context-window size**: no confirmed source. Before Phase 3/4 lets
-  `Capabilities.reports_token_counts` be `true` for the Codex adapter, check whether
-  `codex exec --json`'s event stream or any hook payload actually emits per-turn token
-  usage or the model's context-window size. Until confirmed, treat this as `false` and
-  keep idle-compact/reseed-auto/keepalive skipping (not guessing) for Codex sessions.
+- **Token counts / context-window size**: the rollout parser now reads
+  `event_msg{type:"task_started"}.payload.model_context_window` and
+  `token_usage_record.payload.usage.total_tokens`. These are the same fields exercised by
+  the captured rollout fixture, so the Codex adapter reports `reports_token_counts: true`.
+  Keep the parser fail-closed if either field changes shape; do not infer occupancy from
+  `thread_token_usage`, which is a lifetime sum rather than the current context.
 - **State-file convention for checkpointing**: the near-limit policy's fallback action for
   Codex (since `can_advise_mid_turn` and `can_trigger_compaction` are both false) is
   "checkpoint state, log projected exhaustion" — but no Codex-side equivalent of a

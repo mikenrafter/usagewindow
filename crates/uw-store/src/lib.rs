@@ -223,6 +223,11 @@ impl Store {
             .map(|id| self.read_session(&SessionId(id)))
             .collect()
     }
+    /// Returns the shared five-minute cache-warm approximation for a session.
+    pub fn session_cache_warm(&self, id: &SessionId, now: DateTime<Utc>) -> StoreResult<bool> {
+        let session = self.read_session(id)?;
+        Ok(is_cache_warm(session.last_seen, now))
+    }
     pub fn resume_markers_for_session(&self, id: &SessionId) -> StoreResult<Vec<ResumeMarker>> {
         let mut stmt = self.connection.prepare("SELECT id,session_id,reason,resume_at,requested_at,created_at,status,status_detail,message FROM resume_markers WHERE session_id=? ORDER BY created_at,id")?;
         let rows = stmt.query_map([id.0.as_str()], decode_resume_marker_row)?;
@@ -995,6 +1000,21 @@ mod tests {
         };
         let id = s.insert_usage_sample(&sample).unwrap();
         assert_eq!(s.read_usage_sample(id).unwrap(), sample);
+    }
+
+    #[test]
+    fn session_cache_warm_uses_the_shared_approximation() {
+        let store = Store::open_memory().unwrap();
+        let now = Utc::now();
+        let mut warm = session(&SessionId("warm".into()));
+        warm.last_seen = now - Duration::minutes(CACHE_WARM_APPROXIMATION_MINUTES);
+        store.insert_session(&warm).unwrap();
+        let mut cold = session(&SessionId("cold".into()));
+        cold.last_seen = now - Duration::minutes(CACHE_WARM_APPROXIMATION_MINUTES + 1);
+        store.insert_session(&cold).unwrap();
+
+        assert!(store.session_cache_warm(&warm.id, now).unwrap());
+        assert!(!store.session_cache_warm(&cold.id, now).unwrap());
     }
 
     #[test]

@@ -36,6 +36,8 @@ pub struct SessionListItem {
     pub resume_status: Option<ResumeStatus>,
     pub compaction_status: Option<CompactionStatus>,
     pub keepalive: bool,
+    pub active: bool,
+    pub cached: bool,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionsPage {
@@ -51,6 +53,7 @@ pub struct SessionDetail {
     pub resume_controls: ResumeControls,
     pub compaction_log: Vec<CompactionRequest>,
     pub reseed_lineage: Vec<SessionId>,
+    pub errors: Vec<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateSessionRequest {
@@ -97,6 +100,16 @@ pub struct CompactAskRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactStatusResponse {
     pub requests: Vec<CompactionRequest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentAction {
+    pub session_id: SessionId,
+    pub kind: String,
+    pub status: String,
+    pub at: DateTime<Utc>,
+    pub detail: Option<String>,
+    pub error: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThresholdGetRequest {
@@ -169,6 +182,8 @@ mod tests {
             resume_status: None,
             compaction_status: Some(CompactionStatus::Failed("adapter error".into())),
             keepalive: false,
+            active: true,
+            cached: true,
         };
         round_trip(item.clone());
         round_trip(SessionsPage {
@@ -206,6 +221,7 @@ mod tests {
             },
             compaction_log: vec![],
             reseed_lineage: vec![],
+            errors: vec![],
         });
     }
 

@@ -1088,7 +1088,7 @@ pub async fn run_policy_tick(
     let mut token_rates = HashMap::new();
     for session in sessions {
         let records = store.token_usage(&session.id).await?;
-        let activity_weight = if now - session.last_seen <= Duration::minutes(5) {
+        let activity_weight = if is_cache_warm(session.last_seen, now) {
             1.0
         } else {
             0.3
@@ -1220,7 +1220,7 @@ impl IdleEpisodeTracker {
             now - session.last_seen,
             cache_ttl,
             tokens,
-            window,
+            Some(window),
             &profile.idle_compact,
             &adapter.capabilities(),
         );
@@ -1380,7 +1380,7 @@ fn resume_floor_with_burn(
         .get(&session.harness)
         .copied()
         .unwrap_or_default();
-    if cache_ttl > Duration::zero() && now - session.last_seen <= cache_ttl {
+    if is_cache_warm_for(session.last_seen, now, cache_ttl) {
         return Some(now);
     }
     let lookback_minutes = match block.key.kind {
@@ -1529,6 +1529,15 @@ pub async fn run_production_ticks(
     let observation_interval = env_duration_or("UW_OBSERVATION_INTERVAL_SECS", interval);
     let policy_interval = env_duration_secs("UW_POLICY_INTERVAL_SECS", 30);
     let maintenance_interval = env_duration_secs("UW_MAINTENANCE_INTERVAL_SECS", 3600);
+    let idle_compact_tiers = std::env::var("UW_IDLE_COMPACT_TIERS")
+        .ok()
+        .and_then(|value| match parse_idle_compact_tiers(&value) {
+            Ok(tiers) => Some(tiers),
+            Err(error) => {
+                tracing::warn!(%error, "ignoring malformed UW_IDLE_COMPACT_TIERS");
+                None
+            }
+        });
     let started = Instant::now();
     let mut last_observation = started - observation_interval;
     let mut last_policy = started - policy_interval;
@@ -1572,10 +1581,16 @@ pub async fn run_production_ticks(
                 }),
                 ..Default::default()
             };
+            if let Some(tiers) = &idle_compact_tiers {
+                profile.idle_compact.tiers = tiers.clone();
+            }
             if matches!(session.harness, Provider::ClaudeCode | Provider::Codex) {
                 profile
                     .cache_ttl_by_provider
-                    .insert(session.harness.clone(), Duration::minutes(5));
+                    .insert(
+                        session.harness.clone(),
+                        Duration::minutes(CACHE_WARM_APPROXIMATION_MINUTES),
+                    );
             }
             if auto_reseed.is_some() {
                 profile.reseed_auto = ReseedAutoConfig {
@@ -1640,6 +1655,66 @@ fn env_duration_or(name: &str, default: StdDuration) -> StdDuration {
         .filter(|secs| *secs > 0)
         .map(StdDuration::from_secs)
         .unwrap_or(default)
+}
+
+fn parse_idle_compact_tiers(value: &str) -> anyhow::Result<Vec<TokenTier>> {
+    let mut tiers = Vec::new();
+    for item in value.split(',') {
+        let (window_size_floor, token_threshold) = item
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("expected FLOOR:TOKENS, got {item:?}"))?;
+        tiers.push(TokenTier {
+            window_size_floor: window_size_floor.parse().map_err(|_| {
+                anyhow::anyhow!("invalid context-window floor in {item:?}")
+            })?,
+            token_threshold: token_threshold
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid token threshold in {item:?}"))?,
+        });
+    }
+    if tiers.is_empty() {
+        anyhow::bail!("at least one idle-compaction tier is required");
+    }
+    if tiers
+        .windows(2)
+        .any(|pair| pair[0].window_size_floor >= pair[1].window_size_floor)
+    {
+        anyhow::bail!("idle-compaction tiers must have strictly increasing floors");
+    }
+    Ok(tiers)
+}
+
+#[cfg(test)]
+mod idle_compact_tier_env_tests {
+    use super::*;
+
+    #[test]
+    fn parses_idle_compact_tiers_from_environment_format() {
+        let tiers = parse_idle_compact_tiers("0:100000,200000:150000,300000:200000").unwrap();
+        assert_eq!(
+            tiers,
+            vec![
+                TokenTier {
+                    window_size_floor: 0,
+                    token_threshold: 100_000,
+                },
+                TokenTier {
+                    window_size_floor: 200_000,
+                    token_threshold: 150_000,
+                },
+                TokenTier {
+                    window_size_floor: 300_000,
+                    token_threshold: 200_000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_idle_compact_tiers() {
+        assert!(parse_idle_compact_tiers("0:100000,broken").is_err());
+        assert!(parse_idle_compact_tiers("200000:150000,0:100000").is_err());
+    }
 }
 
 fn auto_reseed_runtime_from_env() -> Option<AutoReseedRuntime> {
@@ -1765,7 +1840,20 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
     let liveness = SystemSessionLivenessChecker {
         db_path: path.clone(),
     };
-    let app = uw_web::app_with_adapters(Store::open(&path)?, adapters.clone());
+    let web_password_hash = match std::env::var("UW_WEB_PASSWORD_HASH_FILE") {
+        Ok(path) => {
+            let hash = std::fs::read_to_string(path)?.trim().to_owned();
+            anyhow::ensure!(!hash.is_empty(), "UW_WEB_PASSWORD_HASH_FILE is empty");
+            Some(hash)
+        }
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let app = uw_web::app_with_adapters_and_auth(
+        Store::open(&path)?,
+        adapters.clone(),
+        web_password_hash,
+    )?;
     let address = std::env::var("UW_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".into());
     let listener = tokio::net::TcpListener::bind(address).await?;
     let server = async move { axum::serve(listener, app).await };

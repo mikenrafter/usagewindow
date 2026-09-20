@@ -319,19 +319,22 @@ pub fn should_idle_compact(
     idle_for: Duration,
     cache_ttl: Duration,
     last_known_token_count: u64,
-    context_window_size: u64,
+    context_window_size: Option<u64>,
     config: &IdleCompactConfig,
     caps: &Capabilities,
 ) -> bool {
     caps.can_trigger_compaction
         && caps.reports_token_counts
         && idle_for >= cache_ttl - config.margin
-        && config
-            .tiers
-            .iter()
-            .filter(|tier| tier.window_size_floor <= context_window_size)
-            .max_by_key(|tier| tier.window_size_floor)
-            .is_some_and(|tier| last_known_token_count >= tier.token_threshold)
+        && match context_window_size {
+            Some(size) => config
+                .tiers
+                .iter()
+                .filter(|tier| tier.window_size_floor <= size)
+                .max_by_key(|tier| tier.window_size_floor)
+                .is_some_and(|tier| last_known_token_count >= tier.token_threshold),
+            None => last_known_token_count >= config.unknown_context_token_threshold,
+        }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -680,13 +683,14 @@ mod tests {
                 },
             ],
             margin: Duration::minutes(1),
+            unknown_context_token_threshold: 150_000,
         };
         let caps = caps();
         assert!(should_idle_compact(
             Duration::minutes(4),
             Duration::minutes(5),
             200_000,
-            210_000,
+            Some(210_000),
             &c,
             &caps
         ));
@@ -694,7 +698,7 @@ mod tests {
             Duration::minutes(4),
             Duration::minutes(5),
             150_000,
-            210_000,
+            Some(210_000),
             &c,
             &caps
         ));
@@ -702,8 +706,33 @@ mod tests {
             Duration::minutes(4),
             Duration::minutes(5),
             99_999,
-            200_000,
+            Some(200_000),
             &c,
+            &caps
+        ));
+    }
+
+    #[test]
+    fn idle_compact_uses_interpolated_threshold_when_context_size_is_unknown() {
+        let config = IdleCompactConfig {
+            unknown_context_token_threshold: 150_000,
+            ..profile().idle_compact
+        };
+        let caps = caps();
+        assert!(!should_idle_compact(
+            Duration::minutes(4),
+            Duration::minutes(5),
+            149_999,
+            None,
+            &config,
+            &caps
+        ));
+        assert!(should_idle_compact(
+            Duration::minutes(4),
+            Duration::minutes(5),
+            150_000,
+            None,
+            &config,
             &caps
         ));
     }
@@ -765,13 +794,14 @@ mod tests {
             Duration::minutes(5),
             Duration::minutes(5),
             200_000,
-            210_000,
+            Some(210_000),
             &IdleCompactConfig {
                 tiers: vec![TokenTier {
                     window_size_floor: 0,
                     token_threshold: 100_000
                 }],
-                margin: Duration::minutes(1)
+                margin: Duration::minutes(1),
+                unknown_context_token_threshold: 150_000,
             },
             &codex
         ));
@@ -871,7 +901,11 @@ mod tests {
                     token_threshold: 100_000
                 },
                 TokenTier {
-                    window_size_floor: 201_000,
+                    window_size_floor: 200_000,
+                    token_threshold: 150_000
+                },
+                TokenTier {
+                    window_size_floor: 300_000,
                     token_threshold: 200_000
                 }
             ]

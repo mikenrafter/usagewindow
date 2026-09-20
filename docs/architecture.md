@@ -348,9 +348,12 @@ not a substitute for real installation).
   that horizon waits for the calculated lead time.
 - **Opportunistic idle-compact** (auto-fires, no asking): tiered table
   `Vec<{window_size_floor: u64, token_threshold: u64}>` sorted ascending, pick the
-  highest floor `<=` the session's context window size. Defaults: 100k tokens for the
-  ≤200k tier, 200k tokens for the 201k+ tier — open-ended, a 1M-window model gets its
-  own tier via config with no code change. Fires when `idle_for >= cache_ttl - margin`
+  highest floor `<=` the session's context window size. Defaults: 100k tokens for
+  windows below 200k, 150k tokens for windows from 200k through 299k, and 200k
+  tokens for windows at 300k and above — open-ended, a larger-window model gets its
+  own tier via config with no code change. If the context-window size is unknown, use
+  the 150k-token threshold. Fires when
+  `idle_for >= cache_ttl - margin`
   AND `last_known_token_count >= tier.token_threshold`. `cache_ttl` is per-provider AND
   per-tier, not one flat number: Anthropic's *default* prompt cache is ~5 minutes, but a
   session using the 1-hour cache beta needs its own `cache_ttl` value or this fires

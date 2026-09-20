@@ -1,6 +1,19 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Approximation used when a harness does not expose explicit prompt-cache
+/// state. Keep this in the domain model so consumers do not invent their own
+/// cache-warm checks.
+pub const CACHE_WARM_APPROXIMATION_MINUTES: i64 = 5;
+
+pub fn is_cache_warm(last_seen: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    is_cache_warm_for(last_seen, now, Duration::minutes(CACHE_WARM_APPROXIMATION_MINUTES))
+}
+
+pub fn is_cache_warm_for(last_seen: DateTime<Utc>, now: DateTime<Utc>, ttl: Duration) -> bool {
+    ttl > Duration::zero() && now - last_seen <= ttl
+}
 use std::str::FromStr;
 use uuid::Uuid;
 
@@ -223,10 +236,26 @@ pub enum CompactionStatus {
     Failed(String),
     Cancelled,
 }
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IdleCompactConfig {
     pub tiers: Vec<TokenTier>,
     pub margin: Duration,
+    #[serde(default = "default_unknown_context_token_threshold")]
+    pub unknown_context_token_threshold: u64,
+}
+
+fn default_unknown_context_token_threshold() -> u64 {
+    150_000
+}
+
+impl Default for IdleCompactConfig {
+    fn default() -> Self {
+        Self {
+            tiers: Vec::new(),
+            margin: Duration::zero(),
+            unknown_context_token_threshold: default_unknown_context_token_threshold(),
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenTier {
@@ -304,11 +333,16 @@ impl Default for ThresholdProfile {
                         token_threshold: 100_000,
                     },
                     TokenTier {
-                        window_size_floor: 201_000,
+                        window_size_floor: 200_000,
+                        token_threshold: 150_000,
+                    },
+                    TokenTier {
+                        window_size_floor: 300_000,
                         token_threshold: 200_000,
                     },
                 ],
                 margin: Duration::minutes(1),
+                unknown_context_token_threshold: 150_000,
             },
             reseed_auto: Default::default(),
             keepalive: None,

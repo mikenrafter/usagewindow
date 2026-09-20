@@ -117,6 +117,13 @@ DankMaterialShell status-bar plugin (bash+QML). This is ground truth for the Cla
 - `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, `CLAUDE_CODE_DISABLE_1M_CONTEXT`, the `[1m]` model
   suffix — relevant to correctly reading a session's actual context window size for the
   idle-compact tier lookup (don't hardcode 200k).
+- The adapter resolves Claude's context size in this order: an explicit
+  `message.model_context_window` transcript field, a `[1m]` marker in the selected model
+  name, then 200,000 tokens. The fallback follows Claude Code's documented standard
+  context size; the 1m suffix is the session-specific signal when the transcript does not
+  include the explicit field. `CLAUDE_CODE_MAX_CONTEXT_TOKENS` remains a process-level
+  override that should be added only when usagewindow can associate it with a specific
+  session rather than guessing from the daemon environment.
 - Claude Code has its own native "autocompact is thrashing" detection message when
   context refills to the limit within 3 turns of a previous compact, 3 times running —
   worth mirroring in this adapter's own thrash guard (don't re-ask/re-trigger
