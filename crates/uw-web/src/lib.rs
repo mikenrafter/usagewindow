@@ -419,6 +419,10 @@ async fn sessions(
                     .resume_markers_for_session(&s.id)?
                     .last()
                     .map(|m| m.status.clone());
+                let compaction_status = store
+                    .compaction_requests_for_session(&s.id)?
+                    .last()
+                    .map(|r| r.status.clone());
                 let keepalive = store
                     .keepalive_config(&s.id)
                     .map(|k| k.enabled)
@@ -431,6 +435,7 @@ async fn sessions(
                     last_seen: s.last_seen,
                     stopped_reason: s.stopped_reason,
                     resume_status,
+                    compaction_status,
                     keepalive,
                 });
             }
@@ -812,6 +817,17 @@ mod tests {
         let store = Store::open_memory().unwrap();
         store.insert_session(&session()).unwrap();
         store
+            .insert_compaction_request(&CompactionRequest {
+                id: uuid::Uuid::new_v4(),
+                session_id: SessionId("session-1".into()),
+                kind: CompactionKind::AgentRequested,
+                prompt: "/compact".into(),
+                reason: "test".into(),
+                status: CompactionStatus::Failed("adapter error".into()),
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        store
             .insert_usage_sample(&UsageSample {
                 at: Utc::now(),
                 fetched_at: None,
@@ -828,7 +844,9 @@ mod tests {
                 credits: None,
             })
             .unwrap();
-        let response = app(store)
+        let router = app(store);
+        let response = router
+            .clone()
             .oneshot(Request::get("/api/status").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -838,11 +856,18 @@ mod tests {
             .unwrap();
         let value: StatusResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(value.usage[0].windows[0].pct, 42.0);
-        let response = app(Store::open_memory().unwrap())
-            .oneshot(Request::get("/api/sessions").body(Body::empty()).unwrap())
+        let response = router
+            .oneshot(Request::get("/api/sessions?stopped=true").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: SessionsPage = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value.items[0].compaction_status,
+            Some(CompactionStatus::Failed("adapter error".into()))
+        );
     }
 
     #[tokio::test]

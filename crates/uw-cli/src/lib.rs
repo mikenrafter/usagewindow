@@ -537,24 +537,36 @@ impl DirectReader for StoreReader {
             .filter(|s| {
                 harness.is_none_or(|h| h == &s.harness) && (stopped || s.stopped_reason.is_none())
             })
-            .map(|s| {
+            .map(|s| -> Result<SessionListItem> {
+                let id = s.id.clone();
                 let keepalive = self
                     .store
-                    .keepalive_config(&s.id)
+                    .keepalive_config(&id)
                     .map(|k| k.enabled)
                     .unwrap_or(false);
-                SessionListItem {
-                    id: s.id,
+                let resume_status = self
+                    .store
+                    .resume_markers_for_session(&id)?
+                    .last()
+                    .map(|m| m.status.clone());
+                let compaction_status = self
+                    .store
+                    .compaction_requests_for_session(&id)?
+                    .last()
+                    .map(|r| r.status.clone());
+                Ok(SessionListItem {
+                    id,
                     harness: s.harness,
                     model: s.model,
                     account: s.account,
                     last_seen: s.last_seen,
                     stopped_reason: s.stopped_reason,
-                    resume_status: s.resume_marker.map(|m| m.status),
+                    resume_status,
+                    compaction_status,
                     keepalive,
-                }
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()?)
     }
     fn sessions_show(&mut self, id: &SessionId) -> Result<SessionDetail> {
         let summary = self.store.read_session(id)?;

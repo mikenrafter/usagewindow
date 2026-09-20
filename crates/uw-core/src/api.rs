@@ -34,6 +34,7 @@ pub struct SessionListItem {
     pub last_seen: DateTime<Utc>,
     pub stopped_reason: Option<StopReason>,
     pub resume_status: Option<ResumeStatus>,
+    pub compaction_status: Option<CompactionStatus>,
     pub keepalive: bool,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -166,6 +167,7 @@ mod tests {
             last_seen: Utc::now(),
             stopped_reason: None,
             resume_status: None,
+            compaction_status: Some(CompactionStatus::Failed("adapter error".into())),
             keepalive: false,
         };
         round_trip(item.clone());

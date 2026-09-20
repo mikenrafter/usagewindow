@@ -205,9 +205,24 @@ function countdown(iso) {
 }
 
 function pillFor(session) {
-  if (session.stopped_reason) return `<span class="pill stopped">stopped</span>`;
-  if (session.resume_status) return `<span class="pill pending">${escapeHtml(session.resume_status)}</span>`;
-  return `<span class="pill ok">tracked</span>`;
+  const pills = [];
+  if (session.stopped_reason) pills.push('<span class="pill stopped">stopped</span>');
+  if (session.resume_status) {
+    pills.push(`<span class="pill pending">resume-${escapeHtml(statusName(session.resume_status))}</span>`);
+  }
+  if (session.compaction_status) {
+    const status = statusName(session.compaction_status);
+    const cls = status === 'failed' ? 'stopped' : 'pending';
+    const label = status === 'pending' ? 'queued' : status;
+    pills.push(`<span class="pill ${cls}">compaction-${label}</span>`);
+  }
+  return pills.join(' ');
+}
+
+function statusName(status) {
+  if (typeof status === 'string') return status.toLowerCase();
+  if (status && typeof status === 'object') return Object.keys(status)[0].toLowerCase();
+  return String(status).toLowerCase();
 }
 
 function escapeHtml(v) {
