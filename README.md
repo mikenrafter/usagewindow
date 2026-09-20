@@ -64,6 +64,13 @@ catch up with the revision. The wire behavior follows the official
 For old local clients, `uw-mcp --stdio` or `UW_MCP_TRANSPORT=stdio` starts the retained
 newline-delimited `2024-11-05` mode.
 
+The MCP protocol does not expose the host harness's agent-session ID: `2026-07-28`
+deliberately removed protocol sessions and `Mcp-Session-Id`. For a tool call, omit
+`session_id` or pass `null` to use the caller context. Stdio clients inherit
+`CLAUDE_CODE_SESSION_ID`; HTTP clients may provide the same value in the
+`com.usagewindow/sessionId` request metadata extension. An explicit string always
+takes precedence.
+
 HTTP mode rejects non-local browser origins by default. Set
 `UW_MCP_ALLOWED_ORIGINS` to a comma-separated list of exact additional origins when a
 trusted reverse proxy needs them. Keep the default loopback binding unless the

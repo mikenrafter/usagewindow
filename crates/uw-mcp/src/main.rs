@@ -24,6 +24,7 @@ const SERVER_INFO_KEY: &str = "io.modelcontextprotocol/serverInfo";
 const PROTOCOL_VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
 const CLIENT_INFO_KEY: &str = "io.modelcontextprotocol/clientInfo";
 const CLIENT_CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
+const CALLER_SESSION_ID_KEY: &str = "com.usagewindow/sessionId";
 
 pub struct Deps {
     pub store: Arc<Mutex<Store>>,
@@ -46,9 +47,22 @@ fn tool_result(value: Value) -> Value {
 fn tool_definitions() -> Value {
     json!({"tools":[
         {"name":"get_usage","description":"Read the latest usage-window state.","inputSchema":{"type":"object","properties":{"provider":{"type":"string"},"account":{"type":"string"}}}},
-        {"name":"get_resume_state","description":"Read resume markers for a session.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}},
-        {"name":"request_compaction","description":"Queue an agent-requested compaction for a harness with a live message transport.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"prompt":{"type":"string"},"reason":{"type":"string"}},"required":["session_id"]}}
+        {"name":"get_resume_state","description":"Read resume markers for the calling session, or a supplied session.","inputSchema":{"type":"object","properties":{"session_id":{"type":["string","null"]}}}},
+        {"name":"request_compaction","description":"Queue an agent-requested compaction for the calling session, or a supplied session, when its harness has a live message transport.","inputSchema":{"type":"object","properties":{"session_id":{"type":["string","null"]},"prompt":{"type":"string"},"reason":{"type":"string"}}}}
     ]})
+}
+
+fn session_id_argument(
+    args: &Value,
+    caller_session_id: Option<&SessionId>,
+) -> Result<SessionId, String> {
+    match args.get("session_id") {
+        Some(Value::String(id)) => Ok(SessionId(id.clone())),
+        Some(Value::Null) | None => caller_session_id.cloned().ok_or(
+            "session_id is unavailable; pass session_id explicitly or configure caller session context".into(),
+        ),
+        Some(_) => Err("session_id must be a string or null".into()),
+    }
 }
 
 fn get_usage(args: &Value, deps: &Deps) -> Result<Value, String> {
@@ -107,15 +121,16 @@ fn get_usage(args: &Value, deps: &Deps) -> Result<Value, String> {
     .map_err(|e| e.to_string())
 }
 
-fn call_tool(name: &str, args: &Value, deps: &Deps) -> Result<Value, String> {
+fn call_tool(
+    name: &str,
+    args: &Value,
+    deps: &Deps,
+    caller_session_id: Option<&SessionId>,
+) -> Result<Value, String> {
     match name {
         "get_usage" => Ok(tool_result(get_usage(args, deps)?)),
         "get_resume_state" => {
-            let id = args
-                .get("session_id")
-                .and_then(Value::as_str)
-                .ok_or("session_id is required")?;
-            let session_id = SessionId(id.into());
+            let session_id = session_id_argument(args, caller_session_id)?;
             let store = deps
                 .store
                 .lock()
@@ -123,14 +138,12 @@ fn call_tool(name: &str, args: &Value, deps: &Deps) -> Result<Value, String> {
             let markers = store
                 .resume_markers_for_session(&session_id)
                 .map_err(|e| e.to_string())?;
-            Ok(tool_result(json!({"session_id": id, "markers": markers})))
+            Ok(tool_result(
+                json!({"session_id": session_id.0, "markers": markers}),
+            ))
         }
         "request_compaction" => {
-            let id = args
-                .get("session_id")
-                .and_then(Value::as_str)
-                .ok_or("session_id is required")?;
-            let session_id = SessionId(id.into());
+            let session_id = session_id_argument(args, caller_session_id)?;
             let prompt = args
                 .get("prompt")
                 .and_then(Value::as_str)
@@ -152,7 +165,7 @@ fn call_tool(name: &str, args: &Value, deps: &Deps) -> Result<Value, String> {
                 .ok_or_else(|| format!("no adapter registered for {:?}", session.harness))?;
             if !adapter.capabilities().can_trigger_compaction {
                 return Ok(tool_result(
-                    json!({"supported":false,"session_id":id,"message":"not supported for this harness: compaction cannot be triggered"}),
+                    json!({"supported":false,"session_id":session_id.0,"message":"not supported for this harness: compaction cannot be triggered"}),
                 ));
             }
             let request = CompactionRequest {
@@ -175,6 +188,23 @@ fn call_tool(name: &str, args: &Value, deps: &Deps) -> Result<Value, String> {
     }
 }
 
+fn caller_session_id_from_env() -> Option<SessionId> {
+    std::env::var("CLAUDE_CODE_SESSION_ID")
+        .ok()
+        .filter(|id| !id.is_empty())
+        .map(SessionId)
+}
+
+fn caller_session_id_from_modern_request(params: &Value) -> Option<SessionId> {
+    params
+        .get("_meta")
+        .and_then(|meta| meta.get(CALLER_SESSION_ID_KEY))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(|id| SessionId(id.into()))
+        .or_else(caller_session_id_from_env)
+}
+
 /// Pure JSON-RPC request handling. The caller owns process I/O; this function does not
 /// read stdin, write stdout, or panic on malformed/unknown requests.
 pub fn handle_request(request: Value, deps: &Deps) -> Value {
@@ -195,7 +225,12 @@ pub fn handle_request(request: Value, deps: &Deps) -> Value {
             let Some(name) = params.get("name").and_then(Value::as_str) else {
                 return error(id, -32602, "tools/call requires a tool name");
             };
-            match call_tool(name, params.get("arguments").unwrap_or(&json!({})), deps) {
+            match call_tool(
+                name,
+                params.get("arguments").unwrap_or(&json!({})),
+                deps,
+                caller_session_id_from_env().as_ref(),
+            ) {
                 Ok(value) => result(id, value),
                 Err(message) if message.starts_with("unknown tool:") => error(id, -32602, message),
                 Err(message) => error(id, -32000, message),
@@ -358,7 +393,12 @@ fn handle_modern_request(request: Value, headers: &HeaderMap, deps: &Deps) -> (S
         }
         "tools/call" => {
             let name = params["name"].as_str().expect("validated tool name");
-            match call_tool(name, params.get("arguments").unwrap_or(&json!({})), deps) {
+            match call_tool(
+                name,
+                params.get("arguments").unwrap_or(&json!({})),
+                deps,
+                caller_session_id_from_modern_request(params).as_ref(),
+            ) {
                 Ok(value) => value,
                 Err(message) if message.starts_with("unknown tool:") => {
                     return (StatusCode::BAD_REQUEST, modern_error(id, -32602, message));
@@ -766,6 +806,57 @@ mod tests {
             .pop()
             .unwrap();
         assert_eq!(request.kind, CompactionKind::AgentRequested);
+    }
+
+    #[test]
+    fn null_session_id_uses_caller_session_metadata() {
+        let deps = deps();
+        let s = session("caller-session", Provider::Codex);
+        deps.store.lock().unwrap().insert_session(&s).unwrap();
+        let response = handle_modern_request(
+            json!({
+                "jsonrpc":"2.0",
+                "id":6,
+                "method":"tools/call",
+                "params":{
+                    "name":"get_resume_state",
+                    "arguments":{"session_id":null},
+                    "_meta":{
+                        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                        "io.modelcontextprotocol/clientInfo":{"name":"test","version":"1"},
+                        "io.modelcontextprotocol/clientCapabilities":{},
+                        "com.usagewindow/sessionId":"caller-session"
+                    }
+                }
+            }),
+            &{
+                let mut headers = HeaderMap::new();
+                headers.insert("mcp-protocol-version", "2026-07-28".parse().unwrap());
+                headers.insert("mcp-method", "tools/call".parse().unwrap());
+                headers.insert("mcp-name", "get_resume_state".parse().unwrap());
+                headers
+            },
+            &deps,
+        );
+        assert_eq!(response.0, StatusCode::OK);
+        assert_eq!(
+            response.1["result"]["structuredContent"]["session_id"],
+            "caller-session"
+        );
+    }
+
+    #[test]
+    fn session_id_is_optional_and_nullable_in_tool_schemas() {
+        let definitions = tool_definitions();
+        let tools = definitions["tools"].as_array().unwrap();
+        for name in ["get_resume_state", "request_compaction"] {
+            let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+            assert!(tool["inputSchema"].get("required").is_none());
+            assert_eq!(
+                tool["inputSchema"]["properties"]["session_id"]["type"],
+                json!(["string", "null"])
+            );
+        }
     }
     #[test]
     fn unknown_method_returns_json_rpc_error() {
