@@ -341,7 +341,11 @@ impl UsageResponse {
 }
 pub fn compact_instructions(prompt: &str) -> String {
     let prompt = prompt.trim();
-    if prompt == "/compact" || prompt.starts_with("/compact ") {
+    let already_prefixed = prompt == "/compact"
+        || prompt
+            .strip_prefix("/compact")
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace));
+    if already_prefixed {
         prompt.to_owned()
     } else if prompt.is_empty() {
         "/compact".into()

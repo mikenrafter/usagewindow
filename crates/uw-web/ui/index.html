@@ -103,12 +103,51 @@
   .errorbox h3 { color: var(--danger); font-size: 0.78rem; margin: 0 0 0.4rem; text-transform: uppercase; letter-spacing: 0.04em; }
   .errorbox ul { margin: 0; padding-left: 1.1rem; color: var(--danger); font-size: 0.82rem; }
   .usage-layout { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(280px, 1fr); gap: 1rem; align-items: start; }
-  @media (max-width: 800px) { .usage-layout { grid-template-columns: 1fr; } }
   #login { display: none; position: fixed; inset: 0; z-index: 20; place-items: center; background: rgba(15,17,21,0.92); }
   #login.show { display: grid; }
   #login form { width: min(22rem, calc(100vw - 2rem)); background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }
   #login h2 { margin-bottom: 0.8rem; }
   #login input { width: 100%; margin-bottom: 0.6rem; }
+
+  /* Mobile: everything above this point assumes a wide screen (sessions list
+     next to detail, usage cards next to actions, a 6-column table). Below the
+     breakpoint, stack sections sequentially and turn the sessions table into
+     a label/value card list so text stops wrapping onto itself. */
+  @media (max-width: 760px) {
+    body { font-size: 15px; }
+    header { padding: 0.6rem 0.8rem; gap: 0.6rem; }
+    header h1 { font-size: 1rem; }
+    header button { padding: 0.35rem 0.65rem; }
+    main { grid-template-columns: 1fr; padding: 0.6rem; gap: 0.8rem; }
+    .usage-layout { grid-template-columns: 1fr; }
+    .cardgrid { grid-template-columns: 1fr; }
+
+    /* Text inputs/selects don't shrink below their intrinsic min-content width
+       in a flex/grid row, so a search box next to a dropdown (or two side-by-side
+       form fields) overflows the viewport on narrow screens instead of wrapping.
+       Stack them instead of trying to fit two on one line. */
+    .row { flex-direction: column; align-items: stretch; }
+    form.edit .row2 { grid-template-columns: 1fr; }
+
+    /* iOS Safari zooms the whole page in on focus when a form control's
+       font-size is under 16px; keep controls at 16px here so focusing the
+       search box or a select doesn't yank the viewport around. */
+    input, select, textarea { font-size: 16px; }
+
+    .kv { grid-template-columns: 1fr; gap: 0.1rem 0; }
+    .kv .k { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; }
+    .kv .v { margin-bottom: 0.5rem; }
+
+    table, thead, tbody, tr, th, td { display: block; }
+    thead { display: none; }
+    tbody tr { border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.6rem; margin-bottom: 0.6rem; }
+    tbody tr:hover { background: none; }
+    tbody td { display: flex; justify-content: space-between; align-items: baseline; gap: 0.6rem; border-bottom: none; padding: 0.3rem 0; min-width: 0; text-align: right; overflow-wrap: anywhere; }
+    tbody td::before { content: attr(data-label); flex: 0 0 auto; color: var(--muted); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.03em; text-align: left; }
+    tbody td:last-child { flex-wrap: wrap; justify-content: flex-start; text-align: left; }
+    tbody td[colspan] { display: block; text-align: left; }
+    tbody td[colspan]::before { content: none; }
+  }
 </style>
 </head>
 <body>
@@ -162,16 +201,18 @@
       <span id="pg-label">page 1</span>
       <button id="pg-next">next &raquo;</button>
     </div>
-    <h2 style="margin-top:1.2rem">New session</h2>
-    <form id="create" class="edit">
-      <div class="row2">
-        <input name="id" placeholder="session id" required>
-        <select name="harness"><option>Codex</option><option>ClaudeCode</option></select>
-      </div>
-      <input name="cwd" placeholder="cwd" required>
-      <input name="model" placeholder="model (optional)">
-      <div class="btnrow"><button class="action primary" type="submit">Create</button></div>
-    </form>
+    <details style="margin-top:1.2rem">
+      <summary>New session</summary>
+      <form id="create" class="edit">
+        <div class="row2">
+          <input name="id" placeholder="session id" required>
+          <select name="harness"><option>Codex</option><option>ClaudeCode</option></select>
+        </div>
+        <input name="cwd" placeholder="cwd" required>
+        <input name="model" placeholder="model (optional)">
+        <div class="btnrow"><button class="action primary" type="submit">Create</button></div>
+      </form>
+    </details>
   </section>
 
   <section class="panel">
@@ -262,6 +303,25 @@ function statusName(status) {
   if (typeof status === 'string') return status.toLowerCase();
   if (status && typeof status === 'object') return Object.keys(status)[0].toLowerCase();
   return String(status).toLowerCase();
+}
+
+function renderCompactionLog(list) {
+  if (!list.length) return '<p class="empty">no compaction requests</p>';
+  return [...list].reverse().map(r => {
+    const status = statusName(r.status);
+    const cls = status === 'failed' ? 'stopped' : status === 'sent' ? 'ok' : 'pending';
+    const failMsg = r.status && typeof r.status === 'object' ? r.status.Failed : null;
+    return `
+      <div class="actionrow">
+        <div class="top">
+          <span class="pill">${escapeHtml(r.kind)}</span>
+          <span class="pill ${cls}">${escapeHtml(status)}</span>
+          <span class="muted">${fmtDate(r.created_at)}</span>
+        </div>
+        <div class="meta"><span>${escapeHtml(r.reason)}</span><span>${escapeHtml(r.prompt)}</span></div>
+        ${failMsg ? `<div class="action-error">${escapeHtml(failMsg)}</div>` : ''}
+      </div>`;
+  }).join('');
 }
 
 function escapeHtml(v) {
@@ -438,12 +498,12 @@ async function loadSessions() {
   } else {
     rows.innerHTML = items.map(s => `
       <tr data-id="${escapeHtml(s.id)}" class="${s.id === selectedId ? 'selected' : ''}">
-        <td>${escapeHtml(s.id)}</td>
-        <td>${escapeHtml(s.harness)}</td>
-        <td>${escapeHtml(s.model || '-')}</td>
-        <td class="muted">${escapeHtml(s.account || '-')}</td>
-        <td>${fmtDate(s.last_seen)}</td>
-        <td>${pillFor(s)}${s.keepalive ? ' <span class="pill keepalive">keepalive</span>' : ''}</td>
+        <td data-label="id">${escapeHtml(s.id)}</td>
+        <td data-label="harness">${escapeHtml(s.harness)}</td>
+        <td data-label="model">${escapeHtml(s.model || '-')}</td>
+        <td data-label="account" class="muted">${escapeHtml(s.account || '-')}</td>
+        <td data-label="last seen">${fmtDate(s.last_seen)}</td>
+        <td data-label="status">${pillFor(s)}${s.keepalive ? ' <span class="pill keepalive">keepalive</span>' : ''}</td>
       </tr>`).join('');
     $$('#rows tr').forEach(tr => tr.addEventListener('click', () => selectSession(tr.dataset.id)));
   }
@@ -494,6 +554,7 @@ async function selectSession(id) {
       <button class="action primary" id="btn-resume">Queue resume</button>
       ${marker ? '<button class="action" id="btn-cancel-resume">Cancel resume</button>' : ''}
       <button class="action" id="btn-keepalive">${keptAlive ? 'Disable' : 'Enable'} keepalive</button>
+      <button class="action" id="btn-compact">Request compaction</button>
       <button class="action" id="btn-edit-toggle">Edit</button>
       <button class="action" id="btn-preview">Load transcript preview</button>
       <button class="action danger" id="btn-delete">Delete session</button>
@@ -514,6 +575,11 @@ async function selectSession(id) {
       <div class="btnrow"><button class="action primary" type="submit">Send</button></div>
     </form>
 
+    <form id="compact-form" class="edit" style="display:none">
+      <input name="reason" placeholder="reason / extra instructions after /compact (optional)">
+      <div class="btnrow"><button class="action primary" type="submit">Send</button></div>
+    </form>
+
     <div id="preview"></div>
 
     <details>
@@ -521,10 +587,8 @@ async function selectSession(id) {
       <pre class="raw">${escapeHtml(d.history.slice(-20))}</pre>
     </details>
 
-    <details>
-      <summary>compaction log (${d.compaction_log.length})</summary>
-      <pre class="raw">${escapeHtml(d.compaction_log)}</pre>
-    </details>
+    <h2 style="margin-top:1rem">Compaction requests (${d.compaction_log.length})</h2>
+    <div id="compaction-log">${renderCompactionLog(d.compaction_log)}</div>
   `;
 
   $('#btn-edit-toggle').addEventListener('click', () => {
@@ -573,6 +637,23 @@ async function selectSession(id) {
       await api('/api/sessions/' + encodeURIComponent(id) + '/resume/cancel', { method: 'POST' });
       await selectSession(id);
     } catch (err) { alert('Cancel failed: ' + err.message); }
+  });
+
+  $('#btn-compact').addEventListener('click', () => {
+    const f = $('#compact-form');
+    f.style.display = f.style.display === 'none' ? 'grid' : 'none';
+  });
+  $('#compact-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('/api/sessions/' + encodeURIComponent(id) + '/compact/ask', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ session_id: id, reason: fd.get('reason') || null }),
+      });
+      await selectSession(id);
+    } catch (err) { alert('Compaction request failed: ' + err.message); }
   });
 
   $('#btn-keepalive').addEventListener('click', async () => {

@@ -137,7 +137,7 @@ impl HarnessAdapter for T3CodeAdapter {
             "message": {
                 "messageId": uuid::Uuid::new_v4(),
                 "role": "user",
-                "text": request.prompt,
+                "text": crate::claude_code::compact_instructions(&request.prompt),
                 "attachments": []
             },
             "runtimeMode": "full-access",

@@ -205,7 +205,7 @@ impl CodexAdapter {
     pub fn capabilities_static() -> Capabilities {
         Capabilities {
             can_trigger_compaction: true,
-            can_advise_mid_turn: false,
+            can_advise_mid_turn: true,
             can_inject_at_session_start: true,
             can_observe_compaction: true,
             reports_token_counts: true,
@@ -339,8 +339,27 @@ impl HarnessAdapter for CodexAdapter {
             .emit_status(session, &format!("{status:?}"))
             .await
     }
-    async fn advise(&self, _: &SessionId, _: &str) -> AdapterResult<DeliveryOutcome> {
-        Err(AdapterError::Unsupported)
+    async fn advise(&self, session: &SessionId, text: &str) -> AdapterResult<DeliveryOutcome> {
+        self.transport
+            .call(
+                "initialize",
+                json!({"clientInfo":{"name":"usagewindow","title":"usagewindow","version":"0.1.0"}}),
+            )
+            .await?;
+        let response = self
+            .transport
+            .call(
+                "turn/start",
+                json!({
+                    "threadId": session.0,
+                    "input": [{"type": "text", "text": text}],
+                }),
+            )
+            .await?;
+        if let Some(error) = response.get("error") {
+            return Err(AdapterError::Other(error.to_string()));
+        }
+        Ok(DeliveryOutcome::Delivered)
     }
     async fn compact(
         &self,
@@ -880,7 +899,7 @@ done
             CodexAdapter::capabilities_static(),
             Capabilities {
                 can_trigger_compaction: true,
-                can_advise_mid_turn: false,
+                can_advise_mid_turn: true,
                 can_inject_at_session_start: true,
                 can_observe_compaction: true,
                 reports_token_counts: true,
@@ -959,10 +978,6 @@ done
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let a = CodexAdapter::new(Arc::new(RecordingRpc(calls.clone())));
         let id = SessionId("s".into());
-        assert!(matches!(
-            a.advise(&id, "x").await,
-            Err(AdapterError::Unsupported)
-        ));
         assert_eq!(
             a.compact(
                 &SessionSummary {
@@ -997,6 +1012,34 @@ done
                     json!({"clientInfo":{"name":"usagewindow","title":"usagewindow","version":"0.1.0"}})
                 ),
                 ("thread/compact/start".into(), json!({"threadId":"s"}))
+            ]
+        );
+    }
+    #[tokio::test]
+    async fn codex_advise_sends_a_turn_with_the_given_text() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let a = CodexAdapter::new(Arc::new(RecordingRpc(calls.clone())));
+        let id = SessionId("s".into());
+        assert_eq!(
+            a.advise(&id, "[[uw-keepalive]] no action needed, acknowledge briefly")
+                .await
+                .unwrap(),
+            DeliveryOutcome::Delivered
+        );
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [
+                (
+                    "initialize".into(),
+                    json!({"clientInfo":{"name":"usagewindow","title":"usagewindow","version":"0.1.0"}})
+                ),
+                (
+                    "turn/start".into(),
+                    json!({
+                        "threadId":"s",
+                        "input": [{"type": "text", "text": "[[uw-keepalive]] no action needed, acknowledge briefly"}],
+                    })
+                )
             ]
         );
     }

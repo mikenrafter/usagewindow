@@ -819,17 +819,30 @@ async fn compact_ask(
     Json(request): Json<CompactAskRequest>,
 ) -> Result<Json<CompactStatusResponse>, (StatusCode, String)> {
     let id = session_id(id);
+    let harness = read(state.clone(), {
+        let id = id.clone();
+        move |store| Ok(store.read_session(&id)?.harness)
+    })
+    .await?;
+    let supported = state
+        .adapters
+        .get(&harness)
+        .is_some_and(|adapter| adapter.capabilities().can_trigger_compaction);
+    if !supported {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("compaction cannot be triggered for harness {harness:?}"),
+        ));
+    }
     Ok(Json(
         read(state, move |store| {
             let request = CompactionRequest {
                 id: uuid::Uuid::new_v4(),
                 session_id: id.clone(),
                 kind: CompactionKind::AgentRequested,
-                prompt: request
-                    .reason
-                    .clone()
-                    .map(|message| format!("/compact {message}"))
-                    .unwrap_or_else(|| "/compact".into()),
+                prompt: uw_adapters::claude_code::compact_instructions(
+                    request.reason.as_deref().unwrap_or(""),
+                ),
                 reason: request.reason.unwrap_or_else(|| "manual request".into()),
                 status: CompactionStatus::Pending,
                 created_at: Utc::now(),
@@ -868,6 +881,25 @@ async fn keepalive(
     Json(request): Json<KeepaliveRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let id = session_id(id);
+    if request.enabled {
+        let harness = read(state.clone(), {
+            let id = id.clone();
+            move |store| Ok(store.read_session(&id)?.harness)
+        })
+        .await?;
+        let supported = state
+            .adapters
+            .get(&harness)
+            .is_some_and(|adapter| adapter.capabilities().can_advise_mid_turn);
+        if !supported {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "keepalive is not supported for harness {harness:?}: it cannot advise mid-turn"
+                ),
+            ));
+        }
+    }
     read(state, move |store| {
         store.set_keepalive(&id, request.enabled)?;
         Ok(())
@@ -1063,6 +1095,57 @@ mod tests {
     use std::collections::HashMap;
     use tower::ServiceExt;
     use uw_core::adapter::TokenUsageRecord;
+
+    struct StubAdapter(uw_core::adapter::Capabilities);
+    #[async_trait::async_trait]
+    impl HarnessAdapter for StubAdapter {
+        fn provider(&self) -> Provider {
+            Provider::Codex
+        }
+        fn capabilities(&self) -> uw_core::adapter::Capabilities {
+            self.0.clone()
+        }
+        async fn fetch_usage(
+            &self,
+            _: Option<&AccountId>,
+        ) -> uw_core::adapter::AdapterResult<UsageSample> {
+            Err(uw_core::adapter::AdapterError::Unsupported)
+        }
+        async fn detect_stop(
+            &self,
+            _: &SessionId,
+        ) -> uw_core::adapter::AdapterResult<Option<StopReason>> {
+            Err(uw_core::adapter::AdapterError::Unsupported)
+        }
+        async fn emit_status(
+            &self,
+            _: &SessionId,
+            _: uw_core::adapter::StatusEvent,
+        ) -> uw_core::adapter::AdapterResult<uw_core::adapter::DeliveryOutcome> {
+            Err(uw_core::adapter::AdapterError::Unsupported)
+        }
+        async fn advise(
+            &self,
+            _: &SessionId,
+            _: &str,
+        ) -> uw_core::adapter::AdapterResult<uw_core::adapter::DeliveryOutcome> {
+            Ok(uw_core::adapter::DeliveryOutcome::Delivered)
+        }
+        async fn compact(
+            &self,
+            _: &SessionSummary,
+            _: &CompactionRequest,
+        ) -> uw_core::adapter::AdapterResult<uw_core::adapter::DeliveryOutcome> {
+            Ok(uw_core::adapter::DeliveryOutcome::Delivered)
+        }
+        async fn resume_session(
+            &self,
+            _: &SessionSummary,
+            _: Option<&str>,
+        ) -> uw_core::adapter::AdapterResult<()> {
+            Err(uw_core::adapter::AdapterError::Unsupported)
+        }
+    }
 
     fn session() -> SessionSummary {
         SessionSummary {
@@ -1561,7 +1644,19 @@ mod tests {
     async fn resume_compaction_and_threshold_routes_write_store() {
         let store = Store::open_memory().unwrap();
         store.insert_session(&session()).unwrap();
-        let router = app(store);
+        let adapters: HashMap<Provider, Arc<dyn HarnessAdapter>> = HashMap::from([(
+            Provider::Codex,
+            Arc::new(StubAdapter(uw_core::adapter::Capabilities {
+                can_trigger_compaction: true,
+                can_advise_mid_turn: false,
+                can_inject_at_session_start: true,
+                can_observe_compaction: true,
+                reports_token_counts: true,
+                headless_resume: true,
+                seed_modes: vec![],
+            })) as Arc<dyn HarnessAdapter>,
+        )]);
+        let router = app_with_adapters(store, adapters);
         let resume = ResumeRequest {
             session_id: SessionId("session-1".into()),
             at: None,
@@ -1628,6 +1723,111 @@ mod tests {
             .unwrap();
         let value: ThresholdResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(value.values.get("closing_pct"), Some(&"85".to_string()));
+    }
+
+    fn unsupported_caps() -> uw_core::adapter::Capabilities {
+        uw_core::adapter::Capabilities {
+            can_trigger_compaction: false,
+            can_advise_mid_turn: false,
+            can_inject_at_session_start: false,
+            can_observe_compaction: false,
+            reports_token_counts: false,
+            headless_resume: false,
+            seed_modes: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_ask_rejects_a_harness_that_cannot_trigger_compaction() {
+        let store = Store::open_memory().unwrap();
+        store.insert_session(&session()).unwrap();
+        let adapters: HashMap<Provider, Arc<dyn HarnessAdapter>> = HashMap::from([(
+            Provider::Codex,
+            Arc::new(StubAdapter(unsupported_caps())) as Arc<dyn HarnessAdapter>,
+        )]);
+        let response = app_with_adapters(store, adapters)
+            .oneshot(
+                Request::post("/api/sessions/session-1/compact/ask")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&CompactAskRequest {
+                            session_id: SessionId("session-1".into()),
+                            reason: None,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn keepalive_rejects_a_harness_that_cannot_advise_mid_turn() {
+        let store = Store::open_memory().unwrap();
+        store.insert_session(&session()).unwrap();
+        let adapters: HashMap<Provider, Arc<dyn HarnessAdapter>> = HashMap::from([(
+            Provider::Codex,
+            Arc::new(StubAdapter(unsupported_caps())) as Arc<dyn HarnessAdapter>,
+        )]);
+        let response = app_with_adapters(store, adapters)
+            .oneshot(
+                Request::post("/api/sessions/session-1/keepalive")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({"enabled": true})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn keepalive_accepts_a_harness_that_can_advise_mid_turn() {
+        let store = Store::open_memory().unwrap();
+        store.insert_session(&session()).unwrap();
+        let adapters: HashMap<Provider, Arc<dyn HarnessAdapter>> = HashMap::from([(
+            Provider::Codex,
+            Arc::new(StubAdapter(uw_core::adapter::Capabilities {
+                can_advise_mid_turn: true,
+                ..unsupported_caps()
+            })) as Arc<dyn HarnessAdapter>,
+        )]);
+        let response = app_with_adapters(store, adapters)
+            .oneshot(
+                Request::post("/api/sessions/session-1/keepalive")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({"enabled": true})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn keepalive_disable_does_not_require_capability() {
+        let store = Store::open_memory().unwrap();
+        store.insert_session(&session()).unwrap();
+        // No adapters registered at all: disabling keepalive must still succeed since
+        // it never needs the mid-turn advise capability.
+        let response = app(store)
+            .oneshot(
+                Request::post("/api/sessions/session-1/keepalive")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({"enabled": false})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

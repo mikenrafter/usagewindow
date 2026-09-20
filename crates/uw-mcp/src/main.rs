@@ -144,11 +144,9 @@ fn call_tool(
         }
         "request_compaction" => {
             let session_id = session_id_argument(args, caller_session_id)?;
-            let prompt = args
-                .get("prompt")
-                .and_then(Value::as_str)
-                .unwrap_or("/compact")
-                .to_string();
+            let prompt = uw_adapters::claude_code::compact_instructions(
+                args.get("prompt").and_then(Value::as_str).unwrap_or(""),
+            );
             let reason = args
                 .get("reason")
                 .and_then(Value::as_str)
