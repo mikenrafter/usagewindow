@@ -43,9 +43,14 @@ nix --extra-experimental-features 'ca-derivations dynamic-derivations recursive-
 
 Run `result/bin/uw-daemon` with `UW_DB_PATH` set to the SQLite path. The daemon listens
 on `UW_LISTEN_ADDR`, defaulting to `127.0.0.1:7878`. Configure `uw-hook` with
-`UW_HOOK_PROVIDER=claude-code` or `UW_HOOK_PROVIDER=codex`; `UW_DAEMON_URL` defaults to
+`UW_HOOK_PROVIDER=claude-code`, `codex`, or `cursor`; `UW_DAEMON_URL` defaults to
 the matching local address. Generic usage polling is available through
 `UW_GENERIC_USAGE_COMMAND`.
+
+The hook is harness-neutral at the executable boundary: Claude Code and Codex use
+their command-hook documents, while Cursor uses native `.cursor/hooks.json` event
+names. All three pass their events to the same `uw-hook` binary with the provider
+environment variable above.
 
 Run `result/bin/uw-mcp` beside the daemon with the same `UW_DB_PATH`. Its MCP endpoint
 is `http://127.0.0.1:7880/mcp`; change the listener with `UW_MCP_LISTEN_ADDR`. The
