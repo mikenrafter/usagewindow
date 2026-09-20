@@ -3,7 +3,11 @@
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
   inputs.cargo-dyndrv = {
-    url = "github:obsidiansystems/cargo-dyndrv";
+    # TODO: point back at obsidiansystems/cargo-dyndrv once
+    # https://github.com/mikenrafter/cargo-dyndrv/tree/fix/build-script-cargo-env-vars
+    # (missing CARGO_PKG_* build-script env vars + --cap-lints=warn for
+    # non-workspace deps) is upstreamed.
+    url = "github:mikenrafter/cargo-dyndrv/fix/build-script-cargo-env-vars";
     inputs.nixpkgs.follows = "nixpkgs";
   };
 
@@ -66,7 +70,16 @@
             cargoLock.lockFile = ./Cargo.lock;
             nativeBuildInputs = [ pkgs.pkg-config ];
             buildInputs = [ pkgs.openssl pkgs.stdenv.cc ];
-            cargoBuildFlags = [ "--workspace" "--bins" ];
+            # Explicit --bin list, not --workspace --bins: uw-web-dev
+            # (crates/uw-web/src/bin/uw-web-dev.rs) is a loopback-only, unauthenticated
+            # dev tool for iterating on the web UI without the daemon — it must not be
+            # built as a dynamic-derivation output alongside the production binaries.
+            cargoBuildFlags = [
+              "--bin" "uw"
+              "--bin" "uw-daemon"
+              "--bin" "uw-hook"
+              "--bin" "uw-mcp"
+            ];
             outputs = [ "uw" "uw-daemon" "uw-hook" "uw-mcp" ];
           };
         in pkgs.symlinkJoin {

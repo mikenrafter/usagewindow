@@ -7,15 +7,16 @@
         ]
       },
       "locked": {
-        "lastModified": 1789594638,
-        "narHash": "sha256-/c+ZhXCAyalEZoVld0qnA86hnLS9UqE3FJFAMKW2DZ4=",
-        "owner": "obsidiansystems",
+        "lastModified": 1789896710,
+        "narHash": "sha256-uijSVr5pItgs0yrbt26zRGs6C8d4oy/2wIrC3+waSz8=",
+        "owner": "mikenrafter",
         "repo": "cargo-dyndrv",
-        "rev": "d5245b85f82627fcaf041e2c57c8aeb7d57d20fe",
+        "rev": "c70beeb376a0610b57426556c9ccfaae74e3b9fa",
         "type": "github"
       },
       "original": {
-        "owner": "obsidiansystems",
+        "owner": "mikenrafter",
+        "ref": "fix/build-script-cargo-env-vars",
         "repo": "cargo-dyndrv",
         "type": "github"
       }
