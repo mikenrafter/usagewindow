@@ -1674,7 +1674,10 @@ fn auto_reseed_runtime_from_env() -> Option<AutoReseedRuntime> {
 /// configuration (SQLite path and adapter registry) is intentionally still a later
 /// wiring concern; this preserves the same cadence/ownership point for Phase 7.
 pub async fn run_daemon_loop() -> anyhow::Result<()> {
-    let path = std::env::var("UW_DB_PATH").unwrap_or_else(|_| "usagewindow.db".into());
+    let path = std::env::var("UW_DB_PATH").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/.usagewindow/usagewindow.db")
+    });
     let store = Store::open(&path)?;
     let daemon_store = Arc::new(SqliteDaemonStore::new(store));
     let cache_path = std::env::var("UW_CLAUDE_CACHE_PATH")

@@ -386,13 +386,14 @@ impl ApiClient for HttpApiClient {
                     .to_string(),
             ));
         }
-        Ok(self
+        let page: SessionsPage = self
             .client
             .get(format!("{}/api/sessions", self.base_url))
             .query(&query)
             .send()?
             .error_for_status()?
-            .json()?)
+            .json()?;
+        Ok(page.items)
     }
     fn sessions_show(&mut self, id: &SessionId) -> Result<SessionDetail> {
         self.get(&format!("/api/sessions/{}", id.0))

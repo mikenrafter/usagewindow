@@ -479,7 +479,10 @@ fn run_stdio(deps: &Deps) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let path = std::env::var("UW_DB_PATH").unwrap_or_else(|_| "usagewindow.db".into());
+    let path = std::env::var("UW_DB_PATH").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/.usagewindow/usagewindow.db")
+    });
     let deps = build_deps(&path)?;
     if std::env::args().any(|arg| arg == "--stdio")
         || std::env::var("UW_MCP_TRANSPORT").is_ok_and(|value| value == "stdio")
