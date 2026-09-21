@@ -1962,10 +1962,11 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
             Arc::new(claude) as Arc<dyn HarnessAdapter>,
         ),
     ]);
-    if let Some(auth) = cursor_auth_from_environment() {
+    let cursor_auth = cursor_auth_from_environment();
+    if !cursor_auth.is_empty() {
         adapters.insert(
             Provider::Cursor,
-            Arc::new(uw_adapters::cursor::CursorAdapter::real(auth)),
+            Arc::new(uw_adapters::cursor::CursorAdapter::real(cursor_auth)),
         );
     }
     if let Ok(command) = std::env::var("UW_GENERIC_USAGE_COMMAND") {
@@ -2044,9 +2045,9 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
     }
 }
 
-fn cursor_auth_from_environment() -> Option<uw_adapters::cursor::CursorAuth> {
+fn cursor_auth_from_environment() -> Vec<uw_adapters::cursor::CursorAuth> {
     let auth = uw_adapters::cursor::CursorAuth::discover_from_environment();
-    if auth.is_none() {
+    if auth.is_empty() {
         tracing::debug!(
             "Cursor credentials not found in environment, IDE state.vscdb, or cursor-agent auth.json"
         );

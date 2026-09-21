@@ -20,24 +20,30 @@ pub enum CursorAuth {
 }
 
 impl CursorAuth {
-    pub fn discover_from_environment() -> Option<Self> {
+    /// Returns every candidate credential this environment has, in the order
+    /// they should be tried. An explicit env var override is trusted alone; the
+    /// IDE and cursor-agent CLI sources are both always collected because they
+    /// expire independently (see `discover`).
+    pub fn discover_from_environment() -> Vec<Self> {
         if let Ok(token) = std::env::var("UW_CURSOR_ACCESS_TOKEN")
             && !token.is_empty()
         {
-            return Some(Self::Bearer(token));
+            return vec![Self::Bearer(token)];
         }
         if let Ok(cookie) = std::env::var("UW_CURSOR_SESSION_COOKIE")
             && !cookie.is_empty()
         {
-            return Some(Self::Cookie(cookie));
+            return vec![Self::Cookie(cookie)];
         }
         if let Ok(token) = std::env::var("CURSOR_AUTH_TOKEN")
             && !token.is_empty()
         {
-            return Some(Self::Bearer(token));
+            return vec![Self::Bearer(token)];
         }
 
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return Vec::new();
+        };
         let config = std::env::var_os("XDG_CONFIG_HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| home.join(".config"));
@@ -50,15 +56,81 @@ impl CursorAuth {
         Self::discover(Some(&state_db), Some(&cli_auth))
     }
 
+    /// The Cursor IDE and the standalone `cursor-agent` CLI keep entirely
+    /// separate access tokens, and either one can be the stale one: a user
+    /// who only runs `cursor-agent` has a long-expired IDE token sitting in
+    /// `state.vscdb` from whenever they last opened the IDE, while a user who
+    /// mostly lives in the IDE may have let a `cursor-agent login` token lapse.
+    /// Preferring the IDE source unconditionally (as pure precedence would)
+    /// means a dead IDE session permanently shadows a perfectly good CLI one.
+    /// So: collect both discovered tokens, and sort the unexpired ones first
+    /// (stable sort keeps the IDE-first tie-break when both are equally
+    /// valid/invalid). A token this can't decode is treated as unexpired —
+    /// trust it and let the API be the final arbiter.
     pub fn discover(
         state_db: Option<&std::path::Path>,
         cli_auth: Option<&std::path::Path>,
-    ) -> Option<Self> {
-        state_db
-            .and_then(read_access_token_from_state_db)
-            .or_else(|| cli_auth.and_then(read_access_token_from_cli_auth))
-            .map(Self::Bearer)
+    ) -> Vec<Self> {
+        let mut tokens: Vec<String> = [
+            state_db.and_then(read_access_token_from_state_db),
+            cli_auth.and_then(read_access_token_from_cli_auth),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        tokens.sort_by_key(|token| jwt_is_expired(token));
+        tokens.into_iter().map(Self::Bearer).collect()
     }
+}
+
+/// Decodes a JWT's unverified payload segment and checks its `exp` claim
+/// against the current time. Cursor's access tokens are JWTs; this never
+/// validates a signature and must only be used to pick which already-issued,
+/// already-trusted local credential to try first.
+fn jwt_is_expired(token: &str) -> bool {
+    let Some(payload) = token.split('.').nth(1) else {
+        return false;
+    };
+    let mut padded = payload.to_owned();
+    while padded.len() % 4 != 0 {
+        padded.push('=');
+    }
+    let Ok(bytes) = base64_url_decode(&padded) else {
+        return false;
+    };
+    let Ok(claims) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    let Some(exp) = claims.get("exp").and_then(Value::as_i64) else {
+        return false;
+    };
+    exp < Utc::now().timestamp()
+}
+
+/// Minimal base64url decoder (RFC 4648 §5) so this file doesn't need a base64
+/// crate dependency just to read one JWT claim.
+fn base64_url_decode(input: &str) -> Result<Vec<u8>, ()> {
+    let mut value: u32 = 0;
+    let mut bits = 0u32;
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    for c in input.bytes() {
+        let digit = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            b'=' => continue,
+            _ => return Err(()),
+        } as u32;
+        value = (value << 6) | digit;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((value >> bits) as u8);
+        }
+    }
+    Ok(out)
 }
 
 fn read_access_token_from_state_db(path: &std::path::Path) -> Option<String> {
@@ -88,28 +160,30 @@ fn read_access_token_from_cli_auth(path: &std::path::Path) -> Option<String> {
 
 pub struct CursorHttpTransport {
     client: reqwest::Client,
-    auth: CursorAuth,
+    /// Tried in order on every call; a candidate that fails with
+    /// `AdapterError::Auth` is skipped in favor of the next one, since the IDE
+    /// and cursor-agent CLI tokens expire independently and either can be the
+    /// stale one. The last candidate's error (or `Auth` if candidates is
+    /// empty) is returned when every candidate fails.
+    candidates: Vec<CursorAuth>,
 }
 
 impl CursorHttpTransport {
-    pub fn new(auth: CursorAuth) -> Self {
+    pub fn new(candidates: Vec<CursorAuth>) -> Self {
         Self {
             client: reqwest::Client::new(),
-            auth,
+            candidates,
         }
     }
-}
 
-#[async_trait]
-impl CursorUsageTransport for CursorHttpTransport {
-    async fn current_period_usage(&self) -> AdapterResult<Value> {
+    async fn call_with(&self, auth: &CursorAuth) -> AdapterResult<Value> {
         let mut request = self
             .client
             .post("https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage")
             .header("Content-Type", "application/json")
             .header("Connect-Protocol-Version", "1")
             .json(&Value::Object(Default::default()));
-        request = match &self.auth {
+        request = match auth {
             CursorAuth::Bearer(token) => request.bearer_auth(token),
             CursorAuth::Cookie(cookie) => request.header(reqwest::header::COOKIE, cookie),
         };
@@ -140,6 +214,20 @@ impl CursorUsageTransport for CursorHttpTransport {
     }
 }
 
+#[async_trait]
+impl CursorUsageTransport for CursorHttpTransport {
+    async fn current_period_usage(&self) -> AdapterResult<Value> {
+        for (index, auth) in self.candidates.iter().enumerate() {
+            match self.call_with(auth).await {
+                Ok(value) => return Ok(value),
+                Err(AdapterError::Auth) if index + 1 < self.candidates.len() => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(AdapterError::Auth)
+    }
+}
+
 pub struct CursorAdapter {
     transport: Arc<dyn CursorUsageTransport>,
     now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
@@ -155,8 +243,8 @@ impl CursorAdapter {
         }
     }
 
-    pub fn real(auth: CursorAuth) -> Self {
-        Self::new(Arc::new(CursorHttpTransport::new(auth))).with_account(read_cached_email())
+    pub fn real(candidates: Vec<CursorAuth>) -> Self {
+        Self::new(Arc::new(CursorHttpTransport::new(candidates))).with_account(read_cached_email())
     }
 
     pub fn with_account(mut self, account: Option<AccountId>) -> Self {
@@ -400,7 +488,9 @@ mod tests {
     async fn unsupported_stop_detection_is_explicit() {
         let adapter = CursorAdapter::new(Arc::new(FakeTransport(json!({}))));
         assert!(matches!(
-            adapter.detect_stop(&SessionId("cursor-session".into())).await,
+            adapter
+                .detect_stop(&SessionId("cursor-session".into()))
+                .await,
             Err(AdapterError::Unsupported)
         ));
     }
@@ -425,7 +515,7 @@ mod tests {
 
         assert_eq!(
             CursorAuth::discover(Some(&path), None),
-            Some(CursorAuth::Bearer("ide-token".into()))
+            vec![CursorAuth::Bearer("ide-token".into())]
         );
         drop(connection);
         let _ = std::fs::remove_file(path);
@@ -439,8 +529,75 @@ mod tests {
 
         assert_eq!(
             CursorAuth::discover(None, Some(&path)),
-            Some(CursorAuth::Bearer("cli-token".into()))
+            vec![CursorAuth::Bearer("cli-token".into())]
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    fn fake_jwt(exp: i64) -> String {
+        fn b64url(bytes: &[u8]) -> String {
+            const CHARS: &[u8] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let mut out = String::new();
+            for chunk in bytes.chunks(3) {
+                let b0 = chunk[0] as u32;
+                let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+                let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+                let n = (b0 << 16) | (b1 << 8) | b2;
+                out.push(CHARS[((n >> 18) & 63) as usize] as char);
+                out.push(CHARS[((n >> 12) & 63) as usize] as char);
+                if chunk.len() > 1 {
+                    out.push(CHARS[((n >> 6) & 63) as usize] as char);
+                }
+                if chunk.len() > 2 {
+                    out.push(CHARS[(n & 63) as usize] as char);
+                }
+            }
+            out
+        }
+        let payload = b64url(json!({"exp": exp}).to_string().as_bytes());
+        format!("header.{payload}.sig")
+    }
+
+    #[test]
+    fn an_expired_ide_token_does_not_shadow_a_valid_cli_token() {
+        let far_future = Utc::now().timestamp() + 3600;
+        let long_expired = Utc::now().timestamp() - 3600;
+
+        let state_db =
+            std::env::temp_dir().join(format!("usagewindow-cursor-{}.vscdb", uuid::Uuid::new_v4()));
+        let connection = rusqlite::Connection::open(&state_db).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO ItemTable (key, value) VALUES ('cursorAuth/accessToken', ?1)",
+                [fake_jwt(long_expired)],
+            )
+            .unwrap();
+        drop(connection);
+
+        let cli_auth =
+            std::env::temp_dir().join(format!("usagewindow-cursor-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &cli_auth,
+            json!({"accessToken": fake_jwt(far_future)}).to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            CursorAuth::discover(Some(&state_db), Some(&cli_auth)),
+            vec![
+                CursorAuth::Bearer(fake_jwt(far_future)),
+                CursorAuth::Bearer(fake_jwt(long_expired)),
+            ]
+        );
+
+        let _ = std::fs::remove_file(state_db);
+        let _ = std::fs::remove_file(cli_auth);
     }
 }

@@ -501,9 +501,9 @@ fn build_deps(path: &str) -> anyhow::Result<Deps> {
         if !token.is_empty() && std::env::var("UW_CURSOR_SESSION_COOKIE").is_err() {
             adapters.insert(
                 Provider::Cursor,
-                Arc::new(uw_adapters::cursor::CursorAdapter::real(
+                Arc::new(uw_adapters::cursor::CursorAdapter::real(vec![
                     uw_adapters::cursor::CursorAuth::Bearer(token),
-                )) as Arc<dyn HarnessAdapter>,
+                ])) as Arc<dyn HarnessAdapter>,
             );
         }
     } else if let Ok(cookie) = std::env::var("UW_CURSOR_SESSION_COOKIE")
@@ -511,9 +511,9 @@ fn build_deps(path: &str) -> anyhow::Result<Deps> {
     {
         adapters.insert(
             Provider::Cursor,
-            Arc::new(uw_adapters::cursor::CursorAdapter::real(
+            Arc::new(uw_adapters::cursor::CursorAdapter::real(vec![
                 uw_adapters::cursor::CursorAuth::Cookie(cookie),
-            )) as Arc<dyn HarnessAdapter>,
+            ])) as Arc<dyn HarnessAdapter>,
         );
     }
     Ok(Deps {
