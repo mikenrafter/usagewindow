@@ -710,25 +710,18 @@ pub async fn run_observation_tick(
         let Some(adapter) = adapters.get(&session.harness) else {
             continue;
         };
-        let sampled_stop = fetched_samples.get(&session.harness).and_then(|sample| {
-            // Account-level exceeded is not evidence that every discovered
-            // rollout hit the limit. Only recently-active (cache-warm) chats
-            // may inherit a stop from the provider usage sample.
-            if !is_cache_warm(session.last_seen, Utc::now()) {
-                return None;
-            }
-            sample
-                .windows
-                .iter()
-                .find(|(_, window)| window.exceeded)
-                .map(|(window, _)| StopReason::UsageLimit {
-                    window: window.clone(),
-                })
-        });
-        let detected = match (sampled_stop, fetched_samples.contains_key(&session.harness)) {
-            (Some(stop), _) => Ok(Some(stop)),
-            (None, true) => Ok(None),
-            (None, false) => adapter.detect_stop(&session.id).await,
+        // Account-level exceeded is not a per-session stop. Adapters decide via
+        // detect_stop_with_usage (quota error markers + usage), and cold/uncached
+        // chats are never candidates for an inferred UsageLimit stop.
+        let detected = if !is_cache_warm(session.last_seen, Utc::now()) {
+            Ok(None)
+        } else {
+            adapter
+                .detect_stop_with_usage(
+                    &session.id,
+                    fetched_samples.get(&session.harness),
+                )
+                .await
         };
         match detected {
             Ok(Some(reason)) if session.stopped_reason.as_ref() != Some(&reason) => {
@@ -2595,6 +2588,9 @@ mod tests {
     struct ObservationAdapter {
         sample: UsageSample,
         stop: Option<StopReason>,
+        /// Mirrors real adapters: UsageLimit is only reported when the session
+        /// itself carries quota-error evidence, not from account usage alone.
+        has_error_marker: bool,
     }
 
     #[async_trait]
@@ -2610,6 +2606,23 @@ mod tests {
         }
         async fn detect_stop(&self, _: &SessionId) -> AdapterResult<Option<StopReason>> {
             Ok(self.stop.clone())
+        }
+        async fn detect_stop_with_usage(
+            &self,
+            _: &SessionId,
+            sample: Option<&UsageSample>,
+        ) -> AdapterResult<Option<StopReason>> {
+            if !self.has_error_marker {
+                return Ok(None);
+            }
+            let Some(sample) = sample else {
+                return Ok(self.stop.clone());
+            };
+            if sample.windows.values().any(|window| window.exceeded) {
+                Ok(self.stop.clone())
+            } else {
+                Ok(None)
+            }
         }
         async fn emit_status(
             &self,
@@ -2654,6 +2667,19 @@ mod tests {
         async fn detect_stop(&self, _: &SessionId) -> AdapterResult<Option<StopReason>> {
             self.provider_requests.fetch_add(1, Ordering::SeqCst);
             Ok(self.stop.clone())
+        }
+        async fn detect_stop_with_usage(
+            &self,
+            _: &SessionId,
+            sample: Option<&UsageSample>,
+        ) -> AdapterResult<Option<StopReason>> {
+            // Stop checks reuse the tick's fetched sample — they must not
+            // trigger another provider round-trip.
+            if sample.is_some_and(|s| s.windows.values().any(|w| w.exceeded)) {
+                Ok(self.stop.clone())
+            } else {
+                Ok(None)
+            }
         }
         async fn emit_status(
             &self,
@@ -2710,6 +2736,7 @@ mod tests {
             stop: Some(StopReason::UsageLimit {
                 window: key.clone(),
             }),
+            has_error_marker: true,
         });
 
         let report = run_observation_tick(
@@ -2768,6 +2795,7 @@ mod tests {
             stop: Some(StopReason::UsageLimit {
                 window: key.clone(),
             }),
+            has_error_marker: true,
         });
 
         let report = run_observation_tick(
@@ -2874,6 +2902,7 @@ mod tests {
             stop: Some(StopReason::UsageLimit {
                 window: key.clone(),
             }),
+            has_error_marker: true,
         });
 
         let report = run_observation_tick(
@@ -2925,6 +2954,56 @@ mod tests {
                 credits: None,
             },
             stop: Some(StopReason::UsageLimit { window: key }),
+            has_error_marker: true,
+        });
+
+        let report = run_observation_tick(
+            &store,
+            &HashMap::from([(Provider::Codex, adapter as Arc<dyn HarnessAdapter>)]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.stops_recorded, 0);
+        assert!(store.stops.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn observation_tick_does_not_stop_without_per_session_error_markers() {
+        let key = WindowKey {
+            provider: Provider::Codex,
+            kind: WindowKind::Rolling { minutes: 300 },
+        };
+        let now = Utc::now();
+        let store = ObservationFake {
+            sessions: vec![SessionSummary {
+                harness: Provider::Codex,
+                ..session()
+            }],
+            samples: StdMutex::new(vec![]),
+            stops: StdMutex::new(vec![]),
+            last_hook_event: Some("SessionEnd".into()),
+        };
+        let adapter = Arc::new(ObservationAdapter {
+            sample: UsageSample {
+                at: now,
+                fetched_at: Some(now),
+                source: UsageSource::ProviderReported,
+                provider: Provider::Codex,
+                account: None,
+                windows: HashMap::from([(
+                    key,
+                    UsageWindowState::new(100.0, true, true, None, None),
+                )]),
+                credits: None,
+            },
+            stop: Some(StopReason::UsageLimit {
+                window: WindowKey {
+                    provider: Provider::Codex,
+                    kind: WindowKind::Rolling { minutes: 300 },
+                },
+            }),
+            has_error_marker: false,
         });
 
         let report = run_observation_tick(

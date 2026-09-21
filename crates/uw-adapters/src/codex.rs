@@ -204,6 +204,34 @@ impl CodexAdapter {
             home.join("sessions")
         })
     }
+
+    /// True when this session's rollout records a verified quota-limit error.
+    /// Account-level exceeded alone is never enough.
+    async fn has_quota_error_evidence(&self, session_id: &SessionId) -> AdapterResult<bool> {
+        let root = self.resolved_sessions_root();
+        let id = session_id.0.clone();
+        tokio::task::spawn_blocking(move || {
+            for path in rollout_files(&root) {
+                let matches_id = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|name| name.ends_with(&id));
+                if !matches_id {
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                if rollout_has_quota_error(&content) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+        .await
+        .map_err(|e| AdapterError::Other(e.to_string()))?
+    }
+
     pub fn capabilities_static() -> Capabilities {
         Capabilities {
             can_trigger_compaction: true,
@@ -330,6 +358,9 @@ impl HarnessAdapter for CodexAdapter {
         let Some(sample) = sample else {
             return self.detect_stop(session_id).await;
         };
+        if !self.has_quota_error_evidence(session_id).await? {
+            return Ok(None);
+        }
         Ok(sample
             .windows
             .iter()
@@ -549,6 +580,42 @@ fn account_from_response(value: &Value) -> Option<AccountId> {
 
 /// Every `*.jsonl` file under `root`, recursively (rollout files live under
 /// `sessions/YYYY/MM/DD/`). Best-effort: an unreadable directory is skipped, not fatal.
+/// Verified against a live Codex rollout that hit the account quota
+/// (`event_msg` / `task_complete` with `error.codex_error_info =
+/// "usage_limit_exceeded"` and a "You've hit your usage limit..." message).
+/// Matching either the structured code or the same quota phrasing trusted
+/// elsewhere is enough; other errors never invent a UsageLimit stop.
+fn rollout_has_quota_error(content: &str) -> bool {
+    content.lines().any(|line| {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("event_msg") {
+            return false;
+        }
+        let Some(payload) = record.get("payload") else {
+            return false;
+        };
+        if payload.get("type").and_then(Value::as_str) != Some("task_complete") {
+            return false;
+        }
+        let Some(error) = payload.get("error") else {
+            return false;
+        };
+        error
+            .get("codex_error_info")
+            .and_then(Value::as_str)
+            .is_some_and(|info| info == "usage_limit_exceeded")
+            || error
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| {
+                    let lower = message.to_ascii_lowercase();
+                    lower.contains("usage limit") || lower.contains("rate limit")
+                })
+    })
+}
+
 fn rollout_files(root: &std::path::Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -979,6 +1046,74 @@ done
             adapter.detect_stop(&SessionId("s".into())).await.unwrap(),
             Some(StopReason::UsageLimit { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn stop_detection_with_usage_requires_rollout_quota_error_evidence() {
+        let root = std::env::temp_dir().join(format!("uw-codex-quota-{}", uuid::Uuid::new_v4()));
+        let id = "01a0c2a3-facc-7ab3-9941-493c9b55f755";
+        let day_dir = root.join("2026/09/21");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join(format!("rollout-2026-09-21T00-25-21-{id}.jsonl"));
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"timestamp":"2026-09-21T06:25:21Z","type":"session_meta","payload":{{"session_id":"{id}","cwd":"/tmp"}}}}
+{{"timestamp":"2026-09-21T06:25:25Z","type":"event_msg","payload":{{"type":"task_complete","error":{{"message":"You've hit your usage limit. try again later.","codex_error_info":"usage_limit_exceeded"}}}}}}
+"#
+            ),
+        )
+        .unwrap();
+        let adapter = CodexAdapter::new(Arc::new(Rpc)).with_sessions_root(root.clone());
+        let sample = UsageSample {
+            at: Utc::now(),
+            fetched_at: Some(Utc::now()),
+            source: UsageSource::ProviderReported,
+            provider: Provider::Codex,
+            account: None,
+            windows: HashMap::from([(
+                WindowKey {
+                    provider: Provider::Codex,
+                    kind: WindowKind::Rolling { minutes: 300 },
+                },
+                UsageWindowState::new(100.0, true, true, None, None),
+            )]),
+            credits: None,
+        };
+        assert_eq!(
+            adapter
+                .detect_stop_with_usage(&SessionId(id.into()), Some(&sample))
+                .await
+                .unwrap(),
+            Some(StopReason::UsageLimit {
+                window: WindowKey {
+                    provider: Provider::Codex,
+                    kind: WindowKind::Rolling { minutes: 300 },
+                }
+            })
+        );
+
+        // Same account-exceeded sample, but a rollout with no quota error —
+        // must not invent a stop for this session.
+        let clean_id = "01a0bbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let clean_path = day_dir.join(format!("rollout-2026-09-21T00-25-21-{clean_id}.jsonl"));
+        std::fs::write(
+            &clean_path,
+            format!(
+                r#"{{"timestamp":"2026-09-21T06:25:21Z","type":"session_meta","payload":{{"session_id":"{clean_id}","cwd":"/tmp"}}}}
+{{"timestamp":"2026-09-21T06:25:25Z","type":"event_msg","payload":{{"type":"task_complete","error":null}}}}
+"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            adapter
+                .detect_stop_with_usage(&SessionId(clean_id.into()), Some(&sample))
+                .await
+                .unwrap(),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
