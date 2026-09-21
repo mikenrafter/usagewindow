@@ -104,6 +104,10 @@ pub struct CompactAskRequest {
     pub reason: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelCompactRequest {
+    pub session_id: SessionId,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactStatusResponse {
     pub requests: Vec<CompactionRequest>,
 }
@@ -247,6 +251,9 @@ mod tests {
         round_trip(CompactAskRequest {
             session_id: SessionId("s".into()),
             reason: Some("r".into()),
+        });
+        round_trip(CancelCompactRequest {
+            session_id: SessionId("s".into()),
         });
         round_trip(CompactStatusResponse { requests: vec![] });
         round_trip(ThresholdGetRequest { scope: None });

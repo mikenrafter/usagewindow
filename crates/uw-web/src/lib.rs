@@ -154,6 +154,7 @@ pub fn app_with_adapters_and_auth(
         .route("/api/sessions/{id}/resume", post(resume))
         .route("/api/sessions/{id}/resume/cancel", post(cancel_resume))
         .route("/api/sessions/{id}/compact/ask", post(compact_ask))
+        .route("/api/sessions/{id}/compact/cancel", post(cancel_compact))
         .route("/api/sessions/{id}/compact/status", get(compact_status))
         .route("/api/sessions/{id}/keepalive", post(keepalive))
         .route("/api/hooks", post(hook_ingress))
@@ -838,6 +839,19 @@ async fn cancel_resume(
     let id = session_id(id);
     read(state, move |store| {
         store.cancel_resume_markers(&id)?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+async fn cancel_compact(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let id = session_id(id);
+    read(state, move |store| {
+        store.cancel_compaction_requests(&id)?;
         Ok(())
     })
     .await?;
@@ -1792,6 +1806,49 @@ mod tests {
             .unwrap();
         let value: ThresholdResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(value.values.get("closing_pct"), Some(&"85".to_string()));
+    }
+
+    #[tokio::test]
+    async fn compact_cancel_marks_pending_requests_cancelled() {
+        let store = Store::open_memory().unwrap();
+        store.insert_session(&session()).unwrap();
+        store
+            .insert_compaction_request(&CompactionRequest {
+                id: uuid::Uuid::new_v4(),
+                session_id: SessionId("session-1".into()),
+                kind: CompactionKind::AgentRequested,
+                prompt: "compact".into(),
+                reason: "manual".into(),
+                status: CompactionStatus::Pending,
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        let router = app(store);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/sessions/session-1/compact/cancel")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = router
+            .oneshot(
+                Request::get("/api/sessions/session-1/compact/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status: CompactStatusResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status.requests[0].status, CompactionStatus::Cancelled);
     }
 
     fn unsupported_caps() -> uw_core::adapter::Capabilities {

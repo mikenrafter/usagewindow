@@ -79,6 +79,9 @@ pub enum CompactCommand {
         #[arg(long)]
         reason: Option<String>,
     },
+    Cancel {
+        session_id: SessionId,
+    },
     Status {
         session_id: SessionId,
     },
@@ -125,6 +128,7 @@ pub trait ApiClient {
     fn resume(&mut self, request: ResumeRequest) -> Result<ResumeResponse>;
     fn cancel_resume(&mut self, request: CancelResumeRequest) -> Result<()>;
     fn compact_ask(&mut self, request: CompactAskRequest) -> Result<CompactStatusResponse>;
+    fn cancel_compact(&mut self, request: CancelCompactRequest) -> Result<()>;
     fn compact_status(&mut self, id: &SessionId) -> Result<CompactStatusResponse>;
     fn reseed(
         &mut self,
@@ -229,6 +233,14 @@ pub fn execute<A: ApiClient, D: DirectReader>(
                 .api
                 .compact_ask(CompactAskRequest { session_id, reason })?,
         )?,
+        Command::Compact {
+            command: CompactCommand::Cancel { session_id },
+        } => {
+            client
+                .api
+                .cancel_compact(CancelCompactRequest { session_id })?;
+            serde_json::json!({"ok":true})
+        }
         Command::Compact {
             command: CompactCommand::Status { session_id },
         } => serde_json::to_value(client.api.compact_status(&session_id)?)?,
@@ -416,6 +428,13 @@ impl ApiClient for HttpApiClient {
             &format!("/api/sessions/{}/compact/ask", request.session_id.0),
             &request,
         )
+    }
+    fn cancel_compact(&mut self, request: CancelCompactRequest) -> Result<()> {
+        let _: serde_json::Value = self.post(
+            &format!("/api/sessions/{}/compact/cancel", request.session_id.0),
+            &request,
+        )?;
+        Ok(())
     }
     fn compact_status(&mut self, id: &SessionId) -> Result<CompactStatusResponse> {
         self.get(&format!("/api/sessions/{}/compact/status", id.0))
@@ -658,6 +677,10 @@ mod tests {
             self.calls.push(format!("ask:{}", r.session_id.0));
             Ok(CompactStatusResponse { requests: vec![] })
         }
+        fn cancel_compact(&mut self, r: CancelCompactRequest) -> Result<()> {
+            self.calls.push(format!("compact-cancel:{}", r.session_id.0));
+            Ok(())
+        }
         fn compact_status(&mut self, _: &SessionId) -> Result<CompactStatusResponse> {
             Ok(CompactStatusResponse { requests: vec![] })
         }
@@ -733,6 +756,7 @@ mod tests {
         assert!(
             Cli::try_parse_from(["uw", "compact", "ask", "s", "--reason", "why", "--json"]).is_ok()
         );
+        assert!(Cli::try_parse_from(["uw", "compact", "cancel", "s", "--json"]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "uw",

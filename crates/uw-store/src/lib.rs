@@ -1370,6 +1370,48 @@ mod tests {
     }
 
     #[test]
+    fn cancel_compaction_requests_only_cancels_pending() {
+        let s = Store::open_memory().unwrap();
+        let sid = SessionId("s".into());
+        s.insert_session(&session(&sid)).unwrap();
+        let pending = uuid::Uuid::new_v4();
+        let sending = uuid::Uuid::new_v4();
+        let sent = uuid::Uuid::new_v4();
+        for (id, status) in [
+            (pending, CompactionStatus::Pending),
+            (sending, CompactionStatus::Sending),
+            (sent, CompactionStatus::Sent),
+        ] {
+            s.insert_compaction_request(&CompactionRequest {
+                id,
+                session_id: sid.clone(),
+                kind: CompactionKind::AgentRequested,
+                prompt: "compact".into(),
+                reason: "test".into(),
+                status: CompactionStatus::Pending,
+                created_at: Utc::now(),
+            })
+            .unwrap();
+            if !matches!(status, CompactionStatus::Pending) {
+                s.update_compaction_status(id, status).unwrap();
+            }
+        }
+
+        s.cancel_compaction_requests(&sid).unwrap();
+
+        let by_id: HashMap<_, _> = s
+            .compaction_requests_for_session(&sid)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.id, r.status))
+            .collect();
+        assert_eq!(by_id[&pending], CompactionStatus::Cancelled);
+        assert_eq!(by_id[&sending], CompactionStatus::Sending);
+        assert_eq!(by_id[&sent], CompactionStatus::Sent);
+        assert!(!s.claim_compaction(pending).unwrap());
+    }
+
+    #[test]
     fn compaction_failure_detail_survives_round_trip() {
         let s = Store::open_memory().unwrap();
         let sid = SessionId("s".into());

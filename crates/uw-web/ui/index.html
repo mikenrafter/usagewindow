@@ -551,6 +551,8 @@ async function selectSession(id) {
   const marker = d.resume_controls.marker;
   const listItem = sessionsById.get(id);
   const keptAlive = listItem ? listItem.keepalive : false;
+  const resumeCancellable = !!(marker && ['pending', 'scheduled'].includes(statusName(marker.status)));
+  const compactCancellable = (d.compaction_log || []).some(r => statusName(r.status) === 'pending');
   detail.innerHTML = `
     ${d.title ? `<h3 class="detail-title">${escapeHtml(d.title)}</h3>` : ''}
     ${d.errors.length ? `<div class="errorbox"><h3>Errors</h3><ul>${d.errors.map(error => `<li>${escapeHtml(error)}</li>`).join('')}</ul></div>` : ''}
@@ -575,9 +577,10 @@ async function selectSession(id) {
 
     <div class="btnrow">
       <button class="action primary" id="btn-resume">Queue resume</button>
-      ${marker ? '<button class="action" id="btn-cancel-resume">Cancel resume</button>' : ''}
+      ${resumeCancellable ? '<button class="action" id="btn-cancel-resume">Cancel resume</button>' : ''}
       <button class="action" id="btn-keepalive">${keptAlive ? 'Disable' : 'Enable'} keepalive</button>
       <button class="action" id="btn-compact">Request compaction</button>
+      ${compactCancellable ? '<button class="action" id="btn-cancel-compact">Cancel compaction</button>' : ''}
       <button class="action" id="btn-edit-toggle">Edit</button>
       <button class="action" id="btn-preview">Load transcript preview</button>
       <button class="action danger" id="btn-delete">Delete session</button>
@@ -660,6 +663,15 @@ async function selectSession(id) {
       await api('/api/sessions/' + encodeURIComponent(id) + '/resume/cancel', { method: 'POST' });
       await selectSession(id);
     } catch (err) { alert('Cancel failed: ' + err.message); }
+  });
+
+  const cancelCompactBtn = $('#btn-cancel-compact');
+  if (cancelCompactBtn) cancelCompactBtn.addEventListener('click', async () => {
+    try {
+      await api('/api/sessions/' + encodeURIComponent(id) + '/compact/cancel', { method: 'POST' });
+      await selectSession(id);
+      await loadActions();
+    } catch (err) { alert('Cancel compaction failed: ' + err.message); }
   });
 
   $('#btn-compact').addEventListener('click', () => {
