@@ -1728,26 +1728,62 @@ pub async fn run_resume_tick(
             continue;
         }
         let session = store.resume_owner(&marker.session_id).await?;
-        let Some(adapter) = adapters.get(&session.harness) else {
-            store
-                .update_resume(marker.id, ResumeStatus::Failed("no adapter".into()))
-                .await?;
-            continue;
+        let mut route_errors = Vec::new();
+        let is_t3_session = matches!(&session.harness, Provider::Other(name) if name == "t3code");
+
+        // T3Code is the owner-preserving meta-harness. Give it first refusal
+        // for native sessions; Unsupported means it has no ownership mapping,
+        // while a transport failure still gets a native fallback attempt.
+        if !is_t3_session
+            && let Some(meta) = adapters.get(&Provider::Other("t3code".into()))
+        {
+            match meta.resume_session(&session, marker.message.as_deref()).await {
+                Ok(()) => {
+                    store.update_resume(marker.id, ResumeStatus::Fired).await?;
+                    continue;
+                }
+                Err(error) => route_errors.push(format!("t3code: {error}")),
+            }
+        }
+
+        let native_succeeded = match adapters.get(&session.harness) {
+            Some(adapter) => match adapter
+                .resume_session(&session, marker.message.as_deref())
+                .await
+            {
+                Ok(()) => true,
+                Err(error) => {
+                    route_errors.push(format!("{}: {error}", provider_label(&session.harness)));
+                    false
+                }
+            },
+            None => {
+                route_errors.push(format!("{}: no adapter", provider_label(&session.harness)));
+                false
+            }
         };
-        let result = adapter
-            .resume_session(&session, marker.message.as_deref())
-            .await;
         store
             .update_resume(
                 marker.id,
-                match result {
-                    Ok(()) => ResumeStatus::Fired,
-                    Err(e) => ResumeStatus::Failed(e.to_string()),
+                if native_succeeded || route_errors.is_empty() {
+                    ResumeStatus::Fired
+                } else {
+                    ResumeStatus::Failed(route_errors.join("; "))
                 },
             )
             .await?;
     }
     Ok(())
+}
+
+fn provider_label(provider: &Provider) -> String {
+    match provider {
+        Provider::ClaudeCode => "claude".into(),
+        Provider::Codex => "codex".into(),
+        Provider::Cursor => "cursor".into(),
+        Provider::Gemini => "gemini".into(),
+        Provider::Other(name) => name.clone(),
+    }
 }
 
 /// Runs the destructive queue and resume scheduler on one shared cadence.
@@ -2220,6 +2256,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::sync::{
         Mutex as StdMutex,
         atomic::{AtomicUsize, Ordering},
@@ -3535,6 +3572,7 @@ mod tests {
         active: Option<ResumeMarker>,
         inserts: StdMutex<u32>,
         resolved: StdMutex<Vec<(uuid::Uuid, DateTime<Utc>)>>,
+        statuses: StdMutex<Vec<ResumeStatus>>,
         owner: SessionSummary,
         due: Vec<ResumeMarker>,
         claim: Arc<StdMutex<bool>>,
@@ -3593,7 +3631,8 @@ mod tests {
         async fn resume_owner(&self, _: &SessionId) -> anyhow::Result<SessionSummary> {
             Ok(self.owner.clone())
         }
-        async fn update_resume(&self, _: uuid::Uuid, _: ResumeStatus) -> anyhow::Result<()> {
+        async fn update_resume(&self, _: uuid::Uuid, status: ResumeStatus) -> anyhow::Result<()> {
+            self.statuses.lock().unwrap().push(status);
             Ok(())
         }
     }
@@ -3638,6 +3677,7 @@ mod tests {
             active: Some(already_scheduled),
             inserts: StdMutex::new(0),
             resolved: StdMutex::new(vec![]),
+            statuses: StdMutex::new(vec![]),
             owner: stopped.clone(),
             due: vec![],
             claim: Arc::new(StdMutex::new(false)),
@@ -3689,6 +3729,7 @@ mod tests {
             active: Some(too_early.clone()),
             inserts: StdMutex::new(0),
             resolved: StdMutex::new(vec![]),
+            statuses: StdMutex::new(vec![]),
             owner: stopped.clone(),
             due: vec![],
             claim: Arc::new(StdMutex::new(false)),
@@ -3718,6 +3759,7 @@ mod tests {
             active: Some(ask_for_more_margin.clone()),
             inserts: StdMutex::new(0),
             resolved: StdMutex::new(vec![]),
+            statuses: StdMutex::new(vec![]),
             owner: stopped.clone(),
             due: vec![],
             claim: Arc::new(StdMutex::new(false)),
@@ -3758,6 +3800,7 @@ mod tests {
             active: None,
             inserts: StdMutex::new(0),
             resolved: StdMutex::new(vec![]),
+            statuses: StdMutex::new(vec![]),
             owner: session(),
             due: vec![marker],
             claim: Arc::new(StdMutex::new(true)),
@@ -3778,6 +3821,203 @@ mod tests {
         first.unwrap();
         second.unwrap();
         assert_eq!(RESUME_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    struct ResumeRouteAdapter {
+        provider: Provider,
+        route_name: &'static str,
+        results: StdMutex<VecDeque<AdapterResult<()>>>,
+        calls: Arc<StdMutex<Vec<&'static str>>>,
+    }
+
+    impl ResumeRouteAdapter {
+        fn new(
+            provider: Provider,
+            route_name: &'static str,
+            result: AdapterResult<()>,
+            calls: Arc<StdMutex<Vec<&'static str>>>,
+        ) -> Self {
+            Self {
+                provider,
+                route_name,
+                results: StdMutex::new(VecDeque::from([result])),
+                calls,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl HarnessAdapter for ResumeRouteAdapter {
+        fn provider(&self) -> Provider {
+            self.provider.clone()
+        }
+        fn capabilities(&self) -> Capabilities {
+            caps(false, false, false)
+        }
+        async fn fetch_usage(&self, _: Option<&AccountId>) -> AdapterResult<UsageSample> {
+            Err(AdapterError::Unsupported)
+        }
+        async fn detect_stop(&self, _: &SessionId) -> AdapterResult<Option<StopReason>> {
+            Err(AdapterError::Unsupported)
+        }
+        async fn emit_status(
+            &self,
+            _: &SessionId,
+            _: StatusEvent,
+        ) -> AdapterResult<DeliveryOutcome> {
+            Err(AdapterError::Unsupported)
+        }
+        async fn advise(&self, _: &SessionId, _: &str) -> AdapterResult<DeliveryOutcome> {
+            Err(AdapterError::Unsupported)
+        }
+        async fn compact(
+            &self,
+            _: &SessionSummary,
+            _: &CompactionRequest,
+        ) -> AdapterResult<DeliveryOutcome> {
+            Err(AdapterError::Unsupported)
+        }
+        async fn resume_session(&self, _: &SessionSummary, _: Option<&str>) -> AdapterResult<()> {
+            self.calls.lock().unwrap().push(self.route_name);
+            self.results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("test adapter received an unexpected extra resume call")
+        }
+    }
+
+    fn due_resume_marker() -> ResumeMarker {
+        let now = Utc::now();
+        ResumeMarker {
+            id: uuid::Uuid::new_v4(),
+            session_id: SessionId("s".into()),
+            reason: ResumeReason::AutoDetectedLimit,
+            resume_at: Some(now - Duration::seconds(1)),
+            requested_at: None,
+            created_at: now - Duration::minutes(1),
+            status: ResumeStatus::Scheduled,
+            message: Some("continue through the owning harness".into()),
+        }
+    }
+
+    fn resume_routing_store(marker: ResumeMarker) -> ResumeFake {
+        ResumeFake {
+            active: None,
+            inserts: StdMutex::new(0),
+            resolved: StdMutex::new(vec![]),
+            statuses: StdMutex::new(vec![]),
+            owner: session(),
+            due: vec![marker],
+            claim: Arc::new(StdMutex::new(true)),
+        }
+    }
+
+    fn resume_routing_adapters(
+        meta_result: AdapterResult<()>,
+        native_result: AdapterResult<()>,
+        calls: Arc<StdMutex<Vec<&'static str>>>,
+    ) -> HashMap<Provider, Arc<dyn HarnessAdapter>> {
+        HashMap::from([
+            (
+                Provider::ClaudeCode,
+                Arc::new(ResumeRouteAdapter::new(
+                    Provider::ClaudeCode,
+                    "claude",
+                    native_result,
+                    calls.clone(),
+                )) as Arc<dyn HarnessAdapter>,
+            ),
+            (
+                Provider::Other("t3code".into()),
+                Arc::new(ResumeRouteAdapter::new(
+                    Provider::Other("t3code".into()),
+                    "t3code",
+                    meta_result,
+                    calls,
+                )) as Arc<dyn HarnessAdapter>,
+            ),
+        ])
+    }
+
+    #[tokio::test]
+    async fn ownership_aware_resume_uses_t3code_owner_before_claude() {
+        let marker = due_resume_marker();
+        let store = resume_routing_store(marker);
+        let calls = Arc::new(StdMutex::new(vec![]));
+        let adapters = resume_routing_adapters(Ok(()), Ok(()), calls.clone());
+
+        run_resume_tick(&store, &adapters, Utc::now())
+            .await
+            .unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["t3code"]);
+        assert_eq!(*store.statuses.lock().unwrap(), vec![ResumeStatus::Fired]);
+    }
+
+    #[tokio::test]
+    async fn ownership_aware_resume_uses_native_when_meta_harness_declines_ownership() {
+        let marker = due_resume_marker();
+        let store = resume_routing_store(marker);
+        let calls = Arc::new(StdMutex::new(vec![]));
+        let adapters =
+            resume_routing_adapters(Err(AdapterError::Unsupported), Ok(()), calls.clone());
+
+        run_resume_tick(&store, &adapters, Utc::now())
+            .await
+            .unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["t3code", "claude"]);
+        assert_eq!(*store.statuses.lock().unwrap(), vec![ResumeStatus::Fired]);
+    }
+
+    #[tokio::test]
+    async fn ownership_aware_resume_falls_back_to_native_after_owner_route_failure() {
+        let marker = due_resume_marker();
+        let store = resume_routing_store(marker);
+        let calls = Arc::new(StdMutex::new(vec![]));
+        let adapters = resume_routing_adapters(
+            Err(AdapterError::Transient(
+                "T3Code dispatch unavailable".into(),
+            )),
+            Ok(()),
+            calls.clone(),
+        );
+
+        run_resume_tick(&store, &adapters, Utc::now())
+            .await
+            .unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["t3code", "claude"]);
+        assert_eq!(*store.statuses.lock().unwrap(), vec![ResumeStatus::Fired]);
+    }
+
+    #[tokio::test]
+    async fn ownership_aware_resume_persists_both_route_errors_when_both_fail() {
+        let marker = due_resume_marker();
+        let store = resume_routing_store(marker);
+        let calls = Arc::new(StdMutex::new(vec![]));
+        let adapters = resume_routing_adapters(
+            Err(AdapterError::Transient(
+                "T3Code dispatch unavailable".into(),
+            )),
+            Err(AdapterError::Other(
+                "No deferred tool marker found in the resumed session".into(),
+            )),
+            calls.clone(),
+        );
+
+        run_resume_tick(&store, &adapters, Utc::now())
+            .await
+            .unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["t3code", "claude"]);
+        let statuses = store.statuses.lock().unwrap();
+        let ResumeStatus::Failed(detail) = &statuses[0] else {
+            panic!("both failed routes must persist a failed resume marker");
+        };
+        assert!(detail.contains("T3Code dispatch unavailable"));
+        assert!(detail.contains("No deferred tool marker found"));
     }
 
     #[test]

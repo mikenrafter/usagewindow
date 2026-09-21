@@ -134,3 +134,24 @@ differently than either "usage limit" or "rate limit", `detect_stop` will
 silently under-report it as "not stopped" rather than false-positive, which
 is the safe failure direction but worth tightening if a Claude-backed example
 ever turns up.
+
+## Native-provider ownership mapping (verified 2026-09-21)
+
+The HTTP thread snapshots above do not include the provider resume cursor. The
+local T3Code state database does: `/home/v0id/.t3/userdata/state.sqlite`, table
+`provider_session_runtime`. The verified row for the affected Claude thread
+maps:
+
+```text
+thread_id: d02b9d75-f564-4cbd-8dcd-62bb445b28c6
+provider_name: claudeAgent
+resume_cursor_json.resume: de50f3dc-713e-44ff-baaa-ea46fd0e4e1a
+```
+
+The same inspection found that Claude rows use
+`resume_cursor_json.$.resume`, Cursor rows use `$.sessionId`, and Codex rows
+use `$.threadId`. Therefore a usagewindow resume for a provider-native
+session must consult this local database to discover its owning T3Code thread;
+looking up the native ID directly through the HTTP snapshot endpoint cannot
+establish ownership. The adapter will treat the state-database path as
+configuration, defaulting to `$HOME/.t3/userdata/state.sqlite`.

@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
+#[cfg(test)]
+use std::path::Path;
 use uw_core::adapter::{
     AdapterError, AdapterResult, Capabilities, DeliveryOutcome, HarnessAdapter, SeedContext,
     SeedMode, StatusEvent,
@@ -96,15 +98,92 @@ impl T3CodeTransport for T3CodeHttpTransport {
 /// dispatching a native `thread.turn.start`; it never starts `claude` itself.
 pub struct T3CodeAdapter {
     transport: Arc<dyn T3CodeTransport>,
+    state_db: Option<PathBuf>,
 }
 
 impl T3CodeAdapter {
     pub fn new(transport: Arc<dyn T3CodeTransport>) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            state_db: None,
+        }
     }
 
     pub fn real(base_url: impl Into<String>, auth: T3CodeAuth) -> Self {
-        Self::new(Arc::new(T3CodeHttpTransport::new(base_url, auth)))
+        let state_db = std::env::var_os("UW_T3CODE_STATE_DB")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".t3/userdata/state.sqlite")));
+        Self {
+            transport: Arc::new(T3CodeHttpTransport::new(base_url, auth)),
+            state_db,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_state_db(transport: Arc<dyn T3CodeTransport>, path: &Path) -> Self {
+        Self {
+            transport,
+            state_db: Some(path.to_owned()),
+        }
+    }
+
+    fn provider_cursor(provider: &Provider) -> Option<(&'static str, &'static str)> {
+        match provider {
+            Provider::ClaudeCode => Some(("claudeAgent", "resume")),
+            Provider::Cursor => Some(("cursor", "sessionId")),
+            Provider::Codex => Some(("codex", "threadId")),
+            Provider::Other(_) | Provider::Gemini => None,
+        }
+    }
+
+    fn native_owner(&self, session: &SessionSummary) -> AdapterResult<Option<SessionId>> {
+        let Some(path) = &self.state_db else {
+            return Ok(None);
+        };
+        let Some((provider_name, cursor_key)) = Self::provider_cursor(&session.harness) else {
+            return Ok(None);
+        };
+        let connection = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|error| AdapterError::Other(format!("open T3Code state database: {error}")))?;
+        let mut statement = connection
+            .prepare(
+                "SELECT thread_id, resume_cursor_json
+                 FROM provider_session_runtime
+                 WHERE provider_name = ?1",
+            )
+            .map_err(|error| AdapterError::Other(format!("read T3Code ownership table: {error}")))?;
+        let rows = statement
+            .query_map([provider_name], |row| {
+                let thread_id: String = row.get(0)?;
+                let cursor: String = row.get(1)?;
+                Ok((thread_id, cursor))
+            })
+            .map_err(|error| AdapterError::Other(format!("scan T3Code ownership table: {error}")))?;
+        for row in rows {
+            let (thread_id, cursor) = row
+                .map_err(|error| AdapterError::Other(format!("read T3Code ownership row: {error}")))?;
+            let cursor: Value = serde_json::from_str(&cursor)
+                .map_err(|error| AdapterError::Other(format!("parse T3Code resume cursor: {error}")))?;
+            if cursor.get(cursor_key).and_then(Value::as_str) == Some(session.id.0.as_str()) {
+                return Ok(Some(SessionId(thread_id)));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn owned_thread(&self, session: &SessionSummary) -> AdapterResult<SessionId> {
+        let thread_id = match &session.harness {
+            Provider::Other(name) if name == "t3code" => session.id.clone(),
+            _ => self.native_owner(session)?.ok_or(AdapterError::Unsupported)?,
+        };
+        match self.transport.get_thread(&thread_id.0).await {
+            Ok(_) => Ok(thread_id),
+            Err(AdapterError::Other(_)) => Err(AdapterError::Unsupported),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn capabilities_static() -> Capabilities {
@@ -208,11 +287,12 @@ impl HarnessAdapter for T3CodeAdapter {
         session: &SessionSummary,
         message: Option<&str>,
     ) -> AdapterResult<()> {
+        let thread_id = self.owned_thread(session).await?;
         let text = message.unwrap_or("Continue from the saved state.");
         let payload = json!({
             "type": "thread.turn.start",
             "commandId": uuid::Uuid::new_v4(),
-            "threadId": session.id.0,
+            "threadId": thread_id.0,
             "message": {
                 "messageId": uuid::Uuid::new_v4(),
                 "role": "user",
@@ -236,6 +316,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use serde_json::Value;
+    use std::fs;
     use std::sync::Mutex;
     use uw_core::model::{LaunchMode, Provider, SessionId, SessionSummary};
 
@@ -305,9 +386,68 @@ mod tests {
         }
     }
 
+    fn native_claude_session() -> SessionSummary {
+        SessionSummary {
+            id: SessionId("de50f3dc-713e-44ff-baaa-ea46fd0e4e1a".into()),
+            harness: Provider::ClaudeCode,
+            ..session()
+        }
+    }
+
     #[tokio::test]
-    async fn sends_a_native_thread_turn() {
-        let transport = std::sync::Arc::new(FakeTransport::new());
+    async fn resume_resolves_native_claude_id_to_its_t3_thread_owner() {
+        let path = std::env::temp_dir().join(format!("usagewindow-t3-owner-{}.db", uuid::Uuid::new_v4()));
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE provider_session_runtime (
+                    thread_id TEXT NOT NULL,
+                    provider_name TEXT NOT NULL,
+                    resume_cursor_json TEXT NOT NULL
+                );
+                INSERT INTO provider_session_runtime
+                    (thread_id, provider_name, resume_cursor_json)
+                VALUES
+                    ('d02b9d75-f564-4cbd-8dcd-62bb445b28c6', 'claudeAgent',
+                     '{\"resume\":\"de50f3dc-713e-44ff-baaa-ea46fd0e4e1a\"}');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let owned_thread = serde_json::json!({
+            "thread": {
+                "id": "d02b9d75-f564-4cbd-8dcd-62bb445b28c6",
+                "session": {"status": "stopped", "providerName": "claudeAgent"}
+            }
+        });
+        let transport = std::sync::Arc::new(FakeTransport::with_thread(owned_thread));
+        let adapter = T3CodeAdapter::with_state_db(transport.clone(), &path);
+
+        adapter
+            .resume_session(&native_claude_session(), Some("continue"))
+            .await
+            .unwrap();
+
+        let calls = transport.calls.lock().unwrap();
+        assert_eq!(calls[0], ("get_thread".into(), Value::String("d02b9d75-f564-4cbd-8dcd-62bb445b28c6".into())));
+        assert_eq!(calls[1].0, "dispatch");
+        assert_eq!(calls[1].1["threadId"], "d02b9d75-f564-4cbd-8dcd-62bb445b28c6");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_checks_ownership_before_sending_a_native_thread_turn() {
+        let owned_thread = serde_json::json!({
+            "thread": {
+                "id": session().id.0,
+                "session": {
+                    "threadId": session().id.0,
+                    "status": "stopped",
+                    "providerName": "claudeAgent"
+                }
+            }
+        });
+        let transport = std::sync::Arc::new(FakeTransport::with_thread(owned_thread));
         let adapter = T3CodeAdapter::new(transport.clone());
 
         adapter
@@ -316,13 +456,30 @@ mod tests {
             .unwrap();
 
         let calls = transport.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "get_thread");
+        assert_eq!(calls[0].1, session().id.0);
+        assert_eq!(calls[1].0, "dispatch");
+        assert_eq!(calls[1].1["type"], "thread.turn.start");
+        assert_eq!(calls[1].1["threadId"], session().id.0);
+        assert_eq!(calls[1].1["message"]["role"], "user");
+        assert_eq!(calls[1].1["message"]["text"], "test message");
+        assert_eq!(calls[1].1["message"]["attachments"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn resume_declines_an_unknown_thread_without_dispatching() {
+        let transport = std::sync::Arc::new(FakeTransport::new());
+        let adapter = T3CodeAdapter::new(transport.clone());
+
+        assert!(matches!(
+            adapter.resume_session(&session(), None).await,
+            Err(AdapterError::Unsupported)
+        ));
+
+        let calls = transport.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "dispatch");
-        assert_eq!(calls[0].1["type"], "thread.turn.start");
-        assert_eq!(calls[0].1["threadId"], session().id.0);
-        assert_eq!(calls[0].1["message"]["role"], "user");
-        assert_eq!(calls[0].1["message"]["text"], "test message");
-        assert_eq!(calls[0].1["message"]["attachments"], serde_json::json!([]));
+        assert_eq!(calls[0].0, "get_thread");
     }
 
     #[tokio::test]
