@@ -1076,13 +1076,20 @@ pub async fn run_near_limit_tick(
     );
     match uw_policy::advise_channel_for(&adapter.capabilities()) {
         AdviseChannel::MidTurn => {
-            adapter.advise(&session.id, &text).await?;
+            if let Err(error) = adapter.advise(&session.id, &text).await {
+                tracing::warn!(session = %session.id.0, %error, "near-limit advisory delivery failed");
+                return Ok(NearLimitOutcome::Checkpointed);
+            }
             Ok(NearLimitOutcome::Advised)
         }
         AdviseChannel::QueuedAtSessionStart => {
-            adapter
+            if let Err(error) = adapter
                 .emit_status(&session.id, StatusEvent::Custom(text))
-                .await?;
+                .await
+            {
+                tracing::warn!(session = %session.id.0, %error, "near-limit status delivery failed");
+                return Ok(NearLimitOutcome::Checkpointed);
+            }
             Ok(NearLimitOutcome::Advised)
         }
         AdviseChannel::None => {
@@ -1690,10 +1697,19 @@ pub async fn run_production_ticks(
         ticker.tick().await;
         // Explicit compaction requests are destructive and user-directed. Dispatch
         // them before provider observation, which may block on a harness transport.
-        run_compaction_tick(store.as_ref(), adapters, liveness).await?;
+        //
+        // Every step below logs and moves on instead of propagating: this loop is the
+        // entire quota-protection safety net for every tracked session, so one
+        // session's bad state (a stale thread id, a provider hiccup) must never take
+        // the whole daemon down and stop tracking/warning/compacting every session.
+        if let Err(error) = run_compaction_tick(store.as_ref(), adapters, liveness).await {
+            tracing::error!(%error, "compaction tick failed");
+        }
         let now = Instant::now();
         if now.duration_since(last_observation) >= observation_interval {
-            run_observation_tick(store.as_ref(), adapters).await?;
+            if let Err(error) = run_observation_tick(store.as_ref(), adapters).await {
+                tracing::error!(%error, "observation tick failed");
+            }
             last_observation = now;
         }
         if now.duration_since(last_maintenance) >= maintenance_interval {
@@ -1702,17 +1718,28 @@ pub async fn run_production_ticks(
                 .and_then(|value| value.parse::<i64>().ok())
                 .filter(|days| *days > 0)
                 .unwrap_or(30);
-            store
+            if let Err(error) = store
                 .prune_usage_before(Utc::now() - Duration::days(retention_days))
-                .await?;
+                .await
+            {
+                tracing::error!(%error, "usage retention prune failed");
+            }
             last_maintenance = now;
         }
         if now.duration_since(last_policy) < policy_interval {
-            run_resume_tick(store.as_ref(), adapters, Utc::now()).await?;
+            if let Err(error) = run_resume_tick(store.as_ref(), adapters, Utc::now()).await {
+                tracing::error!(%error, "resume tick failed");
+            }
             continue;
         }
         last_policy = now;
-        let sessions = store.tracked_sessions().await?;
+        let sessions = match store.tracked_sessions().await {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::error!(%error, "failed to load tracked sessions for policy tick");
+                continue;
+            }
+        };
         let mut profiles = HashMap::new();
         for session in &sessions {
             let mut profile = ThresholdProfile {
@@ -1750,12 +1777,16 @@ pub async fn run_production_ticks(
                     margin: Duration::minutes(1),
                 };
             }
-            profiles.insert(
-                session.id.clone(),
-                store.resolved_profile(session, profile).await?,
-            );
+            match store.resolved_profile(session, profile).await {
+                Ok(resolved) => {
+                    profiles.insert(session.id.clone(), resolved);
+                }
+                Err(error) => {
+                    tracing::error!(session = %session.id.0, %error, "failed to resolve threshold profile");
+                }
+            }
         }
-        run_policy_tick(
+        if let Err(error) = run_policy_tick(
             store.as_ref(),
             store.as_ref(),
             adapters,
@@ -1765,9 +1796,12 @@ pub async fn run_production_ticks(
             &mut policy_state,
             Utc::now(),
         )
-        .await?;
-        if let Some(runtime) = &auto_reseed {
-            run_auto_reseed_ticks(
+        .await
+        {
+            tracing::error!(%error, "policy tick failed");
+        }
+        if let Some(runtime) = &auto_reseed
+            && let Err(error) = run_auto_reseed_ticks(
                 store.as_ref(),
                 adapters,
                 &sessions,
@@ -1775,9 +1809,13 @@ pub async fn run_production_ticks(
                 runtime,
                 Utc::now(),
             )
-            .await?;
+            .await
+        {
+            tracing::error!(%error, "auto-reseed tick failed");
         }
-        run_resume_tick(store.as_ref(), adapters, Utc::now()).await?;
+        if let Err(error) = run_resume_tick(store.as_ref(), adapters, Utc::now()).await {
+            tracing::error!(%error, "resume tick failed");
+        }
     }
 }
 
