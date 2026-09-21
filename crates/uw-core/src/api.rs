@@ -28,6 +28,10 @@ pub struct UsageWindowSummary {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionListItem {
     pub id: SessionId,
+    /// Resolved display title: this session's own title if it has one, else
+    /// the nearest titled ancestor's via `reseeded_from`. `None` when nothing
+    /// in the chain has a title — the UI falls back to `id`.
+    pub title: Option<String>,
     pub harness: Provider,
     pub model: Option<ModelId>,
     pub account: Option<AccountId>,
@@ -49,6 +53,8 @@ pub struct SessionsPage {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionDetail {
     pub summary: SessionSummary,
+    /// Resolved display title (see `SessionListItem::title`).
+    pub title: Option<String>,
     pub history: Vec<SparklinePoint>,
     pub resume_controls: ResumeControls,
     pub compaction_log: Vec<CompactionRequest>,
@@ -174,6 +180,7 @@ mod tests {
     fn session_views_round_trip() {
         let item = SessionListItem {
             id: SessionId("s".into()),
+            title: Some("A titled session".into()),
             harness: Provider::Codex,
             model: None,
             account: None,
@@ -211,6 +218,7 @@ mod tests {
                 superseded_by: None,
                 reseeded_from: None,
             },
+            title: Some("A titled session".into()),
             history: vec![SparklinePoint {
                 at: Utc::now(),
                 pct: 50.0,

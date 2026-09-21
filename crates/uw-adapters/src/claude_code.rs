@@ -598,6 +598,7 @@ fn scan_transcript(path: &str, content: &str) -> Option<DiscoveredSession> {
     let mut last_seen = None;
     let mut last_known_token_count = None;
     let mut token_usage = Vec::new();
+    let mut title = None;
 
     for line in content.lines() {
         let Ok(record) = serde_json::from_str::<Value>(line) else {
@@ -616,6 +617,12 @@ fn scan_transcript(path: &str, content: &str) -> Option<DiscoveredSession> {
         }
         if cwd.is_none() {
             cwd = record.get("cwd").and_then(Value::as_str).map(str::to_owned);
+        }
+        if record.get("type").and_then(Value::as_str) == Some("ai-title")
+            && let Some(value) = record.get("aiTitle").and_then(Value::as_str)
+            && !value.is_empty()
+        {
+            title = Some(value.to_owned());
         }
         let timestamp = record
             .get("timestamp")
@@ -694,6 +701,7 @@ fn scan_transcript(path: &str, content: &str) -> Option<DiscoveredSession> {
         last_seen,
         state_path: Some(path.to_owned()),
         token_usage,
+        title,
     })
 }
 
@@ -758,6 +766,53 @@ mod tests {
         assert_eq!(found[0].token_usage[0].cached_input_tokens, 800);
         assert_eq!(found[0].token_usage[0].cache_write_input_tokens, 100);
         assert_eq!(found[0].token_usage[0].total_tokens, 2400);
+    }
+
+    #[tokio::test]
+    async fn discover_sessions_reads_the_latest_ai_title_record() {
+        let id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b42";
+        let adapter = adapter(
+            200,
+            Arc::new(Cache {
+                entry: Mutex::new(None),
+            }),
+            Arc::new(Mutex::new(0)),
+        )
+        .with_transcript_fs(Arc::new(TranscriptFixture {
+            path: format!("/tmp/{id}.jsonl"),
+            content: format!(
+                r#"{{"timestamp":"2026-09-17T23:32:32Z","sessionId":"{id}","cwd":"/work"}}
+{{"type":"ai-title","aiTitle":"Fix the retry loop","sessionId":"{id}"}}
+{{"type":"ai-title","aiTitle":"Fix the retry loop, take two","sessionId":"{id}"}}"#
+            ),
+        }));
+        let found = adapter.discover_sessions().await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].title.as_deref(),
+            Some("Fix the retry loop, take two")
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_sessions_has_no_title_when_no_ai_title_record_is_present() {
+        let id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b43";
+        let adapter = adapter(
+            200,
+            Arc::new(Cache {
+                entry: Mutex::new(None),
+            }),
+            Arc::new(Mutex::new(0)),
+        )
+        .with_transcript_fs(Arc::new(TranscriptFixture {
+            path: format!("/tmp/{id}.jsonl"),
+            content: format!(
+                r#"{{"timestamp":"2026-09-17T23:32:32Z","sessionId":"{id}","cwd":"/work"}}"#
+            ),
+        }));
+        let found = adapter.discover_sessions().await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].title, None);
     }
 
     #[test]

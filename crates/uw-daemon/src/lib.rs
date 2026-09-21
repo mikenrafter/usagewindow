@@ -627,6 +627,9 @@ impl ObservationStore for SqliteDaemonStore {
             };
             store.upsert_session(&session)?;
             store.insert_token_usage_records(&session.id, &found.token_usage)?;
+            if let Some(title) = found.title {
+                store.set_session_title(&session.id, &title)?;
+            }
             Ok(())
         })
         .await

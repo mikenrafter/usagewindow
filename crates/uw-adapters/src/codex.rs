@@ -706,6 +706,7 @@ fn scan_rollout(path: &std::path::Path) -> Option<DiscoveredSession> {
         last_seen,
         state_path: Some(path.to_string_lossy().into_owned()),
         token_usage,
+        title: None,
     })
 }
 

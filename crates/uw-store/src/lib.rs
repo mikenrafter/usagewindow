@@ -42,16 +42,23 @@ impl Store {
         self.connection.execute_batch(SCHEMA)?;
         // `CREATE TABLE IF NOT EXISTS` above only shapes brand-new databases;
         // existing ones predating this column need it added by hand.
-        if let Err(err) = self
-            .connection
-            .execute("ALTER TABLE resume_markers ADD COLUMN requested_at TEXT", [])
-            && !err.to_string().contains("duplicate column name")
+        if let Err(err) = self.connection.execute(
+            "ALTER TABLE resume_markers ADD COLUMN requested_at TEXT",
+            [],
+        ) && !err.to_string().contains("duplicate column name")
+        {
+            return Err(err.into());
+        }
+        if let Err(err) = self.connection.execute(
+            "ALTER TABLE compaction_requests ADD COLUMN status_detail TEXT",
+            [],
+        ) && !err.to_string().contains("duplicate column name")
         {
             return Err(err.into());
         }
         if let Err(err) = self
             .connection
-            .execute("ALTER TABLE compaction_requests ADD COLUMN status_detail TEXT", [])
+            .execute("ALTER TABLE sessions ADD COLUMN title TEXT", [])
             && !err.to_string().contains("duplicate column name")
         {
             return Err(err.into());
@@ -115,7 +122,10 @@ impl Store {
         let sql = "SELECT provider,account,window_kind,window_scope_value,pct,resets_at,exceeded,active,source,at,fetched_at,credits_json FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY provider,account,window_kind,window_scope_value ORDER BY at DESC,id DESC) AS rank FROM usage_samples WHERE (?1 IS NULL OR provider=?1) AND (?2 IS NULL OR account IS ?2)) WHERE rank=1 ORDER BY provider,account,window_kind,window_scope_value";
         let mut stmt = self.connection.prepare(sql)?;
         let rows = stmt.query_map(
-            params![provider.map(json).transpose()?, account.map(json).transpose()?],
+            params![
+                provider.map(json).transpose()?,
+                account.map(json).transpose()?
+            ],
             decode_usage_sample_row,
         )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -287,6 +297,53 @@ impl Store {
             params![s.id.0,json(&s.harness)?,opt_json(&s.model)?,opt_json(&s.account)?,s.cwd,s.state_path,s.context_window_size.map(|x|x as i64),s.last_known_token_count.map(|x|x as i64),json(&s.launch_mode)?,s.pid.map(|x|x as i64),s.first_seen,s.last_seen,opt_json(&s.stopped_reason)?,Option::<String>::None,s.superseded_by.as_ref().map(|x|&x.0),s.reseeded_from.as_ref().map(|x|&x.0)],
         )?;
         Ok(())
+    }
+    /// Sets a session's title (e.g. from a discovered `ai-title` transcript
+    /// record). A `None`/empty title from discovery never overwrites a title
+    /// this session already has — discovery runs on every tick and not every
+    /// pass has fresh title evidence.
+    pub fn set_session_title(&self, id: &SessionId, title: &str) -> StoreResult<()> {
+        if title.is_empty() {
+            return Ok(());
+        }
+        self.connection.execute(
+            "UPDATE sessions SET title=? WHERE id=?",
+            params![title, id.0],
+        )?;
+        Ok(())
+    }
+    /// Resolves the title to show for a session: its own title if it has one,
+    /// else the nearest ancestor's title by walking `reseeded_from`, so a
+    /// freshly resumed session shows the conversation's real title instead of
+    /// a raw id until it earns a title of its own. Bounded to guard against a
+    /// cycle in `reseeded_from` (which should never happen, but a UI lookup
+    /// must never hang on bad data).
+    pub fn resolve_session_title(&self, id: &SessionId) -> StoreResult<Option<String>> {
+        let mut current = id.clone();
+        for _ in 0..32 {
+            let row = self.connection.query_row(
+                "SELECT title, reseeded_from FROM sessions WHERE id=?",
+                [current.0.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            );
+            let (title, reseeded_from) = match row.optional()? {
+                Some(found) => found,
+                None => return Ok(None),
+            };
+            if let Some(title) = title.filter(|t| !t.is_empty()) {
+                return Ok(Some(title));
+            }
+            match reseeded_from {
+                Some(next) if next != current.0 => current = SessionId(next),
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
     }
     pub fn update_session_observation(
         &self,
@@ -524,7 +581,12 @@ impl Store {
     ) -> StoreResult<()> {
         self.connection.execute(
             "UPDATE compaction_requests SET status=?,status_detail=?,updated_at=? WHERE id=?",
-            params![compaction_status_name(&status), compaction_status_detail(&status), Utc::now(), id.to_string()],
+            params![
+                compaction_status_name(&status),
+                compaction_status_detail(&status),
+                Utc::now(),
+                id.to_string()
+            ],
         )?;
         Ok(())
     }
@@ -571,6 +633,15 @@ impl Store {
     }
     pub fn cancel_resume_markers(&self, session_id: &SessionId) -> StoreResult<()> {
         self.connection.execute("UPDATE resume_markers SET status='cancelled',status_detail=NULL WHERE session_id=? AND status IN ('pending','scheduled')", [session_id.0.as_str()])?;
+        Ok(())
+    }
+    /// Cancels pending compaction deliveries only. Rows already claimed
+    /// (`sending`) are left alone — overwriting them races the daemon tick.
+    pub fn cancel_compaction_requests(&self, session_id: &SessionId) -> StoreResult<()> {
+        self.connection.execute(
+            "UPDATE compaction_requests SET status='cancelled',status_detail=NULL,updated_at=? WHERE session_id=? AND status='pending'",
+            params![Utc::now(), session_id.0.as_str()],
+        )?;
         Ok(())
     }
     pub fn enqueue_hook_message(
@@ -647,8 +718,7 @@ impl Store {
             ))
         })?;
         rows.map(|row| {
-            let (provider, account, last_attempt_at, last_success_at, last_error, failures) =
-                row?;
+            let (provider, account, last_attempt_at, last_success_at, last_error, failures) = row?;
             Ok(ProviderFetchStatus {
                 provider: serde_json::from_str(&provider)?,
                 account: account.map(|x| serde_json::from_str(&x)).transpose()?,
@@ -951,7 +1021,7 @@ fn decode_compaction_event_row(row: &rusqlite::Row) -> rusqlite::Result<Compacti
         completed_at: row.get(9)?,
     })
 }
-const SCHEMA: &str = r#"PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS usage_samples(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,account TEXT,window_kind TEXT NOT NULL,window_scope_value TEXT NOT NULL,pct REAL NOT NULL,resets_at TEXT,exceeded INTEGER NOT NULL,active INTEGER NOT NULL,source TEXT NOT NULL,at TEXT NOT NULL,fetched_at TEXT,credits_json TEXT);CREATE INDEX IF NOT EXISTS usage_samples_window_at ON usage_samples(provider,window_kind,window_scope_value,at);CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,harness TEXT NOT NULL,model TEXT,account TEXT,cwd TEXT NOT NULL,state_path TEXT,context_window_size INTEGER,last_known_token_count INTEGER,launch_mode TEXT NOT NULL,pid INTEGER,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,stopped_reason TEXT,stopped_window_kind TEXT,superseded_by TEXT,reseeded_from TEXT);CREATE TABLE IF NOT EXISTS session_token_usage(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),at TEXT NOT NULL,model TEXT,input_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_write_input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,UNIQUE(session_id,at,total_tokens,input_tokens,output_tokens));CREATE INDEX IF NOT EXISTS session_token_usage_session_at ON session_token_usage(session_id,at);CREATE TABLE IF NOT EXISTS resume_markers(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),reason TEXT NOT NULL,resume_at TEXT,requested_at TEXT,created_at TEXT NOT NULL,status TEXT NOT NULL,status_detail TEXT,message TEXT);CREATE INDEX IF NOT EXISTS resume_markers_session_status ON resume_markers(session_id,status);CREATE UNIQUE INDEX IF NOT EXISTS resume_markers_active ON resume_markers(session_id) WHERE status IN ('pending','scheduled');CREATE TABLE IF NOT EXISTS compaction_requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL,prompt TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS compaction_requests_session_status ON compaction_requests(session_id,status);CREATE TABLE IF NOT EXISTS threshold_overrides(id TEXT PRIMARY KEY,scope_kind TEXT NOT NULL,provider TEXT NOT NULL,model_value TEXT,session_value TEXT,field TEXT NOT NULL,value_json TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS threshold_overrides_key ON threshold_overrides(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field);CREATE TABLE IF NOT EXISTS idle_reseed_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,source_model TEXT NOT NULL,summary_text TEXT NOT NULL,token_count_before INTEGER NOT NULL,token_count_after INTEGER NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS keepalive_config(session_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL,last_ping_at TEXT,ping_day TEXT,ping_count INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS hook_messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,text TEXT NOT NULL,created_at TEXT NOT NULL,delivered_at TEXT);CREATE INDEX IF NOT EXISTS hook_messages_delivery ON hook_messages(session_id,event,delivered_at,created_at);CREATE TABLE IF NOT EXISTS hook_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,created_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS hook_events_session_created ON hook_events(session_id,created_at);CREATE TABLE IF NOT EXISTS provider_fetch_status(provider TEXT NOT NULL,account TEXT,last_attempt_at TEXT NOT NULL,last_success_at TEXT,last_error TEXT,consecutive_failures INTEGER NOT NULL DEFAULT 0);CREATE UNIQUE INDEX IF NOT EXISTS provider_fetch_status_key ON provider_fetch_status(provider,COALESCE(account,''));CREATE TABLE IF NOT EXISTS compaction_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),source TEXT NOT NULL,trigger TEXT,context_pct_before REAL,usage_window_pct_before REAL,tokens_before INTEGER,tokens_after INTEGER,started_at TEXT NOT NULL,completed_at TEXT);CREATE INDEX IF NOT EXISTS compaction_events_session_started ON compaction_events(session_id,started_at);CREATE INDEX IF NOT EXISTS compaction_events_started ON compaction_events(started_at);"#;
+const SCHEMA: &str = r#"PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS usage_samples(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,account TEXT,window_kind TEXT NOT NULL,window_scope_value TEXT NOT NULL,pct REAL NOT NULL,resets_at TEXT,exceeded INTEGER NOT NULL,active INTEGER NOT NULL,source TEXT NOT NULL,at TEXT NOT NULL,fetched_at TEXT,credits_json TEXT);CREATE INDEX IF NOT EXISTS usage_samples_window_at ON usage_samples(provider,window_kind,window_scope_value,at);CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,harness TEXT NOT NULL,model TEXT,account TEXT,cwd TEXT NOT NULL,state_path TEXT,context_window_size INTEGER,last_known_token_count INTEGER,launch_mode TEXT NOT NULL,pid INTEGER,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,stopped_reason TEXT,stopped_window_kind TEXT,superseded_by TEXT,reseeded_from TEXT,title TEXT);CREATE TABLE IF NOT EXISTS session_token_usage(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),at TEXT NOT NULL,model TEXT,input_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_write_input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,UNIQUE(session_id,at,total_tokens,input_tokens,output_tokens));CREATE INDEX IF NOT EXISTS session_token_usage_session_at ON session_token_usage(session_id,at);CREATE TABLE IF NOT EXISTS resume_markers(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),reason TEXT NOT NULL,resume_at TEXT,requested_at TEXT,created_at TEXT NOT NULL,status TEXT NOT NULL,status_detail TEXT,message TEXT);CREATE INDEX IF NOT EXISTS resume_markers_session_status ON resume_markers(session_id,status);CREATE UNIQUE INDEX IF NOT EXISTS resume_markers_active ON resume_markers(session_id) WHERE status IN ('pending','scheduled');CREATE TABLE IF NOT EXISTS compaction_requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL,prompt TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS compaction_requests_session_status ON compaction_requests(session_id,status);CREATE TABLE IF NOT EXISTS threshold_overrides(id TEXT PRIMARY KEY,scope_kind TEXT NOT NULL,provider TEXT NOT NULL,model_value TEXT,session_value TEXT,field TEXT NOT NULL,value_json TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS threshold_overrides_key ON threshold_overrides(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field);CREATE TABLE IF NOT EXISTS idle_reseed_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,source_model TEXT NOT NULL,summary_text TEXT NOT NULL,token_count_before INTEGER NOT NULL,token_count_after INTEGER NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS keepalive_config(session_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL,last_ping_at TEXT,ping_day TEXT,ping_count INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS hook_messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,text TEXT NOT NULL,created_at TEXT NOT NULL,delivered_at TEXT);CREATE INDEX IF NOT EXISTS hook_messages_delivery ON hook_messages(session_id,event,delivered_at,created_at);CREATE TABLE IF NOT EXISTS hook_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,created_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS hook_events_session_created ON hook_events(session_id,created_at);CREATE TABLE IF NOT EXISTS provider_fetch_status(provider TEXT NOT NULL,account TEXT,last_attempt_at TEXT NOT NULL,last_success_at TEXT,last_error TEXT,consecutive_failures INTEGER NOT NULL DEFAULT 0);CREATE UNIQUE INDEX IF NOT EXISTS provider_fetch_status_key ON provider_fetch_status(provider,COALESCE(account,''));CREATE TABLE IF NOT EXISTS compaction_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),source TEXT NOT NULL,trigger TEXT,context_pct_before REAL,usage_window_pct_before REAL,tokens_before INTEGER,tokens_after INTEGER,started_at TEXT NOT NULL,completed_at TEXT);CREATE INDEX IF NOT EXISTS compaction_events_session_started ON compaction_events(session_id,started_at);CREATE INDEX IF NOT EXISTS compaction_events_started ON compaction_events(started_at);"#;
 
 #[cfg(test)]
 mod tests {
@@ -978,6 +1048,78 @@ mod tests {
             reseeded_from: None,
         }
     }
+    #[test]
+    fn resolve_session_title_walks_the_reseeded_from_chain() {
+        let store = Store::open_memory().unwrap();
+        let original = SessionId("original".into());
+        let resumed = SessionId("resumed".into());
+        let untitled_grandchild = SessionId("untitled-grandchild".into());
+
+        store.insert_session(&session(&original)).unwrap();
+        store
+            .set_session_title(&original, "Fix the retry loop")
+            .unwrap();
+
+        store
+            .insert_session(&SessionSummary {
+                reseeded_from: Some(original.clone()),
+                ..session(&resumed)
+            })
+            .unwrap();
+
+        store
+            .insert_session(&SessionSummary {
+                reseeded_from: Some(resumed.clone()),
+                ..session(&untitled_grandchild)
+            })
+            .unwrap();
+
+        assert_eq!(
+            store.resolve_session_title(&original).unwrap(),
+            Some("Fix the retry loop".into())
+        );
+        assert_eq!(
+            store.resolve_session_title(&resumed).unwrap(),
+            Some("Fix the retry loop".into()),
+            "a session with no title of its own should inherit its ancestor's"
+        );
+        assert_eq!(
+            store.resolve_session_title(&untitled_grandchild).unwrap(),
+            Some("Fix the retry loop".into()),
+            "inheritance should walk more than one hop"
+        );
+
+        store
+            .set_session_title(&resumed, "Retry loop, take two")
+            .unwrap();
+        assert_eq!(
+            store.resolve_session_title(&untitled_grandchild).unwrap(),
+            Some("Retry loop, take two".into()),
+            "should stop at the nearest titled ancestor, not always the root"
+        );
+    }
+
+    #[test]
+    fn resolve_session_title_is_none_when_nothing_in_the_chain_has_one() {
+        let store = Store::open_memory().unwrap();
+        let id = SessionId("no-title-anywhere".into());
+        store.insert_session(&session(&id)).unwrap();
+        assert_eq!(store.resolve_session_title(&id).unwrap(), None);
+    }
+
+    #[test]
+    fn set_session_title_ignores_an_empty_title() {
+        let store = Store::open_memory().unwrap();
+        let id = SessionId("s".into());
+        store.insert_session(&session(&id)).unwrap();
+        store.set_session_title(&id, "Real title").unwrap();
+        store.set_session_title(&id, "").unwrap();
+        assert_eq!(
+            store.resolve_session_title(&id).unwrap(),
+            Some("Real title".into())
+        );
+    }
+
     #[test]
     fn schema_and_sample_round_trip() {
         let mut s = Store::open_memory().unwrap();
@@ -1221,10 +1363,7 @@ mod tests {
 
         s.delete_session(&sid).unwrap();
 
-        assert!(matches!(
-            s.read_session(&sid),
-            Err(StoreError::NotFound)
-        ));
+        assert!(matches!(s.read_session(&sid), Err(StoreError::NotFound)));
         assert!(s.resume_markers_for_session(&sid).unwrap().is_empty());
         assert!(s.compaction_requests_for_session(&sid).unwrap().is_empty());
         assert!(matches!(s.delete_session(&sid), Err(StoreError::NotFound)));
@@ -1423,8 +1562,13 @@ mod tests {
         let t0 = Utc::now();
         s.record_fetch_failure(&Provider::Codex, None, t0, "boom")
             .unwrap();
-        s.record_fetch_failure(&Provider::Codex, None, t0 + Duration::minutes(1), "boom again")
-            .unwrap();
+        s.record_fetch_failure(
+            &Provider::Codex,
+            None,
+            t0 + Duration::minutes(1),
+            "boom again",
+        )
+        .unwrap();
         let statuses = s.fetch_statuses().unwrap();
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].consecutive_failures, 2);

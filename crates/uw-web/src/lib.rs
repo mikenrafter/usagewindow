@@ -630,8 +630,10 @@ async fn sessions(
                     .map(|k| k.enabled)
                     .unwrap_or(false);
                 let cached = store.session_cache_warm(&s.id, now)?;
+                let title = store.resolve_session_title(&s.id)?;
                 items.push(SessionListItem {
                     id: s.id,
+                    title,
                     harness: s.harness,
                     model: s.model,
                     account: s.account,
@@ -657,6 +659,7 @@ async fn sessions(
 
 fn detail(store: &Store, id: &SessionId) -> anyhow::Result<SessionDetail> {
     let summary = store.read_session(id)?;
+    let title = store.resolve_session_title(id)?;
     let markers = store.resume_markers_for_session(id)?;
     let marker = markers.last().cloned();
     let history = store
@@ -687,6 +690,7 @@ fn detail(store: &Store, id: &SessionId) -> anyhow::Result<SessionDetail> {
     }));
     Ok(SessionDetail {
         summary,
+        title,
         history,
         resume_controls: ResumeControls {
             can_resume: marker.is_some(),

@@ -530,8 +530,7 @@ impl DirectReader for StoreReader {
         stopped: bool,
         harness: Option<&Provider>,
     ) -> Result<Vec<SessionListItem>> {
-        self
-            .store
+        self.store
             .list_sessions()?
             .into_iter()
             .filter(|s| {
@@ -554,8 +553,10 @@ impl DirectReader for StoreReader {
                     .compaction_requests_for_session(&id)?
                     .last()
                     .map(|r| r.status.clone());
+                let title = self.store.resolve_session_title(&id)?;
                 Ok(SessionListItem {
                     id,
+                    title,
                     harness: s.harness,
                     model: s.model,
                     account: s.account,
@@ -586,8 +587,10 @@ impl DirectReader for StoreReader {
                 })
             })
             .collect();
+        let title = self.store.resolve_session_title(id)?;
         Ok(SessionDetail {
             summary,
+            title,
             history,
             resume_controls: ResumeControls {
                 can_resume: marker.is_some(),

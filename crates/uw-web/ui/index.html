@@ -46,6 +46,8 @@
   .pill.inline { color: var(--ok); border-color: var(--ok); }
   .pill.external { color: var(--warn); border-color: var(--warn); }
   .muted { color: var(--muted); }
+  .sid-sub { font-size: 0.75rem; font-weight: 400; margin-top: 0.1rem; word-break: break-all; }
+  .detail-title { margin: 0 0 0.8rem; font-size: 1rem; color: var(--text); }
   .kv { display: grid; grid-template-columns: 11rem 1fr; gap: 0.35rem 0.8rem; font-size: 0.85rem; margin-bottom: 1rem; }
   .kv .k { color: var(--muted); }
   .kv .v { word-break: break-word; }
@@ -203,7 +205,7 @@
     </div>
     <div id="err" class="err"></div>
     <table>
-      <thead><tr><th>id</th><th>harness</th><th>model</th><th>account</th><th>last seen</th><th>status</th></tr></thead>
+      <thead><tr><th>session</th><th>harness</th><th>model</th><th>account</th><th>last seen</th><th>status</th></tr></thead>
       <tbody id="rows"><tr><td colspan="6" class="empty">loading…</td></tr></tbody>
     </table>
     <div class="pager">
@@ -344,6 +346,11 @@ document.addEventListener('click', event => {
   const account = event.target.closest('.acct');
   if (account) account.classList.toggle('revealed');
 });
+
+function sessionLabel(s) {
+  if (!s.title) return escapeHtml(s.id);
+  return `${escapeHtml(s.title)}<div class="sid-sub muted">${escapeHtml(s.id)}</div>`;
+}
 
 function providerLabel(p) {
   if (typeof p === 'string') return ({ ClaudeCode: 'Claude', Codex: 'Codex', Cursor: 'Cursor' })[p] || p;
@@ -513,7 +520,7 @@ async function loadSessions() {
   } else {
     rows.innerHTML = items.map(s => `
       <tr data-id="${escapeHtml(s.id)}" class="${s.id === selectedId ? 'selected' : ''}">
-        <td data-label="id">${escapeHtml(s.id)}</td>
+        <td data-label="session">${sessionLabel(s)}</td>
         <td data-label="harness">${escapeHtml(providerLabel(s.harness))}</td>
         <td data-label="model">${escapeHtml(s.model || '-')}</td>
         <td data-label="account" class="muted acct">${escapeHtml(s.account || '-')}</td>
@@ -545,6 +552,7 @@ async function selectSession(id) {
   const listItem = sessionsById.get(id);
   const keptAlive = listItem ? listItem.keepalive : false;
   detail.innerHTML = `
+    ${d.title ? `<h3 class="detail-title">${escapeHtml(d.title)}</h3>` : ''}
     ${d.errors.length ? `<div class="errorbox"><h3>Errors</h3><ul>${d.errors.map(error => `<li>${escapeHtml(error)}</li>`).join('')}</ul></div>` : ''}
     <div class="kv">
       <div class="k">id</div><div class="v">${escapeHtml(s.id)}</div>

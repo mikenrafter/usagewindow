@@ -83,6 +83,10 @@ pub struct DiscoveredSession {
     pub state_path: Option<String>,
     /// Per-turn token usage recovered from the session's on-disk rollout.
     pub token_usage: Vec<TokenUsageRecord>,
+    /// A human-readable title recovered from the on-disk record, if the
+    /// harness (or a tool observing it) writes one. `None` when the harness
+    /// has no title concept — the UI falls back to the session id.
+    pub title: Option<String>,
 }
 /// Token accounting emitted by a harness for one response. Cached input is a
 /// subset of input tokens; cache-write tokens are reported separately when the
