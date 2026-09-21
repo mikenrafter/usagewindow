@@ -94,21 +94,43 @@ returns:
 }
 ```
 
-Two things worth noting for whoever picks this up next:
+One thing worth noting for whoever picks this up next: **`thread.title` exists
+and is populated** ("Connectivity Test Ping" on the thread checked here) — T3Code
+has its own title, independently of Claude's `ai-title` transcript records. If
+usagewindow ever surfaces T3Code sessions with titles, this is the field, not
+something synthesized.
 
-- **`thread.title` exists and is populated** ("Connectivity Test Ping" on the
-  thread checked here) — T3Code has its own title, independently of Claude's
-  `ai-title` transcript records. If usagewindow ever surfaces T3Code sessions
-  with titles, this is the field, not something synthesized.
-- **`session.lastError` is the presumed stop-detection signal, but this pass
-  only observed it as `null`** on a thread that ended normally (`status:
-  "stopped"`, no error). Its shape when a thread actually stops from a
-  provider rate limit is unverified — I do not know whether it is a string, a
-  structured object, what field would carry a Claude-shaped `rate_limit_error`
-  the same way the Claude Code transcript adapter checks for one, or whether
-  `status` takes on a distinct value (e.g. `"error"`) versus staying
-  `"stopped"` with only `lastError` populated. Implementing `detect_stop`
-  against a guessed shape here would repeat the exact mistake the Claude/Codex
-  stop-detection fixes were written to stop doing (inventing a stop instead of
-  evidencing one). This needs one real example: a T3Code thread that actually
-  hit a provider quota limit, inspected the same way.
+## Stop detection: verified quota-error shape (verified 2026-09-21)
+
+Thread `35a334bc-07c7-432b-9942-6da8b512fb6a`, a Codex-backed thread that had
+actually hit its provider's quota limit, returned:
+
+```json
+"session": {
+  "threadId": "35a334bc-07c7-432b-9942-6da8b512fb6a",
+  "status": "error",
+  "providerName": "codex",
+  "providerInstanceId": "codex",
+  "runtimeMode": "full-access",
+  "activeTurnId": null,
+  "lastError": "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 3:48 AM.",
+  "updatedAt": "2026-09-21T06:25:25.218Z"
+}
+```
+
+Confirms: `status` does take a distinct value (`"error"`, not `"stopped"`) for
+a quota-limit stop, and `lastError` is a plain string — provider-passthrough
+text, not a structured code. Since T3Code can host more than one underlying
+provider (`providerName` here is `codex`, not `claudeAgent`), the adapter's
+`detect_stop` gates on `status == "error"` and then matches the `lastError`
+text against the quota phrasing already trusted elsewhere in this codebase
+("usage limit" from Codex's own message, "rate limit" as the general Claude
+`rate_limit_error` shape) rather than inventing new evidence. Implemented in
+`crates/uw-adapters/src/t3code.rs`.
+
+Still unverified: a Claude-backed T3Code thread's `lastError` text for a
+quota stop (this example is Codex-backed) — if it turns out to phrase
+differently than either "usage limit" or "rate limit", `detect_stop` will
+silently under-report it as "not stopped" rather than false-positive, which
+is the safe failure direction but worth tightening if a Claude-backed example
+ever turns up.

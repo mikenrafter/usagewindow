@@ -18,6 +18,9 @@ pub enum T3CodeAuth {
 #[async_trait]
 pub trait T3CodeTransport: Send + Sync {
     async fn post_dispatch(&self, payload: Value) -> AdapterResult<Value>;
+    /// `GET /api/orchestration/threads/:thread_id`. Returns the raw response
+    /// body; callers read `thread.session.status`/`lastError` out of it.
+    async fn get_thread(&self, thread_id: &str) -> AdapterResult<Value>;
 }
 
 /// HTTP transport for a running T3Code environment server.
@@ -37,17 +40,15 @@ impl T3CodeHttpTransport {
     }
 }
 
-#[async_trait]
-impl T3CodeTransport for T3CodeHttpTransport {
-    async fn post_dispatch(&self, payload: Value) -> AdapterResult<Value> {
-        let mut request = self
-            .client
-            .post(format!("{}/api/orchestration/dispatch", self.base_url))
-            .json(&payload);
-        request = match &self.auth {
-            T3CodeAuth::Bearer(token) => request.bearer_auth(token),
-            T3CodeAuth::Cookie(cookie) => request.header(reqwest::header::COOKIE, cookie),
-        };
+impl T3CodeHttpTransport {
+    fn authed(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.auth {
+            T3CodeAuth::Bearer(token) => builder.bearer_auth(token),
+            T3CodeAuth::Cookie(cookie) => builder.header(reqwest::header::COOKIE, cookie),
+        }
+    }
+
+    async fn send(&self, request: reqwest::RequestBuilder, what: &str) -> AdapterResult<Value> {
         let response = request
             .send()
             .await
@@ -62,10 +63,30 @@ impl T3CodeTransport for T3CodeHttpTransport {
         }
         if !status.is_success() {
             return Err(AdapterError::Other(format!(
-                "T3Code dispatch failed ({status}): {body}"
+                "T3Code {what} failed ({status}): {body}"
             )));
         }
         Ok(body)
+    }
+}
+
+#[async_trait]
+impl T3CodeTransport for T3CodeHttpTransport {
+    async fn post_dispatch(&self, payload: Value) -> AdapterResult<Value> {
+        let request = self.authed(
+            self.client
+                .post(format!("{}/api/orchestration/dispatch", self.base_url))
+                .json(&payload),
+        );
+        self.send(request, "dispatch").await
+    }
+
+    async fn get_thread(&self, thread_id: &str) -> AdapterResult<Value> {
+        let request = self.authed(self.client.get(format!(
+            "{}/api/orchestration/threads/{thread_id}",
+            self.base_url
+        )));
+        self.send(request, "thread read").await
     }
 }
 
@@ -113,8 +134,40 @@ impl HarnessAdapter for T3CodeAdapter {
         Err(AdapterError::Unsupported)
     }
 
-    async fn detect_stop(&self, _: &SessionId) -> AdapterResult<Option<StopReason>> {
-        Err(AdapterError::Unsupported)
+    /// Verified against a live T3Code thread that actually hit a provider
+    /// quota limit (`status: "error"`, `lastError` a plain string containing
+    /// "usage limit" from a Codex-backed thread; see docs/research-t3code.md).
+    /// `lastError`'s shape is provider-free text, not a structured code, so
+    /// this matches the same quota phrasing already trusted elsewhere in this
+    /// codebase (Codex's own "usage limit" message, Claude's
+    /// "rate_limit_error"/"rate limit") rather than inventing new evidence.
+    /// A thread with any other status, or an error that doesn't look
+    /// quota-shaped, reports no stop — this never guesses.
+    async fn detect_stop(&self, session_id: &SessionId) -> AdapterResult<Option<StopReason>> {
+        let thread = self.transport.get_thread(&session_id.0).await?;
+        let session = thread.pointer("/thread/session");
+        let status = session
+            .and_then(|s| s.get("status"))
+            .and_then(Value::as_str);
+        if status != Some("error") {
+            return Ok(None);
+        }
+        let Some(error) = session
+            .and_then(|s| s.get("lastError"))
+            .and_then(Value::as_str)
+        else {
+            return Ok(None);
+        };
+        let lower = error.to_ascii_lowercase();
+        if !(lower.contains("usage limit") || lower.contains("rate limit")) {
+            return Ok(None);
+        }
+        Ok(Some(StopReason::UsageLimit {
+            window: WindowKey {
+                provider: Provider::Other("t3code".into()),
+                kind: WindowKind::Custom("quota".into()),
+            },
+        }))
     }
 
     async fn emit_status(&self, _: &SessionId, _: StatusEvent) -> AdapterResult<DeliveryOutcome> {
@@ -188,6 +241,23 @@ mod tests {
 
     struct FakeTransport {
         calls: Mutex<Vec<(String, Value)>>,
+        thread: Mutex<Option<Value>>,
+    }
+
+    impl FakeTransport {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                thread: Mutex::new(None),
+            }
+        }
+
+        fn with_thread(thread: Value) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                thread: Mutex::new(Some(thread)),
+            }
+        }
     }
 
     #[async_trait]
@@ -198,6 +268,18 @@ mod tests {
                 .unwrap()
                 .push(("dispatch".into(), payload));
             Ok(serde_json::json!({"sequence": 108562}))
+        }
+
+        async fn get_thread(&self, thread_id: &str) -> AdapterResult<Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("get_thread".into(), Value::String(thread_id.into())));
+            self.thread
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or(AdapterError::Other("no thread fixture set".into()))
         }
     }
 
@@ -225,9 +307,7 @@ mod tests {
 
     #[tokio::test]
     async fn sends_a_native_thread_turn() {
-        let transport = std::sync::Arc::new(FakeTransport {
-            calls: Mutex::new(Vec::new()),
-        });
+        let transport = std::sync::Arc::new(FakeTransport::new());
         let adapter = T3CodeAdapter::new(transport.clone());
 
         adapter
@@ -247,9 +327,7 @@ mod tests {
 
     #[tokio::test]
     async fn sends_compact_as_a_meta_harness_message() {
-        let transport = std::sync::Arc::new(FakeTransport {
-            calls: Mutex::new(Vec::new()),
-        });
+        let transport = std::sync::Arc::new(FakeTransport::new());
         let adapter = T3CodeAdapter::new(transport.clone());
         let request = CompactionRequest {
             id: uuid::Uuid::new_v4(),
@@ -290,14 +368,77 @@ mod tests {
         );
     }
 
+    /// Shape verified live against a T3Code thread that actually hit a
+    /// provider quota limit (see docs/research-t3code.md): a Codex-backed
+    /// thread with `status: "error"` and a plain-string `lastError`.
+    fn error_thread(last_error: &str) -> Value {
+        serde_json::json!({
+            "thread": {
+                "id": session().id.0,
+                "session": {
+                    "threadId": session().id.0,
+                    "status": "error",
+                    "providerName": "codex",
+                    "providerInstanceId": "codex",
+                    "runtimeMode": "full-access",
+                    "activeTurnId": null,
+                    "lastError": last_error,
+                    "updatedAt": "2026-09-21T06:25:25.218Z",
+                }
+            }
+        })
+    }
+
     #[tokio::test]
-    async fn unverified_stop_detection_is_reported_as_unsupported() {
-        let adapter = T3CodeAdapter::new(Arc::new(FakeTransport {
-            calls: Mutex::new(Vec::new()),
-        }));
-        assert!(matches!(
-            adapter.detect_stop(&session().id).await,
-            Err(AdapterError::Unsupported)
-        ));
+    async fn stop_detection_reports_a_verified_quota_error_thread() {
+        let adapter = T3CodeAdapter::new(Arc::new(FakeTransport::with_thread(error_thread(
+            "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), \
+             visit https://chatgpt.com/codex/settings/usage to purchase more credits or try \
+             again at 3:48 AM.",
+        ))));
+        assert_eq!(
+            adapter.detect_stop(&session().id).await.unwrap(),
+            Some(StopReason::UsageLimit {
+                window: WindowKey {
+                    provider: Provider::Other("t3code".into()),
+                    kind: WindowKind::Custom("quota".into()),
+                },
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_detection_does_not_invent_a_stop_for_a_non_quota_error() {
+        let adapter = T3CodeAdapter::new(Arc::new(FakeTransport::with_thread(error_thread(
+            "internal server error",
+        ))));
+        assert_eq!(adapter.detect_stop(&session().id).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn stop_detection_does_not_invent_a_stop_for_a_normally_stopped_thread() {
+        let normal = serde_json::json!({
+            "thread": {
+                "id": session().id.0,
+                "session": {
+                    "threadId": session().id.0,
+                    "status": "stopped",
+                    "providerName": "claudeAgent",
+                    "providerInstanceId": "claudeAgent",
+                    "runtimeMode": "full-access",
+                    "activeTurnId": null,
+                    "lastError": null,
+                    "updatedAt": "2026-09-18T06:31:17.415Z",
+                }
+            }
+        });
+        let adapter = T3CodeAdapter::new(Arc::new(FakeTransport::with_thread(normal)));
+        assert_eq!(adapter.detect_stop(&session().id).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn stop_detection_propagates_a_transport_error_instead_of_guessing() {
+        let adapter = T3CodeAdapter::new(Arc::new(FakeTransport::new()));
+        assert!(adapter.detect_stop(&session().id).await.is_err());
     }
 }
