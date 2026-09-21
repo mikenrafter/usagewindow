@@ -5,9 +5,9 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::sync::LazyLock;
+use std::sync::{Arc, Mutex};
 use uw_core::adapter::{
     AdapterError, AdapterResult, Capabilities, DeliveryOutcome, DiscoveredSession, HarnessAdapter,
     SeedContext, SeedMode, StatusEvent, TokenUsageRecord, TurnPreview, TurnRole,
@@ -196,9 +196,11 @@ impl CodexAdapter {
     }
     fn resolved_sessions_root(&self) -> PathBuf {
         self.sessions_root.clone().unwrap_or_else(|| {
-            let home = std::env::var("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|_| {
-                PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".codex")
-            });
+            let home = std::env::var("CODEX_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| {
+                    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".codex")
+                });
             home.join("sessions")
         })
     }
@@ -306,7 +308,11 @@ impl HarnessAdapter for CodexAdapter {
             let mins = limits
                 .pointer("/primary/windowDurationMins")
                 .and_then(Value::as_u64)
-                .unwrap_or(300) as u32;
+                .ok_or_else(|| {
+                    AdapterError::Other(
+                        "rate limit reached but window duration is missing from account/rateLimits/read".into(),
+                    )
+                })? as u32;
             return Ok(Some(StopReason::UsageLimit {
                 window: WindowKey {
                     provider: Provider::Codex,
@@ -328,7 +334,9 @@ impl HarnessAdapter for CodexAdapter {
             .windows
             .iter()
             .find(|(_, window)| window.exceeded)
-            .map(|(window, _)| StopReason::UsageLimit { window: window.clone() }))
+            .map(|(window, _)| StopReason::UsageLimit {
+                window: window.clone(),
+            }))
     }
     async fn emit_status(
         &self,
@@ -376,10 +384,7 @@ impl HarnessAdapter for CodexAdapter {
             .await?;
         let response = self
             .transport
-            .call(
-                "thread/compact/start",
-                json!({"threadId": session.id.0}),
-            )
+            .call("thread/compact/start", json!({"threadId": session.id.0}))
             .await?;
         if let Some(error) = response.get("error") {
             return Err(AdapterError::Other(error.to_string()));
@@ -393,15 +398,15 @@ impl HarnessAdapter for CodexAdapter {
     ) -> AdapterResult<()> {
         let message = message.unwrap_or("Continue from the saved state.");
         let resume = self.spawner.run(ProcessSpec {
-                program: "codex".into(),
-                args: vec![
-                    "exec".into(),
-                    "resume".into(),
-                    session.id.0.clone(),
-                    message.into(),
-                ],
-                cwd: session.cwd.clone(),
-            });
+            program: "codex".into(),
+            args: vec![
+                "exec".into(),
+                "resume".into(),
+                session.id.0.clone(),
+                message.into(),
+            ],
+            cwd: session.cwd.clone(),
+        });
         match resume.await {
             Ok(_) => Ok(()),
             Err(error) if error.to_string().contains("active writer") => self
@@ -495,11 +500,18 @@ impl HarnessAdapter for CodexAdapter {
                 .map(|old| {
                     let old_count = old.session.token_usage.len();
                     let mut delta = session.clone();
-                    delta.token_usage = session.token_usage[old_count.min(session.token_usage.len())..].to_vec();
+                    delta.token_usage =
+                        session.token_usage[old_count.min(session.token_usage.len())..].to_vec();
                     delta
                 })
                 .unwrap_or_else(|| session.clone());
-            cache.insert(path, CachedRollout { fingerprint, session });
+            cache.insert(
+                path,
+                CachedRollout {
+                    fingerprint,
+                    session,
+                },
+            );
             found.push(returned);
         }
         Ok(found)
@@ -512,13 +524,13 @@ impl HarnessAdapter for CodexAdapter {
         tokio::task::spawn_blocking(move || {
             // A session tracked via hooks (not discovery) never had `state_path` set —
             // find its rollout file by id so the preview still works for it.
-            let path = known_path
-                .map(PathBuf::from)
-                .or_else(|| rollout_files(&root).into_iter().find(|p| {
+            let path = known_path.map(PathBuf::from).or_else(|| {
+                rollout_files(&root).into_iter().find(|p| {
                     p.file_stem()
                         .and_then(|s| s.to_str())
                         .is_some_and(|name| name.ends_with(&id))
-                }))?;
+                })
+            })?;
             rollout_turn_preview(&path)
         })
         .await
@@ -992,10 +1004,7 @@ done
         }
 
         let adapter = CodexAdapter::new(Arc::new(LimitWithoutWindow));
-        assert!(adapter
-            .detect_stop(&SessionId("s".into()))
-            .await
-            .is_err());
+        assert!(adapter.detect_stop(&SessionId("s".into())).await.is_err());
     }
 
     struct RpcWithLimit;
@@ -1063,9 +1072,12 @@ done
         let a = CodexAdapter::new(Arc::new(RecordingRpc(calls.clone())));
         let id = SessionId("s".into());
         assert_eq!(
-            a.advise(&id, "[[uw-keepalive]] no action needed, acknowledge briefly")
-                .await
-                .unwrap(),
+            a.advise(
+                &id,
+                "[[uw-keepalive]] no action needed, acknowledge briefly"
+            )
+            .await
+            .unwrap(),
             DeliveryOutcome::Delivered
         );
         assert_eq!(
@@ -1130,7 +1142,9 @@ done
             let mut specs = self.specs.lock().unwrap();
             specs.push(spec);
             if specs.len() == 1 {
-                Err(AdapterError::Other("thread-store conflict: active writer".into()))
+                Err(AdapterError::Other(
+                    "thread-store conflict: active writer".into(),
+                ))
             } else {
                 Ok(crate::process::ProcessOutput::default())
             }
@@ -1324,11 +1338,13 @@ done
             .await
             .unwrap();
         assert_eq!(
-            preview
-                .iter()
-                .map(|t| t.text.as_str())
-                .collect::<Vec<_>>(),
-            vec!["first question", "first answer", "last question", "last answer"]
+            preview.iter().map(|t| t.text.as_str()).collect::<Vec<_>>(),
+            vec![
+                "first question",
+                "first answer",
+                "last question",
+                "last answer"
+            ]
         );
 
         std::fs::remove_dir_all(&root).ok();

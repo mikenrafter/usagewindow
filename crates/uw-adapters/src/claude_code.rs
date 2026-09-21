@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use uw_core::adapter::{
-    AdapterError, AdapterResult, Capabilities, DeliveryOutcome, DiscoveredSession,
-    HarnessAdapter, SeedContext, SeedMode, StatusEvent, TokenUsageRecord,
+    AdapterError, AdapterResult, Capabilities, DeliveryOutcome, DiscoveredSession, HarnessAdapter,
+    SeedContext, SeedMode, StatusEvent, TokenUsageRecord,
 };
 use uw_core::model::*;
 
@@ -19,6 +19,25 @@ pub trait TranscriptFileSystem: Send + Sync {
 }
 
 pub struct ClaudeTranscriptFileSystem;
+
+/// Usage percentage at or above which a transcript quota error is corroborated
+/// by the provider's own reported usage, rather than some unrelated error.
+const NEAR_LIMIT_STOP_PCT: f32 = 95.0;
+
+fn transcript_has_quota_error(content: &str) -> bool {
+    content.lines().any(|line| {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        record.get("type").and_then(Value::as_str) == Some("error")
+            && record
+                .get("error")
+                .and_then(|error| error.get("type"))
+                .and_then(Value::as_str)
+                == Some("rate_limit_error")
+    })
+}
+
 pub fn filter_keepalive_transcript(content: &str) -> String {
     content
         .lines()
@@ -320,6 +339,20 @@ impl ClaudeCodeAdapter {
         })
     }
 }
+impl ClaudeCodeAdapter {
+    async fn has_quota_error_evidence(&self, session_id: &SessionId) -> AdapterResult<bool> {
+        for path in self.transcript_fs.jsonl_files().await? {
+            let content = self.transcript_fs.read_to_string(&path).await?;
+            if !path.contains(&session_id.0) && !content.contains(&session_id.0) {
+                continue;
+            }
+            if transcript_has_quota_error(&content) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
 fn account_from_credentials(value: &Value) -> Option<AccountId> {
     [
         "/claudeAiOauth/email",
@@ -398,6 +431,25 @@ impl HarnessAdapter for ClaudeCodeAdapter {
     async fn detect_stop(&self, _: &SessionId) -> AdapterResult<Option<StopReason>> {
         Ok(None)
     }
+    async fn detect_stop_with_usage(
+        &self,
+        session_id: &SessionId,
+        sample: Option<&UsageSample>,
+    ) -> AdapterResult<Option<StopReason>> {
+        let Some(sample) = sample else {
+            return Ok(None);
+        };
+        if !self.has_quota_error_evidence(session_id).await? {
+            return Ok(None);
+        }
+        Ok(sample
+            .windows
+            .iter()
+            .find(|(_, window)| window.pct >= NEAR_LIMIT_STOP_PCT)
+            .map(|(window, _)| StopReason::UsageLimit {
+                window: window.clone(),
+            }))
+    }
     async fn emit_status(
         &self,
         session: &SessionId,
@@ -434,7 +486,11 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         message: Option<&str>,
     ) -> AdapterResult<()> {
         validate_session_owner(session)?;
-        let mut args = vec!["--print".to_string(), "--resume".into(), session.id.0.clone()];
+        let mut args = vec![
+            "--print".to_string(),
+            "--resume".into(),
+            session.id.0.clone(),
+        ];
         if let Some(message) = message {
             args.push(message.to_string());
         }
@@ -512,7 +568,13 @@ impl HarnessAdapter for ClaudeCodeAdapter {
                     self.discovery_cache
                         .lock()
                         .map_err(|_| AdapterError::Other("discovery cache poisoned".into()))?
-                        .insert(path, CachedTranscript { fingerprint, session: session.clone() });
+                        .insert(
+                            path,
+                            CachedTranscript {
+                                fingerprint,
+                                session: session.clone(),
+                            },
+                        );
                 }
                 discovered.push(session);
             }
@@ -590,9 +652,7 @@ fn scan_transcript(path: &str, content: &str) -> Option<DiscoveredSession> {
                 .pointer("/message/usage/output_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or_default();
-            let total_input = value
-                .saturating_add(cache_read)
-                .saturating_add(cache_write);
+            let total_input = value.saturating_add(cache_read).saturating_add(cache_write);
             let total = total_input.saturating_add(output);
             let Some(at) = timestamp else { continue };
             last_known_token_count = Some(total);
@@ -762,9 +822,7 @@ mod tests {
         )
         .with_transcript_fs(Arc::new(TranscriptFixture {
             path: "/tmp/not-an-id.jsonl".into(),
-            content: format!(
-                "{{\"sessionId\":\"{first}\"}}\n{{\"sessionId\":\"{second}\"}}"
-            ),
+            content: format!("{{\"sessionId\":\"{first}\"}}\n{{\"sessionId\":\"{second}\"}}"),
         }));
 
         assert!(adapter.discover_sessions().await.unwrap().is_empty());
@@ -1149,9 +1207,7 @@ mod tests {
         ));
         let mut superseded = session(LaunchMode::Headless);
         superseded.id = SessionId("3507fe61-2d6b-4aae-a0b6-4fe4eec12b40".into());
-        superseded.superseded_by = Some(SessionId(
-            "7fd75ec4-661a-4d52-8308-b65c60f44b85".into(),
-        ));
+        superseded.superseded_by = Some(SessionId("7fd75ec4-661a-4d52-8308-b65c60f44b85".into()));
         assert!(matches!(
             adapter.resume_session(&superseded, None).await,
             Err(AdapterError::Other(message)) if message.contains("superseded")
