@@ -1853,22 +1853,13 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
 }
 
 fn cursor_auth_from_environment() -> Option<uw_adapters::cursor::CursorAuth> {
-    match (
-        std::env::var("UW_CURSOR_ACCESS_TOKEN").ok(),
-        std::env::var("UW_CURSOR_SESSION_COOKIE").ok(),
-    ) {
-        (Some(token), None) if !token.is_empty() => {
-            Some(uw_adapters::cursor::CursorAuth::Bearer(token))
-        }
-        (None, Some(cookie)) if !cookie.is_empty() => {
-            Some(uw_adapters::cursor::CursorAuth::Cookie(cookie))
-        }
-        (Some(_), Some(_)) => {
-            tracing::warn!("both Cursor auth variables are set; Cursor adapter disabled");
-            None
-        }
-        _ => None,
+    let auth = uw_adapters::cursor::CursorAuth::discover_from_environment();
+    if auth.is_none() {
+        tracing::debug!(
+            "Cursor credentials not found in environment, IDE state.vscdb, or cursor-agent auth.json"
+        );
     }
+    auth
 }
 
 struct SystemSessionLivenessChecker {

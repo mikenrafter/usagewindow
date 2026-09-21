@@ -19,6 +19,73 @@ pub enum CursorAuth {
     Cookie(String),
 }
 
+impl CursorAuth {
+    pub fn discover_from_environment() -> Option<Self> {
+        if let Ok(token) = std::env::var("UW_CURSOR_ACCESS_TOKEN")
+            && !token.is_empty()
+        {
+            return Some(Self::Bearer(token));
+        }
+        if let Ok(cookie) = std::env::var("UW_CURSOR_SESSION_COOKIE")
+            && !cookie.is_empty()
+        {
+            return Some(Self::Cookie(cookie));
+        }
+        if let Ok(token) = std::env::var("CURSOR_AUTH_TOKEN")
+            && !token.is_empty()
+        {
+            return Some(Self::Bearer(token));
+        }
+
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+        let config = std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        let state_db = std::env::var_os("CURSOR_STATE_DB")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| config.join("Cursor/User/globalStorage/state.vscdb"));
+        let cli_auth = std::env::var_os("CURSOR_CLI_AUTH_FILE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| config.join("cursor/auth.json"));
+        Self::discover(Some(&state_db), Some(&cli_auth))
+    }
+
+    pub fn discover(
+        state_db: Option<&std::path::Path>,
+        cli_auth: Option<&std::path::Path>,
+    ) -> Option<Self> {
+        state_db
+            .and_then(read_access_token_from_state_db)
+            .or_else(|| cli_auth.and_then(read_access_token_from_cli_auth))
+            .map(Self::Bearer)
+    }
+}
+
+fn read_access_token_from_state_db(path: &std::path::Path) -> Option<String> {
+    let connection = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .ok()?;
+    connection
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = 'cursorAuth/accessToken'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .filter(|token| !token.is_empty())
+}
+
+fn read_access_token_from_cli_auth(path: &std::path::Path) -> Option<String> {
+    let value: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    value
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+}
+
 pub struct CursorHttpTransport {
     client: reqwest::Client,
     auth: CursorAuth,
@@ -327,5 +394,44 @@ mod tests {
     fn cursor_has_no_destructive_harness_capabilities() {
         assert!(!CursorAdapter::capabilities_static().can_trigger_compaction);
         assert!(!CursorAdapter::capabilities_static().reports_token_counts);
+    }
+
+    #[test]
+    fn discovers_access_token_from_cursor_ide_state_database() {
+        let path =
+            std::env::temp_dir().join(format!("usagewindow-cursor-{}.vscdb", uuid::Uuid::new_v4()));
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO ItemTable (key, value) VALUES ('cursorAuth/accessToken', 'ide-token')",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            CursorAuth::discover(Some(&path), None),
+            Some(CursorAuth::Bearer("ide-token".into()))
+        );
+        drop(connection);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn falls_back_to_cursor_agent_auth_json() {
+        let path =
+            std::env::temp_dir().join(format!("usagewindow-cursor-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&path, r#"{"accessToken":"cli-token"}"#).unwrap();
+
+        assert_eq!(
+            CursorAuth::discover(None, Some(&path)),
+            Some(CursorAuth::Bearer("cli-token".into()))
+        );
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -102,19 +102,18 @@
   .errorbox { border: 1px solid var(--danger); border-radius: 6px; background: rgba(255,91,110,0.08); padding: 0.65rem 0.8rem; margin: 0 0 1rem; }
   .errorbox h3 { color: var(--danger); font-size: 0.78rem; margin: 0 0 0.4rem; text-transform: uppercase; letter-spacing: 0.04em; }
   .errorbox ul { margin: 0; padding-left: 1.1rem; color: var(--danger); font-size: 0.82rem; }
-  .usage-layout { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(280px, 1fr); gap: 1rem; align-items: start; }
-  .actions-card {
+  .actions-panel {
     background: #0d0f14; border: 1px solid var(--border); border-radius: 8px;
-    max-height: 60vh; overflow-y: auto; min-width: 0;
+    grid-column: 1 / -1; max-height: 60vh; overflow-y: auto; min-width: 0;
   }
-  .actions-card > .panelhead {
+  .actions-panel > .panelhead {
     position: sticky; top: 0; z-index: 1;
     background: #0d0f14; padding: 0.8rem 0.8rem 0.5rem;
     border-bottom: 1px solid var(--border); margin: 0;
   }
-  .actions-card > .panelhead h2 { margin: 0; }
-  .actions-card > .panelhead .muted { margin: 0; }
-  .actions-card #actions { padding: 0 0.8rem 0.8rem; }
+  .actions-panel > .panelhead h2 { margin: 0; }
+  .actions-panel > .panelhead .muted { margin: 0; }
+  .actions-panel #actions { padding: 0 0.8rem 0.8rem; }
   #login { display: none; position: fixed; inset: 0; z-index: 20; place-items: center; background: rgba(15,17,21,0.92); }
   #login.show { display: grid; }
   #login form { width: min(22rem, calc(100vw - 2rem)); background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }
@@ -183,13 +182,12 @@
       <h2>Usage</h2>
       <span id="usagemeta" class="muted"></span>
     </div>
-    <div class="usage-layout">
-      <div id="usagecards" class="cardgrid"><p class="empty">loading…</p></div>
-      <div class="actions-card">
-        <div class="panelhead"><h2>Recent actions</h2><span class="muted" style="font-size:.78rem">latest 20</span></div>
-        <div id="actions"><p class="empty">loading…</p></div>
-      </div>
-    </div>
+    <div id="usagecards" class="cardgrid"><p class="empty">loading…</p></div>
+  </section>
+
+  <section class="panel actions-panel">
+    <div class="panelhead"><h2>Recent actions</h2><span class="muted" style="font-size:.78rem">latest 20</span></div>
+    <div id="actions"><p class="empty">loading…</p></div>
   </section>
 
   <section class="panel">

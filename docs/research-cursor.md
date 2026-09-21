@@ -54,8 +54,12 @@ provider usage bars are `planUsage.autoPercentUsed` and
 
 The adapter uses either a bearer access token or an already-issued
 `WorkosCursorSessionToken` cookie. It does not attempt login, token exchange, or
-browser automation. Configure one of `UW_CURSOR_ACCESS_TOKEN` or
-`UW_CURSOR_SESSION_COOKIE`; setting both disables the daemon's Cursor adapter.
+browser automation. Explicit configuration uses `UW_CURSOR_ACCESS_TOKEN`,
+`CURSOR_AUTH_TOKEN`, or `UW_CURSOR_SESSION_COOKIE`. When those are absent, the
+daemon reads Cursor's local IDE `cursorAuth/accessToken` from
+`~/.config/Cursor/User/globalStorage/state.vscdb`, then falls back to the Cursor
+Agent CLI token in `~/.config/cursor/auth.json`. `CURSOR_STATE_DB` and
+`CURSOR_CLI_AUTH_FILE` override those paths.
 
 Cursor's bars are monthly billing-pool percentages, not duration-keyed rolling
 windows. They are stored as `WindowKind::Custom("auto")` and
