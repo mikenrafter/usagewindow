@@ -711,6 +711,12 @@ pub async fn run_observation_tick(
             continue;
         };
         let sampled_stop = fetched_samples.get(&session.harness).and_then(|sample| {
+            // Account-level exceeded is not evidence that every discovered
+            // rollout hit the limit. Only recently-active (cache-warm) chats
+            // may inherit a stop from the provider usage sample.
+            if !is_cache_warm(session.last_seen, Utc::now()) {
+                return None;
+            }
             sample
                 .windows
                 .iter()
@@ -1183,6 +1189,18 @@ pub async fn run_policy_tick(
                 session.stopped_reason.as_ref(),
                 Some(StopReason::UsageLimit { window }) if window == &key
             );
+            let window_exceeded = samples
+                .iter()
+                .filter(|sample| sample.account == session.account)
+                .filter_map(|sample| {
+                    sample
+                        .windows
+                        .get(&key)
+                        .map(|window| (sample.at, window.exceeded))
+                })
+                .max_by_key(|(at, _)| *at)
+                .is_some_and(|(_, exceeded)| exceeded);
+            let quota_exhausted = window_exceeded || current_pct >= 100.0;
             let hard_boundary_active =
                 current_pct >= profile.plan_pressure_pct || stopped_on_this_window;
             let compact_band_active = !hard_boundary_active && current_pct >= profile.compact_pct;
@@ -1192,8 +1210,43 @@ pub async fn run_policy_tick(
                 keepalive_store
                     .set_keepalive_enabled(&session.id, false)
                     .await?;
-                handle_hard_boundary(store, session, block, profile, now, sessions, &token_rates)
+                if should_enqueue_hard_boundary_compaction(
+                    session,
+                    now,
+                    current_pct,
+                    window_exceeded,
+                    stopped_on_this_window,
+                    profile,
+                ) {
+                    handle_hard_boundary(
+                        store,
+                        session,
+                        block,
+                        profile,
+                        now,
+                        sessions,
+                        &token_rates,
+                    )
                     .await?;
+                } else if quota_exhausted
+                    && stopped_on_this_window
+                    && is_cache_warm(session.last_seen, now)
+                {
+                    // Past 100% there is nothing left to reclaim by compacting.
+                    // Still schedule resume for the session that actually stopped.
+                    reconcile_resume_marker_with_token_rates(
+                        store,
+                        session,
+                        block,
+                        now,
+                        profile,
+                        session.model.as_ref().map_or("", |model| model.0.as_str()),
+                        &[],
+                        sessions,
+                        &token_rates,
+                    )
+                    .await?;
+                }
             } else if compact_band_active {
                 suppress_idle = true;
                 keepalive_store
@@ -1330,6 +1383,30 @@ impl IdleEpisodeTracker {
 }
 
 pub use uw_core::compaction::HARD_BOUNDARY_REASON;
+
+/// Destructive hard-boundary compaction is only for live chats that still have
+/// quota left to reclaim. Exhausted windows and cold/uncached archives must
+/// never receive it — spraying every discovered rollout when an account hits
+/// its limit is a catastrophic token-burn class.
+pub fn should_enqueue_hard_boundary_compaction(
+    session: &SessionSummary,
+    now: DateTime<Utc>,
+    current_pct: f32,
+    window_exceeded: bool,
+    stopped_on_this_window: bool,
+    profile: &ThresholdProfile,
+) -> bool {
+    if window_exceeded || current_pct >= 100.0 {
+        return false;
+    }
+    if !(current_pct >= profile.plan_pressure_pct || stopped_on_this_window) {
+        return false;
+    }
+    if !is_cache_warm(session.last_seen, now) {
+        return false;
+    }
+    session.last_known_token_count.unwrap_or(0) >= profile.plan_pressure_min_tokens
+}
 
 /// Drives the plan_pressure_pct hard boundary: stop, queue a blocking
 /// compaction, and only schedule an automatic resume once that specific
@@ -1758,7 +1835,9 @@ pub async fn run_production_ticks(
             if let Some(tiers) = &idle_compact_tiers {
                 profile.idle_compact.tiers = tiers.clone();
             }
-            if matches!(session.harness, Provider::ClaudeCode | Provider::Codex) {
+            if matches!(session.harness, Provider::ClaudeCode) {
+                // Codex cache TTL is unresearched — architecture forbids a
+                // guessed default that would enable opportunistic idle-compact.
                 profile.cache_ttl_by_provider.insert(
                     session.harness.clone(),
                     Duration::minutes(CACHE_WARM_APPROXIMATION_MINUTES),
@@ -2645,6 +2724,62 @@ mod tests {
             store.stops.lock().unwrap().as_slice(),
             &[(
                 SessionId("s".into()),
+                StopReason::UsageLimit { window: key }
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn observation_tick_does_not_stop_uncached_sessions_from_account_exceeded() {
+        let key = WindowKey {
+            provider: Provider::Codex,
+            kind: WindowKind::Rolling { minutes: 300 },
+        };
+        let now = Utc::now();
+        let mut cold = session();
+        cold.id = SessionId("cold-archive".into());
+        cold.harness = Provider::Codex;
+        cold.last_seen = now - Duration::hours(6);
+        let mut warm = session();
+        warm.id = SessionId("warm-live".into());
+        warm.harness = Provider::Codex;
+        warm.last_seen = now - Duration::minutes(1);
+        let store = ObservationFake {
+            sessions: vec![cold, warm],
+            samples: StdMutex::new(vec![]),
+            stops: StdMutex::new(vec![]),
+            last_hook_event: None,
+        };
+        let adapter = Arc::new(ObservationAdapter {
+            sample: UsageSample {
+                at: now,
+                fetched_at: Some(now),
+                source: UsageSource::ProviderReported,
+                provider: Provider::Codex,
+                account: None,
+                windows: HashMap::from([(
+                    key.clone(),
+                    UsageWindowState::new(100.0, true, true, None, None),
+                )]),
+                credits: None,
+            },
+            stop: Some(StopReason::UsageLimit {
+                window: key.clone(),
+            }),
+        });
+
+        let report = run_observation_tick(
+            &store,
+            &HashMap::from([(Provider::Codex, adapter as Arc<dyn HarnessAdapter>)]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.stops_recorded, 1);
+        assert_eq!(
+            store.stops.lock().unwrap().as_slice(),
+            &[(
+                SessionId("warm-live".into()),
                 StopReason::UsageLimit { window: key }
             )]
         );
@@ -3835,7 +3970,9 @@ mod tests {
 
     fn boundary_store(now: DateTime<Utc>, pct: f32) -> BoundaryStore {
         let session = SessionSummary {
-            last_seen: now - Duration::minutes(10),
+            // Warm enough for hard-boundary eligibility, idle enough for
+            // compact-band keepalive cadence (ttl 5m − margin − 1m).
+            last_seen: now - Duration::minutes(4),
             ..session()
         };
         BoundaryStore {
@@ -3972,6 +4109,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hard_boundary_does_not_enqueue_when_quota_is_already_exhausted() {
+        let now = Utc::now();
+        let mut store = boundary_store(now, 100.0);
+        store.samples = boundary_samples(now, 100.0)
+            .into_iter()
+            .map(|mut sample| {
+                for window in sample.windows.values_mut() {
+                    window.pct = 100.0;
+                    window.exceeded = true;
+                }
+                sample
+            })
+            .collect();
+        let adapter = Arc::new(BoundaryAdapter {
+            advised: StdMutex::new(vec![]),
+            resume_calls: AtomicUsize::new(0),
+        });
+        let adapters = HashMap::from([(
+            Provider::ClaudeCode,
+            adapter.clone() as Arc<dyn HarnessAdapter>,
+        )]);
+        let profiles = HashMap::from([(store.session.id.clone(), boundary_profile())]);
+
+        run_policy_tick(
+            &store,
+            &store,
+            &adapters,
+            &AlwaysIdle,
+            std::slice::from_ref(&store.session),
+            &profiles,
+            &mut PolicyRuntimeState::default(),
+            now,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            store.enqueued.lock().unwrap().is_empty(),
+            "compacting an already-exhausted window burns tokens for no reclaim"
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_boundary_does_not_enqueue_for_uncached_inactive_sessions() {
+        let now = Utc::now();
+        let mut store = boundary_store(now, 96.0);
+        store.session.last_seen = now - Duration::minutes(30);
+        let adapter = Arc::new(BoundaryAdapter {
+            advised: StdMutex::new(vec![]),
+            resume_calls: AtomicUsize::new(0),
+        });
+        let adapters = HashMap::from([(
+            Provider::ClaudeCode,
+            adapter as Arc<dyn HarnessAdapter>,
+        )]);
+        let profiles = HashMap::from([(store.session.id.clone(), boundary_profile())]);
+
+        run_policy_tick(
+            &store,
+            &store,
+            &adapters,
+            &AlwaysIdle,
+            std::slice::from_ref(&store.session),
+            &profiles,
+            &mut PolicyRuntimeState::default(),
+            now,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            store.enqueued.lock().unwrap().is_empty(),
+            "cold/uncached archives must not inherit account-level plan pressure"
+        );
+    }
+
+    #[test]
+    fn hard_boundary_enqueue_gate_rejects_exhausted_and_cold_sessions() {
+        let now = Utc::now();
+        let mut warm = session();
+        warm.last_seen = now - Duration::minutes(1);
+        let profile = boundary_profile();
+        assert!(should_enqueue_hard_boundary_compaction(
+            &warm, now, 96.0, false, false, &profile
+        ));
+        assert!(!should_enqueue_hard_boundary_compaction(
+            &warm, now, 100.0, false, false, &profile
+        ));
+        assert!(!should_enqueue_hard_boundary_compaction(
+            &warm, now, 96.0, true, false, &profile
+        ));
+        warm.last_seen = now - Duration::minutes(30);
+        assert!(!should_enqueue_hard_boundary_compaction(
+            &warm, now, 96.0, false, true, &profile
+        ));
+    }
+
+    #[tokio::test]
     async fn failed_hard_boundary_compaction_voids_resume_and_never_fires_after_reset() {
         let now = Utc::now();
         let key = WindowKey {
@@ -3984,7 +4219,7 @@ mod tests {
             }),
             ..session()
         };
-        stopped.last_seen = now - Duration::minutes(10);
+        stopped.last_seen = now - Duration::minutes(1);
         let store = Store::open_memory().unwrap();
         store.insert_session(&stopped).unwrap();
         for sample in boundary_samples(now, 96.0) {
@@ -4071,7 +4306,7 @@ mod tests {
             stopped_reason: Some(StopReason::UsageLimit { window: key }),
             ..session()
         };
-        stopped.last_seen = now - Duration::minutes(10);
+        stopped.last_seen = now - Duration::minutes(1);
         let inner = Store::open_memory().unwrap();
         inner.insert_session(&stopped).unwrap();
         for sample in boundary_samples(now, 96.0) {
