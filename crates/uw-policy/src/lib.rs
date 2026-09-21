@@ -932,6 +932,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn default_idle_compact_margin_leaves_warm_window_headroom() {
+        // Policy (~30s) + compaction (~60s) cadence can add ~90s after the
+        // threshold. Margin of 2m on a 5m TTL fires at ~3m so delivery lands
+        // around 4–4.5m — still inside the warm cache, not after it expires.
+        let c = &profile().idle_compact;
+        assert_eq!(c.margin, Duration::minutes(2));
+        let caps = caps();
+        assert!(should_idle_compact(
+            Duration::minutes(3),
+            Duration::minutes(5),
+            150_000,
+            Some(200_000),
+            c,
+            &caps
+        ));
+        assert!(!should_idle_compact(
+            Duration::minutes(2) + Duration::seconds(59),
+            Duration::minutes(5),
+            150_000,
+            Some(200_000),
+            c,
+            &caps
+        ));
+    }
+
     fn caps() -> Capabilities {
         Capabilities {
             can_trigger_compaction: true,

@@ -214,6 +214,7 @@ pub fn plan_compaction_tick(
     capabilities: &Capabilities,
     idle: bool,
     session: &SessionSummary,
+    cache_warm: bool,
 ) -> CompactionPlan {
     if let Some(replacement) = &session.superseded_by {
         return CompactionPlan::SkipUnsupported(format!(
@@ -231,6 +232,14 @@ pub fn plan_compaction_tick(
             CompactionPlan::ClaimAndSend
         }
         CompactionKind::OpportunisticIdle | CompactionKind::AltModelReseed => {
+            // Idle-compact only pays for itself while the prompt cache is still
+            // warm. Past TTL the write is a full cold re-ingest — fail closed
+            // rather than WaitForIdle across a cold window.
+            if !cache_warm {
+                return CompactionPlan::SkipUnsupported(
+                    "cache already cold; idle compact missed the warm window".into(),
+                );
+            }
             if idle {
                 CompactionPlan::ClaimAndSend
             } else {
@@ -1019,6 +1028,7 @@ pub async fn run_compaction_tick(
             &adapter.capabilities(),
             liveness.is_idle(&session).await,
             &session,
+            is_cache_warm(session.last_seen, Utc::now()),
         ) {
             CompactionPlan::SkipUnsupported(reason) => {
                 store
@@ -2521,7 +2531,13 @@ mod tests {
     #[test]
     fn unsupported_compaction_is_failed_without_send_plan() {
         assert_eq!(
-            plan_compaction_tick(&request(), &caps(false, false, false), true, &session(),),
+            plan_compaction_tick(
+                &request(),
+                &caps(false, false, false),
+                true,
+                &session(),
+                true,
+            ),
             CompactionPlan::SkipUnsupported(
                 "adapter cannot honor destructive compaction requests".into()
             )
@@ -2530,8 +2546,77 @@ mod tests {
     #[test]
     fn race_plan_requires_claim_before_send() {
         assert_eq!(
-            plan_compaction_tick(&request(), &caps(true, false, false), true, &session()),
+            plan_compaction_tick(&request(), &caps(true, false, false), true, &session(), true),
             CompactionPlan::ClaimAndSend
+        );
+    }
+
+    #[test]
+    fn opportunistic_idle_is_skipped_once_cache_is_cold() {
+        assert_eq!(
+            plan_compaction_tick(&request(), &caps(true, false, false), true, &session(), false),
+            CompactionPlan::SkipUnsupported(
+                "cache already cold; idle compact missed the warm window".into()
+            )
+        );
+    }
+
+    #[test]
+    fn opportunistic_idle_waits_only_while_cache_is_still_warm() {
+        assert_eq!(
+            plan_compaction_tick(
+                &request(),
+                &caps(true, false, false),
+                false,
+                &session(),
+                true,
+            ),
+            CompactionPlan::WaitForIdle
+        );
+        assert_eq!(
+            plan_compaction_tick(
+                &request(),
+                &caps(true, false, false),
+                false,
+                &session(),
+                false,
+            ),
+            CompactionPlan::SkipUnsupported(
+                "cache already cold; idle compact missed the warm window".into()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn opportunistic_idle_is_failed_without_send_when_cache_is_cold() {
+        let compacted = Arc::new(StdMutex::new(0));
+        let adapter = Arc::new(FakeAdapter {
+            capabilities: caps(true, false, false),
+            compacted: compacted.clone(),
+            advised: Arc::new(StdMutex::new(0)),
+        });
+        let mut cold = session();
+        cold.last_seen = Utc::now() - Duration::minutes(CACHE_WARM_APPROXIMATION_MINUTES + 1);
+        let store = FakeStore {
+            request: StdMutex::new(Some(request())),
+            owner: cold,
+            claim: true,
+            status: StdMutex::new(vec![]),
+            samples: vec![],
+            enqueues: Arc::new(StdMutex::new(0)),
+            active_resume: None,
+            resolved: Arc::new(StdMutex::new(vec![])),
+        };
+        run_compaction_tick(
+            &store,
+            &HashMap::from([(Provider::ClaudeCode, adapter as Arc<dyn HarnessAdapter>)]),
+            &AlwaysIdle,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*compacted.lock().unwrap(), 0);
+        assert!(
+            matches!(&store.status.lock().unwrap()[0], CompactionStatus::Failed(reason) if reason.contains("cache already cold"))
         );
     }
     #[tokio::test]
@@ -3674,7 +3759,7 @@ mod tests {
         let mut owner = session();
         owner.superseded_by = Some(SessionId("replacement".into()));
         assert_eq!(
-            plan_compaction_tick(&request(), &caps(true, true, true), true, &owner),
+            plan_compaction_tick(&request(), &caps(true, true, true), true, &owner, true),
             CompactionPlan::SkipUnsupported(
                 "session identity was superseded by replacement".into()
             )
@@ -4052,7 +4137,7 @@ mod tests {
     fn boundary_store(now: DateTime<Utc>, pct: f32) -> BoundaryStore {
         let session = SessionSummary {
             // Warm enough for hard-boundary eligibility, idle enough for
-            // compact-band keepalive cadence (ttl 5m − margin − 1m).
+            // compact-band keepalive cadence (ttl 5m − margin 2m − 1m = 2m).
             last_seen: now - Duration::minutes(4),
             ..session()
         };

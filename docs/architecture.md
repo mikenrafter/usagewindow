@@ -359,7 +359,13 @@ not a substitute for real installation).
   own tier via config with no code change. If the context-window size is unknown, use
   the 150k-token threshold. Fires when
   `idle_for >= cache_ttl - margin`
-  AND `last_known_token_count >= tier.token_threshold`. `cache_ttl` is per-provider AND
+  AND `last_known_token_count >= tier.token_threshold`. Default `margin` is 2 minutes
+  so that, on a 5-minute warm cache, the policy enqueues around the 3-minute mark —
+  leaving headroom for the policy (~30s) and compaction (~60s) tick cadences to
+  *deliver* while the cache is still warm (typically ~4–4.5 minutes). Delivery of
+  `OpportunisticIdle` / `AltModelReseed` must also fail closed if the cache has
+  already gone cold at claim time; never WaitForIdle across a cold window.
+  `cache_ttl` is per-provider AND
   per-tier, not one flat number: Anthropic's *default* prompt cache is ~5 minutes, but a
   session using the 1-hour cache beta needs its own `cache_ttl` value or this fires
   hours early on a cache that's still warm — add `cache_ttl_by_provider:

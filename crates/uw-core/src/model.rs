@@ -341,7 +341,9 @@ impl Default for ThresholdProfile {
                         token_threshold: 200_000,
                     },
                 ],
-                margin: Duration::minutes(1),
+                // 2m leaves ~policy+compaction cadence headroom so delivery
+                // lands inside a 5m warm window (~4–4.5m), not after expiry.
+                margin: Duration::minutes(2),
                 unknown_context_token_threshold: 150_000,
             },
             reseed_auto: Default::default(),
