@@ -541,7 +541,7 @@ impl DirectReader for StoreReader {
             usage,
             last_updated: Utc::now(),
             provider_status: self.store.fetch_statuses()?,
-            keepalive_active_count: self.store.keepalive_active_count()?,
+            keepalive_active_count: self.store.keepalive_active_count(Utc::now())?,
         })
     }
     fn sessions_list(
@@ -557,11 +557,14 @@ impl DirectReader for StoreReader {
             })
             .map(|s| -> Result<SessionListItem> {
                 let id = s.id.clone();
+                let now = Utc::now();
+                let token_records = self.store.token_usage_for_session(&id)?;
                 let keepalive = self
                     .store
                     .keepalive_config(&id)
                     .map(|k| k.enabled)
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    && uw_core::model::is_keepalive_eligible(&s, &token_records, now);
                 let resume_status = self
                     .store
                     .resume_markers_for_session(&id)?

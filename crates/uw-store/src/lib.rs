@@ -730,12 +730,23 @@ impl Store {
         })
         .collect()
     }
-    pub fn keepalive_active_count(&self) -> StoreResult<u32> {
-        Ok(self.connection.query_row(
-            "SELECT COUNT(*) FROM keepalive_config WHERE enabled=1",
-            [],
-            |row| row.get(0),
-        )?)
+    pub fn keepalive_active_count(&self, now: DateTime<Utc>) -> StoreResult<u32> {
+        let mut count = 0u32;
+        let mut stmt = self
+            .connection
+            .prepare("SELECT session_id FROM keepalive_config WHERE enabled=1")?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for id in ids {
+            let session_id = SessionId(id);
+            let session = self.read_session(&session_id)?;
+            let records = self.token_usage_for_session(&session_id)?;
+            if uw_core::model::is_keepalive_eligible(&session, &records, now) {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
     pub fn insert_compaction_event(&self, event: &CompactionEvent) -> StoreResult<()> {
         self.connection.execute(
@@ -1659,14 +1670,38 @@ mod tests {
     }
 
     #[test]
-    fn keepalive_active_count_counts_only_enabled_rows() {
+    fn keepalive_active_count_counts_only_eligible_enabled_rows() {
+        use uw_core::adapter::TokenUsageRecord;
         let s = Store::open_memory().unwrap();
+        let now = Utc::now();
         let a = SessionId("a".into());
         let b = SessionId("b".into());
-        s.insert_session(&session(&a)).unwrap();
+        let mut warm = session(&a);
+        warm.last_seen = now - chrono::Duration::minutes(1);
+        s.insert_session(&warm).unwrap();
         s.insert_session(&session(&b)).unwrap();
         s.set_keepalive(&a, true).unwrap();
         s.set_keepalive(&b, false).unwrap();
-        assert_eq!(s.keepalive_active_count().unwrap(), 1);
+        s.insert_token_usage_records(
+            &a,
+            &[TokenUsageRecord {
+                at: now - chrono::Duration::minutes(1),
+                model: None,
+                input_tokens: 1,
+                cached_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                output_tokens: 1,
+                reasoning_output_tokens: 0,
+                total_tokens: 2,
+            }],
+        )
+        .unwrap();
+        assert_eq!(s.keepalive_active_count(now).unwrap(), 1);
+        let cold_id = SessionId("cold".into());
+        let mut cold = session(&cold_id);
+        cold.last_seen = now - chrono::Duration::minutes(10);
+        s.insert_session(&cold).unwrap();
+        s.set_keepalive(&cold_id, true).unwrap();
+        assert_eq!(s.keepalive_active_count(now).unwrap(), 1);
     }
 }

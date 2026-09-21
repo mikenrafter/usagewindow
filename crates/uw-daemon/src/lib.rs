@@ -971,9 +971,17 @@ pub async fn run_keepalive_tick(
     adapters: &HashMap<Provider, Arc<dyn HarnessAdapter>>,
     now: DateTime<Utc>,
     profiles: &HashMap<SessionId, ThresholdProfile>,
+    token_records: &HashMap<SessionId, Vec<TokenUsageRecord>>,
 ) -> anyhow::Result<u32> {
     let mut sent = 0;
     for session in store.keepalive_sessions().await? {
+        let records = token_records
+            .get(&session.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if !is_keepalive_eligible(&session, records, now) {
+            continue;
+        }
         let Some(profile) = profiles.get(&session.id) else {
             continue;
         };
@@ -987,7 +995,7 @@ pub async fn run_keepalive_tick(
             Ok(x) => x,
             Err(_) => continue,
         };
-        if !should_fire_keepalive(now, &session, &state, profile) {
+        if !state.enabled || !should_fire_keepalive(now, &session, &state, profile) {
             continue;
         }
         if matches!(
@@ -1148,8 +1156,10 @@ pub async fn run_policy_tick(
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     let mut token_rates = HashMap::new();
+    let mut token_records = HashMap::new();
     for session in sessions {
         let records = store.token_usage(&session.id).await?;
+        token_records.insert(session.id.clone(), records.clone());
         let activity_weight = if is_cache_warm(session.last_seen, now) {
             1.0
         } else {
@@ -1252,20 +1262,24 @@ pub async fn run_policy_tick(
                 }
             } else if compact_band_active {
                 suppress_idle = true;
-                keepalive_store
-                    .set_keepalive_enabled(&session.id, true)
-                    .await?;
-                let mut effective_state = keepalive_store.keepalive_state(&session.id).await?;
-                effective_state.enabled = true;
-                if should_fire_keepalive(now, session, &effective_state, profile)
-                    && matches!(
-                        adapter.advise(&session.id, KEEPALIVE_MARKER).await,
-                        Ok(DeliveryOutcome::Delivered)
-                    )
-                {
-                    keepalive_store
-                        .record_keepalive_ping(&session.id, now)
-                        .await?;
+                let records = token_records
+                    .get(&session.id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                if is_keepalive_eligible(session, records, now) {
+                    let mut effective_state =
+                        keepalive_store.keepalive_state(&session.id).await?;
+                    effective_state.enabled = true;
+                    if should_fire_keepalive(now, session, &effective_state, profile)
+                        && matches!(
+                            adapter.advise(&session.id, KEEPALIVE_MARKER).await,
+                            Ok(DeliveryOutcome::Delivered)
+                        )
+                    {
+                        keepalive_store
+                            .record_keepalive_ping(&session.id, now)
+                            .await?;
+                    }
                 }
             } else {
                 let ask_key = (session.id.clone(), key.clone(), block.resets_at);
@@ -1328,8 +1342,20 @@ pub async fn run_policy_tick(
                 )
                 .await?;
         }
+        let records = token_records
+            .get(&session.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if let Ok(state) = keepalive_store.keepalive_state(&session.id).await
+            && state.enabled
+            && !is_keepalive_eligible(session, records, now)
+        {
+            keepalive_store
+                .set_keepalive_enabled(&session.id, false)
+                .await?;
+        }
     }
-    run_keepalive_tick(keepalive_store, adapters, now, profiles).await?;
+    run_keepalive_tick(keepalive_store, adapters, now, profiles, &token_records).await?;
     Ok(())
 }
 impl IdleEpisodeTracker {
@@ -3884,9 +3910,22 @@ mod tests {
         }
         let now = Utc::now();
         let session = SessionSummary {
-            last_seen: now - Duration::minutes(10),
+            last_seen: now - Duration::minutes(4),
             ..session()
         };
+        let token_records = HashMap::from([(
+            session.id.clone(),
+            vec![TokenUsageRecord {
+                at: now - Duration::minutes(4),
+                model: None,
+                input_tokens: 10,
+                cached_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                output_tokens: 5,
+                reasoning_output_tokens: 0,
+                total_tokens: 15,
+            }],
+        )]);
         let mut profile = ThresholdProfile {
             keepalive: Some(KeepaliveConfig {
                 enabled: true,
@@ -3919,7 +3958,8 @@ mod tests {
                 &store,
                 &HashMap::from([(Provider::ClaudeCode, adapter as Arc<dyn HarnessAdapter>)]),
                 now,
-                &HashMap::from([(session.id.clone(), profile)])
+                &HashMap::from([(session.id.clone(), profile)]),
+                &token_records,
             )
             .await
             .unwrap(),
@@ -3935,7 +3975,8 @@ mod tests {
     struct BoundaryStore {
         session: SessionSummary,
         samples: Vec<UsageSample>,
-        keepalive: KeepaliveState,
+        token_usage: Vec<TokenUsageRecord>,
+        keepalive: StdMutex<KeepaliveState>,
         enqueued: StdMutex<Vec<CompactionRequest>>,
         resume_markers: StdMutex<Vec<ResumeMarker>>,
         recorded_pings: StdMutex<u32>,
@@ -3967,7 +4008,7 @@ mod tests {
             Ok(self.samples.clone())
         }
         async fn token_usage(&self, _: &SessionId) -> anyhow::Result<Vec<TokenUsageRecord>> {
-            Ok(vec![])
+            Ok(self.token_usage.clone())
         }
         async fn active_resume_marker(
             &self,
@@ -4043,7 +4084,7 @@ mod tests {
             Ok(vec![self.session.clone()])
         }
         async fn keepalive_state(&self, _: &SessionId) -> anyhow::Result<KeepaliveState> {
-            Ok(self.keepalive.clone())
+            Ok(self.keepalive.lock().unwrap().clone())
         }
         async fn record_keepalive_ping(
             &self,
@@ -4051,6 +4092,14 @@ mod tests {
             _: DateTime<Utc>,
         ) -> anyhow::Result<()> {
             *self.recorded_pings.lock().unwrap() += 1;
+            Ok(())
+        }
+        async fn set_keepalive_enabled(
+            &self,
+            _: &SessionId,
+            enabled: bool,
+        ) -> anyhow::Result<()> {
+            self.keepalive.lock().unwrap().enabled = enabled;
             Ok(())
         }
     }
@@ -4134,6 +4183,19 @@ mod tests {
         profile
     }
 
+    fn boundary_token_usage(now: DateTime<Utc>) -> Vec<TokenUsageRecord> {
+        vec![TokenUsageRecord {
+            at: now - Duration::minutes(4),
+            model: None,
+            input_tokens: 100,
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            output_tokens: 50,
+            reasoning_output_tokens: 0,
+            total_tokens: 150,
+        }]
+    }
+
     fn boundary_store(now: DateTime<Utc>, pct: f32) -> BoundaryStore {
         let session = SessionSummary {
             // Warm enough for hard-boundary eligibility, idle enough for
@@ -4142,15 +4204,16 @@ mod tests {
             ..session()
         };
         BoundaryStore {
-            keepalive: KeepaliveState {
+            keepalive: StdMutex::new(KeepaliveState {
                 session_id: session.id.clone(),
                 enabled: false,
                 last_ping_at: None,
                 ping_day: None,
                 ping_count: 0,
-            },
+            }),
             session,
             samples: boundary_samples(now, pct),
+            token_usage: boundary_token_usage(now),
             enqueued: StdMutex::new(vec![]),
             resume_markers: StdMutex::new(vec![]),
             recorded_pings: StdMutex::new(0),
@@ -4314,6 +4377,42 @@ mod tests {
         assert!(
             store.enqueued.lock().unwrap().is_empty(),
             "compacting an already-exhausted window burns tokens for no reclaim"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_band_does_not_mark_cold_archives_as_keepalive() {
+        let now = Utc::now();
+        let mut store = boundary_store(now, 92.0);
+        store.session.last_seen = now - Duration::minutes(30);
+        store.token_usage.clear();
+        store.keepalive.lock().unwrap().enabled = true;
+        let adapter = Arc::new(BoundaryAdapter {
+            advised: StdMutex::new(vec![]),
+            resume_calls: AtomicUsize::new(0),
+        });
+        let adapters = HashMap::from([(
+            Provider::ClaudeCode,
+            adapter as Arc<dyn HarnessAdapter>,
+        )]);
+        let profiles = HashMap::from([(store.session.id.clone(), boundary_profile())]);
+
+        run_policy_tick(
+            &store,
+            &store,
+            &adapters,
+            &AlwaysIdle,
+            std::slice::from_ref(&store.session),
+            &profiles,
+            &mut PolicyRuntimeState::default(),
+            now,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !store.keepalive.lock().unwrap().enabled,
+            "cold archives must not remain marked keepalive"
         );
     }
 
@@ -4621,8 +4720,12 @@ mod tests {
         }
 
         let now = Utc::now();
-        let mut store = boundary_store(now, 92.0);
-        store.keepalive.enabled = true;
+        let store = boundary_store(now, 92.0);
+        store.keepalive.lock().unwrap().enabled = true;
+        let token_records = HashMap::from([(
+            store.session.id.clone(),
+            boundary_token_usage(now),
+        )]);
         let sent = run_keepalive_tick(
             &store,
             &HashMap::from([(
@@ -4631,6 +4734,7 @@ mod tests {
             )]),
             now,
             &HashMap::from([(store.session.id.clone(), boundary_profile())]),
+            &token_records,
         )
         .await
         .unwrap();

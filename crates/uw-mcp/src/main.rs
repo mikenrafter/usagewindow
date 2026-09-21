@@ -116,7 +116,9 @@ fn get_usage(args: &Value, deps: &Deps) -> Result<Value, String> {
         usage,
         last_updated: Utc::now(),
         provider_status: store.fetch_statuses().map_err(|e| e.to_string())?,
-        keepalive_active_count: store.keepalive_active_count().map_err(|e| e.to_string())?,
+        keepalive_active_count: store
+            .keepalive_active_count(chrono::Utc::now())
+            .map_err(|e| e.to_string())?,
     })
     .map_err(|e| e.to_string())
 }

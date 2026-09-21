@@ -559,7 +559,7 @@ async fn status(
             usage,
             last_updated: now,
             provider_status: store.fetch_statuses()?,
-            keepalive_active_count: store.keepalive_active_count()?,
+            keepalive_active_count: store.keepalive_active_count(now)?,
         })
     }).await?;
     Ok(Json(value))
@@ -626,10 +626,12 @@ async fn sessions(
                     .compaction_requests_for_session(&s.id)?
                     .last()
                     .map(|r| r.status.clone());
+                let token_records = store.token_usage_for_session(&s.id)?;
                 let keepalive = store
                     .keepalive_config(&s.id)
                     .map(|k| k.enabled)
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    && uw_core::model::is_keepalive_eligible(&s, &token_records, now);
                 let cached = store.session_cache_warm(&s.id, now)?;
                 let title = store.resolve_session_title(&s.id)?;
                 items.push(SessionListItem {

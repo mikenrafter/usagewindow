@@ -14,6 +14,33 @@ pub fn is_cache_warm(last_seen: DateTime<Utc>, now: DateTime<Utc>) -> bool {
 pub fn is_cache_warm_for(last_seen: DateTime<Utc>, now: DateTime<Utc>, ttl: Duration) -> bool {
     ttl > Duration::zero() && now - last_seen <= ttl
 }
+
+/// Matches the web UI's active-session filter: a live session with token
+/// accounting in the last thirty minutes.
+pub const SESSION_ACTIVE_TOKEN_LOOKBACK_MINUTES: i64 = 30;
+
+pub fn session_has_recent_token_activity(
+    records: &[crate::adapter::TokenUsageRecord],
+    now: DateTime<Utc>,
+) -> bool {
+    records.iter().any(|record| {
+        record.at >= now - Duration::minutes(SESSION_ACTIVE_TOKEN_LOOKBACK_MINUTES)
+            && record.total_tokens > 0
+    })
+}
+
+/// Keepalive only applies while the provider prompt cache is still warm and
+/// the session is actively consuming quota — not for cold archives discovered
+/// from historical transcripts.
+pub fn is_keepalive_eligible(
+    session: &SessionSummary,
+    token_records: &[crate::adapter::TokenUsageRecord],
+    now: DateTime<Utc>,
+) -> bool {
+    session.stopped_reason.is_none()
+        && is_cache_warm(session.last_seen, now)
+        && session_has_recent_token_activity(token_records, now)
+}
 use std::str::FromStr;
 use uuid::Uuid;
 
@@ -503,6 +530,45 @@ mod tests {
             event,
             serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap()
         );
+    }
+
+    #[test]
+    fn keepalive_eligibility_requires_warm_cache_and_recent_tokens() {
+        use crate::adapter::TokenUsageRecord;
+        let now = Utc::now();
+        let mut session = SessionSummary {
+            id: SessionId("s".into()),
+            harness: Provider::ClaudeCode,
+            model: None,
+            account: None,
+            first_seen: now,
+            last_seen: now - Duration::minutes(1),
+            cwd: ".".into(),
+            state_path: None,
+            context_window_size: None,
+            last_known_token_count: None,
+            launch_mode: LaunchMode::Interactive,
+            pid: None,
+            stopped_reason: None,
+            resume_marker: None,
+            superseded_by: None,
+            reseeded_from: None,
+        };
+        let recent = vec![TokenUsageRecord {
+            at: now - Duration::minutes(5),
+            model: None,
+            input_tokens: 10,
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            output_tokens: 5,
+            reasoning_output_tokens: 0,
+            total_tokens: 15,
+        }];
+        assert!(is_keepalive_eligible(&session, &recent, now));
+        session.last_seen = now - Duration::minutes(10);
+        assert!(!is_keepalive_eligible(&session, &recent, now));
+        session.last_seen = now - Duration::minutes(1);
+        assert!(!is_keepalive_eligible(&session, &[], now));
     }
 
     #[test]
