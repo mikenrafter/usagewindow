@@ -6,7 +6,7 @@ use uw_core::adapter::Capabilities;
 use uw_core::adapter::TokenUsageRecord;
 use uw_core::model::{
     AccountId, IdleCompactConfig, Provider, ReseedAutoConfig, Severity, ThresholdProfile,
-    UsageSample, WindowKey,
+    UsageSample, WindowKind, WindowKey,
 };
 
 const ROLLOVER_TOLERANCE: Duration = Duration::minutes(2);
@@ -93,6 +93,16 @@ pub fn burn_rate_lookback(provider: &Provider) -> Duration {
     match provider {
         Provider::Cursor => Duration::hours(24),
         _ => Duration::minutes(30),
+    }
+}
+
+/// Lookback for status/UI burn-rate display, keyed by window duration rather than
+/// provider. Weekly and other long windows use 24h; short session windows use 30m.
+pub fn burn_rate_display_lookback(kind: &WindowKind) -> Duration {
+    match kind {
+        WindowKind::WeeklyModel(_) | WindowKind::WeeklySurface(_) => Duration::hours(24),
+        WindowKind::Rolling { minutes } if *minutes >= 24 * 60 => Duration::hours(24),
+        WindowKind::Rolling { .. } | WindowKind::Custom(_) => Duration::minutes(30),
     }
 }
 
@@ -410,12 +420,30 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use std::collections::HashMap;
-    use uw_core::model::{Provider, TokenTier, UsageSource, UsageWindowState, WindowKind};
+    use uw_core::model::{
+        ModelId, Provider, TokenTier, UsageSource, UsageWindowState, WindowKind,
+    };
 
     #[test]
     fn cursor_burn_rate_uses_the_last_24_hours() {
         assert_eq!(burn_rate_lookback(&Provider::Cursor), Duration::hours(24));
         assert_eq!(burn_rate_lookback(&Provider::Codex), Duration::minutes(30));
+    }
+
+    #[test]
+    fn display_lookback_is_24h_for_weekly_and_long_rolling_windows() {
+        assert_eq!(
+            burn_rate_display_lookback(&WindowKind::WeeklyModel(ModelId("claude".into()))),
+            Duration::hours(24)
+        );
+        assert_eq!(
+            burn_rate_display_lookback(&WindowKind::Rolling { minutes: 10_080 }),
+            Duration::hours(24)
+        );
+        assert_eq!(
+            burn_rate_display_lookback(&WindowKind::Rolling { minutes: 300 }),
+            Duration::minutes(30)
+        );
     }
 
     #[test]

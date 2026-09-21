@@ -86,10 +86,10 @@
   .barrow .label .burn-val b { color: var(--text); font-weight: 600; }
   .barrow .label .burnlabel { color: var(--muted); margin-right: 0.2rem; }
   .bar { position: relative; height: 10px; border-radius: 5px; background: #1c2028; overflow: hidden; }
-  .bar .fill { position: absolute; inset: 0; width: 0; border-radius: 5px 0 0 5px; background: var(--ok); transition: width 0.3s; }
-  .bar .fill.warn { background: var(--warn); }
-  .bar .fill.danger { background: var(--danger); }
-  .bar .burnmark { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--accent); }
+  .bar .seg { position: absolute; top: 0; bottom: 0; transition: left 0.3s, width 0.3s; }
+  .bar .seg.used { left: 0; border-radius: 5px 0 0 5px; }
+  .bar .seg.projected { border-radius: 0; }
+  .bar .seg.remain { border-radius: 0 5px 5px 0; }
   .barrow .meta { display: flex; gap: 0.8rem; font-size: 0.72rem; color: var(--muted); margin-top: 0.25rem; flex-wrap: wrap; }
   .barrow .meta b { color: var(--text); }
 
@@ -390,10 +390,66 @@ function sortWindows(windows) {
   });
 }
 
-function severityClass(pct) {
-  if (pct >= 90) return 'danger';
-  if (pct >= 70) return 'warn';
-  return '';
+function remainingHue(remaining) {
+  const r = Math.min(100, Math.max(0, remaining));
+  if (r >= 50) return 120 - ((100 - r) / 50) * 75;
+  return 45 - ((50 - r) / 50) * 45;
+}
+
+function hslColor(hue, sat, light = 48) {
+  return `hsl(${hue.toFixed(1)}, ${sat}%, ${light}%)`;
+}
+
+function usedHazardBg(hue) {
+  const a = hslColor(hue, 30, 42);
+  const b = hslColor(hue, 20, 36);
+  return `repeating-linear-gradient(135deg, ${a} 0 3px, ${b} 3px 6px)`;
+}
+
+function burnDisplayWindow(kind) {
+  if (kind.WeeklyModel || kind.WeeklySurface) return { minutes: 1440, label: '24h' };
+  if (kind.Rolling) {
+    if (kind.Rolling.minutes >= 24 * 60) return { minutes: 1440, label: '24h' };
+    return { minutes: 30, label: '30m' };
+  }
+  return { minutes: 30, label: '30m' };
+}
+
+function renderUsageBar(w) {
+  const used = Math.min(100, Math.max(0, w.pct));
+  const remaining = 100 - used;
+  const hue = remainingHue(remaining);
+  const { minutes: burnWindowMinutes, label: burnLabel } = burnDisplayWindow(w.window);
+  const burnConsumed = w.burn_rate_pct_per_hour != null
+    ? w.burn_rate_pct_per_hour * burnWindowMinutes / 60
+    : null;
+  const projected = burnConsumed != null ? Math.min(remaining, Math.max(0, burnConsumed)) : 0;
+  const burnPct = burnConsumed != null
+    ? (burnConsumed > 0 ? '-' : '+') + Math.abs(burnConsumed).toFixed(1) + '%'
+    : '-';
+  const sessions = `${w.active_sessions} session${w.active_sessions === 1 ? '' : 's'}`;
+  const usedStyle = `width:${used}%;background:${usedHazardBg(hue)}`;
+  const projStyle = projected > 0
+    ? `left:${used}%;width:${projected}%;background:${hslColor(hue, 50)}`
+    : '';
+  const remainStyle = `left:${used + projected}%;width:${Math.max(0, remaining - projected)}%;background:${hslColor(hue, 100)}`;
+  return `
+    <div class="barrow">
+      <div class="title">${escapeHtml(windowLabel(w.window))}${w.exceeded ? ' · exceeded' : ''}</div>
+      <div class="label">
+        <span class="pct-val">${remaining.toFixed(1)}% remaining</span>
+        <span class="burn-val"><span class="burnlabel">burn/${burnLabel}</span> ${sessions} @ <b>${burnPct}</b></span>
+      </div>
+      <div class="bar">
+        ${used > 0 ? `<div class="seg used" style="${usedStyle}"></div>` : ''}
+        ${projected > 0 ? `<div class="seg projected" style="${projStyle}"></div>` : ''}
+        <div class="seg remain" style="${remainStyle}"></div>
+      </div>
+      <div class="meta">
+        <span>resets in <b>${countdown(w.resets_at)}</b></span>
+        <span>exhausted in <b>${w.depletes_at ? countdown(w.depletes_at) : '-'}</b></span>
+      </div>
+    </div>`;
 }
 
 function setBanner(msg) {
@@ -416,31 +472,7 @@ function renderUsage(status) {
     const staleBadge = fs && fs.last_error
       ? `<span class="pill stopped stale" title="${escapeHtml(fs.last_error)}">refresh failing (${fs.consecutive_failures}×) · last ok ${fs.last_success_at ? fmtDate(fs.last_success_at) : 'never'}</span>`
       : '';
-    const bars = sortWindows(u.windows).map(w => {
-      const pct = Math.min(100, Math.max(0, w.pct));
-      const sev = severityClass(pct);
-      const burnWindowMinutes = u.provider === 'Cursor' ? 1440 : 30;
-      const burn = w.burn_rate_pct_per_hour != null ? (w.burn_rate_pct_per_hour * burnWindowMinutes / 60) : null;
-      const burnPos = burn != null ? Math.min(100, pct + burn) : null;
-      const burnPct = burn != null ? (burn >= 0 ? '+' : '') + burn.toFixed(1) + '%' : '-';
-      const sessions = `${w.active_sessions} session${w.active_sessions === 1 ? '' : 's'}`;
-      return `
-        <div class="barrow">
-          <div class="title">${escapeHtml(windowLabel(w.window))}${w.exceeded ? ' · exceeded' : ''}</div>
-          <div class="label">
-            <span class="pct-val">${pct.toFixed(1)}%</span>
-            <span class="burn-val"><span class="burnlabel">burn/${burnWindowMinutes === 1440 ? '24h' : '30m'}</span> ${sessions} @ <b>${burnPct}</b></span>
-          </div>
-          <div class="bar">
-            <div class="fill ${sev}" style="width:${pct}%"></div>
-            ${burnPos != null ? `<div class="burnmark" style="left:${burnPos}%" title="projected in ${burnWindowMinutes === 1440 ? '24h' : '30m'}"></div>` : ''}
-          </div>
-          <div class="meta">
-            <span>resets in <b>${countdown(w.resets_at)}</b></span>
-            <span>depletes in <b>${w.depletes_at ? countdown(w.depletes_at) : '-'}</b></span>
-          </div>
-        </div>`;
-    }).join('');
+    const bars = sortWindows(u.windows).map(renderUsageBar).join('');
     return `
       <div class="card">
         <div class="head">

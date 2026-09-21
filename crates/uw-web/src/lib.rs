@@ -546,7 +546,7 @@ async fn status(
             let windows = sample.windows.into_iter().map(|(key, window)| {
                 let window_key = WindowKey { provider: provider.clone(), kind: key.kind.clone() };
                 let blocks = uw_policy::segment_blocks(&all_samples, &window_key, account.as_ref());
-                let burn_rate_pct_per_hour = blocks.last().and_then(|block| uw_policy::burn_rate_pct_per_hour_available(block, uw_policy::burn_rate_lookback(&provider)));
+                let burn_rate_pct_per_hour = blocks.last().and_then(|block| uw_policy::burn_rate_pct_per_hour_available(block, uw_policy::burn_rate_display_lookback(&key.kind)));
                 let depletes_at = burn_rate_pct_per_hour.filter(|rate| *rate > 0.0).map(|rate| {
                     let minutes_remaining = (100.0 - window.pct) / rate * 60.0;
                     now + chrono::Duration::minutes(minutes_remaining.max(0.0) as i64)
