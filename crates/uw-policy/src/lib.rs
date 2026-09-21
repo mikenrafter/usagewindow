@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use uw_core::adapter::Capabilities;
 use uw_core::adapter::TokenUsageRecord;
 use uw_core::model::{
-    AccountId, IdleCompactConfig, ReseedAutoConfig, Severity, ThresholdProfile, UsageSample,
-    WindowKey,
+    AccountId, IdleCompactConfig, Provider, ReseedAutoConfig, Severity, ThresholdProfile,
+    UsageSample, WindowKey,
 };
 
 const ROLLOVER_TOLERANCE: Duration = Duration::minutes(2);
@@ -88,6 +88,14 @@ pub struct WindowBlock {
     pub point_resets_at: Vec<Option<DateTime<Utc>>>,
 }
 
+/// History needed for a useful burn-rate estimate for each provider.
+pub fn burn_rate_lookback(provider: &Provider) -> Duration {
+    match provider {
+        Provider::Cursor => Duration::hours(24),
+        _ => Duration::minutes(30),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdviseChannel {
     MidTurn,
@@ -158,10 +166,7 @@ pub fn burn_rate_pct_per_hour(block: &WindowBlock, lookback: Duration) -> Option
 /// anchor does not exist yet. It still refuses reset-spanning pairs and
 /// zero-length intervals; callers can use this during daemon startup when a
 /// fresh window has only a few minutes of history.
-pub fn burn_rate_pct_per_hour_available(
-    block: &WindowBlock,
-    lookback: Duration,
-) -> Option<f32> {
+pub fn burn_rate_pct_per_hour_available(block: &WindowBlock, lookback: Duration) -> Option<f32> {
     let &(last_at, last_pct) = block.points.last()?;
     let cutoff = last_at - lookback;
     let (first_index, &(first_at, first_pct)) = block
@@ -254,8 +259,7 @@ pub fn weighted_token_rate_per_minute(
             0.0
         };
         let old_minutes = minutes - recent_minutes;
-        let weighted_interval_minutes =
-            old_minutes + recent_minutes * recent_coefficient;
+        let weighted_interval_minutes = old_minutes + recent_minutes * recent_coefficient;
         weighted_work += work_per_minute * weighted_interval_minutes * activity_weight;
         weighted_minutes += weighted_interval_minutes;
     }
@@ -263,7 +267,15 @@ pub fn weighted_token_rate_per_minute(
 }
 
 pub fn projected_exhaustion(block: &WindowBlock, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    let rate = burn_rate_pct_per_hour(block, Duration::minutes(30))?;
+    projected_exhaustion_with_lookback(block, now, Duration::minutes(30))
+}
+
+pub fn projected_exhaustion_with_lookback(
+    block: &WindowBlock,
+    now: DateTime<Utc>,
+    lookback: Duration,
+) -> Option<DateTime<Utc>> {
+    let rate = burn_rate_pct_per_hour(block, lookback)?;
     if rate <= 0.0 {
         return None;
     }
@@ -399,6 +411,12 @@ mod tests {
     use chrono::TimeZone;
     use std::collections::HashMap;
     use uw_core::model::{Provider, TokenTier, UsageSource, UsageWindowState, WindowKind};
+
+    #[test]
+    fn cursor_burn_rate_uses_the_last_24_hours() {
+        assert_eq!(burn_rate_lookback(&Provider::Cursor), Duration::hours(24));
+        assert_eq!(burn_rate_lookback(&Provider::Codex), Duration::minutes(30));
+    }
 
     #[test]
     fn cache_cost_falls_back_with_fewer_than_three_buckets() {
@@ -554,15 +572,17 @@ mod tests {
             token_record(25, 200, 0, 0, 0),
             token_record(30, 300, 0, 0, 0),
         ];
-        assert!(weighted_token_rate_per_minute(
-            &records,
-            at(30),
-            Duration::minutes(30),
-            Duration::minutes(5),
-            1.2,
-            1.0,
-        )
-        .is_some());
+        assert!(
+            weighted_token_rate_per_minute(
+                &records,
+                at(30),
+                Duration::minutes(30),
+                Duration::minutes(5),
+                1.2,
+                1.0,
+            )
+            .is_some()
+        );
     }
     fn block(points: Vec<(DateTime<Utc>, f32)>, reset: Option<DateTime<Utc>>) -> WindowBlock {
         WindowBlock {

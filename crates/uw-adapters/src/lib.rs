@@ -2,8 +2,9 @@
 
 pub mod claude_code;
 pub mod codex;
-pub mod generic_hook;
+pub mod cursor;
 pub mod fallback;
+pub mod generic_hook;
 pub mod process;
 pub mod summarizer;
 pub mod t3code;

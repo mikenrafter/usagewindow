@@ -1,3 +1,4 @@
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
     Json, Router,
     body::Body,
@@ -7,7 +8,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use chrono::{Duration, Utc};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
@@ -45,7 +45,8 @@ struct AuthState {
 impl WebAuth {
     fn new(password_hash: Option<String>) -> anyhow::Result<Self> {
         if let Some(hash) = &password_hash {
-            PasswordHash::new(hash).map_err(|error| anyhow::anyhow!("invalid password verifier: {error:?}"))?;
+            PasswordHash::new(hash)
+                .map_err(|error| anyhow::anyhow!("invalid password verifier: {error:?}"))?;
         }
         Ok(Self {
             password_hash,
@@ -74,9 +75,11 @@ impl WebAuth {
 
     fn login(&self, password: &str) -> LoginResult {
         let valid = self.password_hash.as_ref().is_some_and(|hash| {
-            PasswordHash::new(hash)
-                .ok()
-                .is_some_and(|parsed| Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok())
+            PasswordHash::new(hash).ok().is_some_and(|parsed| {
+                Argon2::default()
+                    .verify_password(password.as_bytes(), &parsed)
+                    .is_ok()
+            })
         });
         let Ok(mut state) = self.state.lock() else {
             return LoginResult::Locked;
@@ -198,10 +201,7 @@ struct LoginRequest {
     password: String,
 }
 
-async fn auth_login(
-    State(state): State<AppState>,
-    Json(request): Json<LoginRequest>,
-) -> Response {
+async fn auth_login(State(state): State<AppState>, Json(request): Json<LoginRequest>) -> Response {
     if !state.auth.enabled() {
         return StatusCode::NO_CONTENT.into_response();
     }
@@ -230,7 +230,9 @@ async fn auth_logout(State(state): State<AppState>, headers: HeaderMap) -> Respo
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        HeaderValue::from_static("uw_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0"),
+        HeaderValue::from_static(
+            "uw_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0",
+        ),
     );
     response
 }
@@ -377,10 +379,13 @@ fn record_pre_compact(
     now: chrono::DateTime<Utc>,
 ) -> anyhow::Result<()> {
     let session = store.read_session(id)?;
-    let inline = store.compaction_requests_for_session(id)?.into_iter().any(|r| {
-        matches!(r.status, CompactionStatus::Sending | CompactionStatus::Sent)
-            && (now - r.created_at) <= chrono::Duration::minutes(5)
-    });
+    let inline = store
+        .compaction_requests_for_session(id)?
+        .into_iter()
+        .any(|r| {
+            matches!(r.status, CompactionStatus::Sending | CompactionStatus::Sent)
+                && (now - r.created_at) <= chrono::Duration::minutes(5)
+        });
     let tokens_before = session.last_known_token_count;
     let context_pct_before = match (tokens_before, session.context_window_size) {
         (Some(tokens), Some(window)) if window > 0 => Some(tokens as f32 / window as f32 * 100.0),
@@ -394,13 +399,22 @@ fn record_pre_compact(
         .into_iter()
         .filter(|s| s.provider == session.harness && s.account == session.account)
         .max_by_key(|s| s.at)
-        .and_then(|s| s.windows.values().map(|w| w.pct).fold(None, |acc: Option<f32>, pct| {
-            Some(acc.map_or(pct, |acc| acc.max(pct)))
-        }));
+        .and_then(|s| {
+            s.windows
+                .values()
+                .map(|w| w.pct)
+                .fold(None, |acc: Option<f32>, pct| {
+                    Some(acc.map_or(pct, |acc| acc.max(pct)))
+                })
+        });
     store.insert_compaction_event(&CompactionEvent {
         id: uuid::Uuid::new_v4(),
         session_id: id.clone(),
-        source: if inline { CompactionSource::Inline } else { CompactionSource::External },
+        source: if inline {
+            CompactionSource::Inline
+        } else {
+            CompactionSource::External
+        },
         trigger,
         context_pct_before,
         usage_window_pct_before,
@@ -531,7 +545,7 @@ async fn status(
             let windows = sample.windows.into_iter().map(|(key, window)| {
                 let window_key = WindowKey { provider: provider.clone(), kind: key.kind.clone() };
                 let blocks = uw_policy::segment_blocks(&all_samples, &window_key, account.as_ref());
-                let burn_rate_pct_per_hour = blocks.last().and_then(|block| uw_policy::burn_rate_pct_per_hour_available(block, chrono::Duration::minutes(30)));
+                let burn_rate_pct_per_hour = blocks.last().and_then(|block| uw_policy::burn_rate_pct_per_hour_available(block, uw_policy::burn_rate_lookback(&provider)));
                 let depletes_at = burn_rate_pct_per_hour.filter(|rate| *rate > 0.0).map(|rate| {
                     let minutes_remaining = (100.0 - window.pct) / rate * 60.0;
                     now + chrono::Duration::minutes(minutes_remaining.max(0.0) as i64)
@@ -570,7 +584,10 @@ async fn sessions(
     let harness: Option<Provider> = query.harness.and_then(|value| value.parse().ok());
     let include_inactive = query.inactive.or(query.stopped).unwrap_or(false);
     let offset = query.offset.unwrap_or(0);
-    let limit = query.limit.unwrap_or(DEFAULT_SESSIONS_LIMIT).min(MAX_SESSIONS_LIMIT);
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_SESSIONS_LIMIT)
+        .min(MAX_SESSIONS_LIMIT);
     Ok(Json(
         read(state, move |store| {
             let mut matching = Vec::new();
@@ -580,7 +597,9 @@ async fn sessions(
                     && store
                         .token_usage_for_session(&s.id)?
                         .into_iter()
-                        .any(|record| record.at >= now - Duration::minutes(30) && record.total_tokens > 0);
+                        .any(|record| {
+                            record.at >= now - Duration::minutes(30) && record.total_tokens > 0
+                        });
                 if !harness.as_ref().is_none_or(|h| h == &s.harness)
                     || (!include_inactive && !active)
                 {
@@ -625,7 +644,12 @@ async fn sessions(
                     cached,
                 });
             }
-            Ok(SessionsPage { items, total, offset, limit })
+            Ok(SessionsPage {
+                items,
+                total,
+                offset,
+                limit,
+            })
         })
         .await?,
     ))
@@ -993,9 +1017,15 @@ async fn compactions_recent(
     State(state): State<AppState>,
     Query(query): Query<CompactionsQuery>,
 ) -> Result<Json<Vec<CompactionEvent>>, (StatusCode, String)> {
-    let limit = query.limit.unwrap_or(DEFAULT_COMPACTIONS_LIMIT).min(MAX_COMPACTIONS_LIMIT);
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_COMPACTIONS_LIMIT)
+        .min(MAX_COMPACTIONS_LIMIT);
     Ok(Json(
-        read(state, move |store| Ok(store.recent_compaction_events(limit)?)).await?,
+        read(state, move |store| {
+            Ok(store.recent_compaction_events(limit)?)
+        })
+        .await?,
     ))
 }
 
@@ -1023,53 +1053,72 @@ async fn actions_recent(
     State(state): State<AppState>,
     Query(query): Query<CompactionsQuery>,
 ) -> Result<Json<Vec<RecentAction>>, (StatusCode, String)> {
-    let limit = query.limit.unwrap_or(DEFAULT_COMPACTIONS_LIMIT).min(MAX_COMPACTIONS_LIMIT);
-    Ok(Json(read(state, move |store| {
-        let mut actions = Vec::new();
-        for session in store.list_sessions()? {
-            for request in store.compaction_requests_for_session(&session.id)? {
-                let (status, error) = compact_action_status(&request.status);
-                actions.push(RecentAction {
-                    session_id: session.id.clone(), kind: "compaction".into(),
-                    status, at: request.created_at,
-                    detail: Some(request.reason),
-                    error,
-                });
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_COMPACTIONS_LIMIT)
+        .min(MAX_COMPACTIONS_LIMIT);
+    Ok(Json(
+        read(state, move |store| {
+            let mut actions = Vec::new();
+            for session in store.list_sessions()? {
+                for request in store.compaction_requests_for_session(&session.id)? {
+                    let (status, error) = compact_action_status(&request.status);
+                    actions.push(RecentAction {
+                        session_id: session.id.clone(),
+                        kind: "compaction".into(),
+                        status,
+                        at: request.created_at,
+                        detail: Some(request.reason),
+                        error,
+                    });
+                }
+                for event in store.compaction_events_for_session(&session.id)? {
+                    actions.push(RecentAction {
+                        session_id: session.id.clone(),
+                        kind: "compaction".into(),
+                        status: if event.completed_at.is_some() {
+                            "successful".into()
+                        } else {
+                            "in progress".into()
+                        },
+                        at: event.started_at,
+                        detail: event.trigger,
+                        error: None,
+                    });
+                }
+                for marker in store.resume_markers_for_session(&session.id)? {
+                    let (status, error) = resume_status(&marker.status);
+                    actions.push(RecentAction {
+                        session_id: session.id.clone(),
+                        kind: "resume".into(),
+                        status,
+                        at: marker.created_at,
+                        detail: marker.message,
+                        error,
+                    });
+                }
+                if let Ok(keepalive) = store.keepalive_config(&session.id)
+                    && keepalive.enabled
+                {
+                    actions.push(RecentAction {
+                        session_id: session.id.clone(),
+                        kind: "keepalive".into(),
+                        status: "active".into(),
+                        at: keepalive.last_ping_at.unwrap_or(session.last_seen),
+                        detail: None,
+                        error: None,
+                    });
+                }
             }
-            for event in store.compaction_events_for_session(&session.id)? {
-                actions.push(RecentAction {
-                    session_id: session.id.clone(), kind: "compaction".into(),
-                    status: if event.completed_at.is_some() { "successful".into() } else { "in progress".into() },
-                    at: event.started_at,
-                    detail: event.trigger,
-                    error: None,
-                });
-            }
-            for marker in store.resume_markers_for_session(&session.id)? {
-                let (status, error) = resume_status(&marker.status);
-                actions.push(RecentAction {
-                    session_id: session.id.clone(), kind: "resume".into(),
-                    status, at: marker.created_at,
-                    detail: marker.message,
-                    error,
-                });
-            }
-            if let Ok(keepalive) = store.keepalive_config(&session.id)
-                && keepalive.enabled
-            {
-                actions.push(RecentAction {
-                    session_id: session.id.clone(), kind: "keepalive".into(),
-                    status: "active".into(),
-                    at: keepalive.last_ping_at.unwrap_or(session.last_seen),
-                    detail: None,
-                    error: None,
-                });
-            }
-        }
-        actions.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.session_id.0.cmp(&b.session_id.0)));
-        actions.truncate(limit as usize);
-        Ok(actions)
-    }).await?))
+            actions.sort_by(|a, b| {
+                b.at.cmp(&a.at)
+                    .then_with(|| a.session_id.0.cmp(&b.session_id.0))
+            });
+            actions.truncate(limit as usize);
+            Ok(actions)
+        })
+        .await?,
+    ))
 }
 
 async fn static_asset() -> Response<Body> {
@@ -1213,7 +1262,11 @@ mod tests {
         let value: StatusResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(value.usage[0].windows[0].pct, 42.0);
         let response = router
-            .oneshot(Request::get("/api/sessions?stopped=true").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/api/sessions?stopped=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -1235,7 +1288,9 @@ mod tests {
             )
             .unwrap()
             .to_string();
-        let router = app_with_adapters_and_auth(Store::open_memory().unwrap(), HashMap::new(), Some(hash)).unwrap();
+        let router =
+            app_with_adapters_and_auth(Store::open_memory().unwrap(), HashMap::new(), Some(hash))
+                .unwrap();
 
         let response = router
             .clone()
@@ -1506,12 +1561,14 @@ mod tests {
         let id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b40";
         let path = format!("/tmp/{id}.jsonl");
         let store = Store::open_memory().unwrap();
-        store.insert_session(&{
-            let mut s = session();
-            s.id = SessionId(id.into());
-            s.harness = Provider::ClaudeCode;
-            s
-        }).unwrap();
+        store
+            .insert_session(&{
+                let mut s = session();
+                s.id = SessionId(id.into());
+                s.harness = Provider::ClaudeCode;
+                s
+            })
+            .unwrap();
         // A CompactionRequest we issued ourselves and have already claimed for
         // delivery (Sending), so the upcoming PreCompact should be classified
         // as Inline.
@@ -1698,7 +1755,10 @@ mod tests {
             String::from_utf8_lossy(&response_body)
         );
         let compact_status: CompactStatusResponse = serde_json::from_slice(&response_body).unwrap();
-        assert_eq!(compact_status.requests.last().unwrap().prompt, "/compact test");
+        assert_eq!(
+            compact_status.requests.last().unwrap().prompt,
+            "/compact test"
+        );
         let threshold = ThresholdSetRequest {
             scope: ThresholdScope {
                 provider: Provider::Codex,
@@ -1891,7 +1951,9 @@ mod tests {
             .oneshot(Request::get("/api/sessions").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let page: SessionsPage = serde_json::from_slice(&body).unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].id, active.id);
@@ -1906,7 +1968,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let page: SessionsPage = serde_json::from_slice(&body).unwrap();
         assert_eq!(page.total, 2);
     }

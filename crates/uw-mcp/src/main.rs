@@ -494,6 +494,26 @@ fn build_deps(path: &str) -> anyhow::Result<Deps> {
             Arc::new(uw_adapters::codex::CodexAdapter::real()) as Arc<dyn HarnessAdapter>,
         ),
     ]);
+    let mut adapters = adapters;
+    if let Ok(token) = std::env::var("UW_CURSOR_ACCESS_TOKEN") {
+        if !token.is_empty() && std::env::var("UW_CURSOR_SESSION_COOKIE").is_err() {
+            adapters.insert(
+                Provider::Cursor,
+                Arc::new(uw_adapters::cursor::CursorAdapter::real(
+                    uw_adapters::cursor::CursorAuth::Bearer(token),
+                )) as Arc<dyn HarnessAdapter>,
+            );
+        }
+    } else if let Ok(cookie) = std::env::var("UW_CURSOR_SESSION_COOKIE")
+        && !cookie.is_empty()
+    {
+        adapters.insert(
+            Provider::Cursor,
+            Arc::new(uw_adapters::cursor::CursorAdapter::real(
+                uw_adapters::cursor::CursorAuth::Cookie(cookie),
+            )) as Arc<dyn HarnessAdapter>,
+        );
+    }
     Ok(Deps {
         store: Arc::new(Mutex::new(Store::open(path)?)),
         adapters,

@@ -4,9 +4,9 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use uw_core::adapter::{
@@ -28,10 +28,8 @@ mod paseo_messenger_tests {
 
     #[test]
     fn resolves_paseo_agent_from_claude_session_id() {
-        let root = std::env::temp_dir().join(format!(
-            "usagewindow-paseo-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("usagewindow-paseo-test-{}", uuid::Uuid::new_v4()));
         let agents = root.join("agents/project");
         std::fs::create_dir_all(&agents).unwrap();
         std::fs::write(
@@ -49,10 +47,8 @@ mod paseo_messenger_tests {
 
     #[test]
     fn does_not_resolve_an_unrelated_claude_session() {
-        let root = std::env::temp_dir().join(format!(
-            "usagewindow-paseo-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("usagewindow-paseo-test-{}", uuid::Uuid::new_v4()));
         let agents = root.join("agents/project");
         std::fs::create_dir_all(&agents).unwrap();
         std::fs::write(
@@ -83,18 +79,17 @@ fn resolve_paseo_agent_id(home: &Path, session_id: &SessionId) -> anyhow::Result
             if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
                 continue;
             }
-            let value: serde_json::Value = match serde_json::from_str(&std::fs::read_to_string(&path)?) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
+            let value: serde_json::Value =
+                match serde_json::from_str(&std::fs::read_to_string(&path)?) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
             let matches = value
                 .pointer("/runtimeInfo/sessionId")
                 .or_else(|| value.pointer("/persistence/sessionId"))
                 .and_then(serde_json::Value::as_str)
                 == Some(session_id);
-            if matches
-                && let Some(id) = value.get("id").and_then(serde_json::Value::as_str)
-            {
+            if matches && let Some(id) = value.get("id").and_then(serde_json::Value::as_str) {
                 return Ok(Some(id.to_owned()));
             }
         }
@@ -136,11 +131,12 @@ impl uw_adapters::claude_code::SessionMessenger for PaseoSessionMessenger {
     ) -> uw_core::adapter::AdapterResult<DeliveryOutcome> {
         let home = self.home.clone();
         let session_id = session_id.clone();
-        let agent_id = tokio::task::spawn_blocking(move || resolve_paseo_agent_id(&home, &session_id))
-            .await
-            .map_err(|error| AdapterError::Other(error.to_string()))?
-            .map_err(|error| AdapterError::Other(error.to_string()))?
-            .ok_or(AdapterError::Unsupported)?;
+        let agent_id =
+            tokio::task::spawn_blocking(move || resolve_paseo_agent_id(&home, &session_id))
+                .await
+                .map_err(|error| AdapterError::Other(error.to_string()))?
+                .map_err(|error| AdapterError::Other(error.to_string()))?
+                .ok_or(AdapterError::Unsupported)?;
         let output = tokio::process::Command::new(&self.program)
             .args(["send", "--no-wait", &agent_id, text])
             .output()
@@ -271,11 +267,7 @@ pub trait DaemonStore: Send + Sync {
         session_id: &SessionId,
     ) -> anyhow::Result<Option<ResumeMarker>>;
     async fn insert_resume_marker(&self, marker: ResumeMarker) -> anyhow::Result<()>;
-    async fn set_resume_at(
-        &self,
-        id: uuid::Uuid,
-        resume_at: DateTime<Utc>,
-    ) -> anyhow::Result<()>;
+    async fn set_resume_at(&self, id: uuid::Uuid, resume_at: DateTime<Utc>) -> anyhow::Result<()>;
     async fn due_resume_markers(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<ResumeMarker>>;
     async fn claim_resume_marker(&self, _id: uuid::Uuid) -> anyhow::Result<bool> {
         Ok(false)
@@ -460,10 +452,7 @@ impl DaemonStore for SqliteDaemonStore {
         self.blocking(move |store| Ok(store.token_usage_for_session(&id)?))
             .await
     }
-    async fn active_resume_marker(
-        &self,
-        id: &SessionId,
-    ) -> anyhow::Result<Option<ResumeMarker>> {
+    async fn active_resume_marker(&self, id: &SessionId) -> anyhow::Result<Option<ResumeMarker>> {
         let id = id.clone();
         self.blocking(move |s| Ok(s.active_resume_marker(&id)?))
             .await
@@ -665,15 +654,15 @@ pub async fn run_observation_tick(
         let Some(adapter) = adapters.get(&session.harness) else {
             continue;
         };
-        let sampled_stop = fetched_samples
-            .get(&session.harness)
-            .and_then(|sample| {
-                sample
-                    .windows
-                    .iter()
-                    .find(|(_, window)| window.exceeded)
-                    .map(|(window, _)| StopReason::UsageLimit { window: window.clone() })
-            });
+        let sampled_stop = fetched_samples.get(&session.harness).and_then(|sample| {
+            sample
+                .windows
+                .iter()
+                .find(|(_, window)| window.exceeded)
+                .map(|(window, _)| StopReason::UsageLimit {
+                    window: window.clone(),
+                })
+        });
         let detected = match (sampled_stop, fetched_samples.contains_key(&session.harness)) {
             (Some(stop), _) => Ok(Some(stop)),
             (None, true) => Ok(None),
@@ -1019,7 +1008,8 @@ pub async fn run_near_limit_tick(
     let Some((_, current_pct)) = block.points.last() else {
         return Ok(NearLimitOutcome::NoData);
     };
-    let Some(burn) = uw_policy::burn_rate_pct_per_hour(block, Duration::minutes(30)) else {
+    let lookback = uw_policy::burn_rate_lookback(&key.provider);
+    let Some(burn) = uw_policy::burn_rate_pct_per_hour(block, lookback) else {
         return Ok(NearLimitOutcome::NoData);
     };
     if !uw_policy::should_trigger_near_limit(*current_pct, burn, profile)
@@ -1029,7 +1019,7 @@ pub async fn run_near_limit_tick(
     }
     let text = format!(
         "Usage is at {current_pct:.1}% and projected to exhaust at {:?}.",
-        uw_policy::projected_exhaustion(block, Utc::now())
+        uw_policy::projected_exhaustion_with_lookback(block, Utc::now(), lookback)
     );
     match uw_policy::advise_channel_for(&adapter.capabilities()) {
         AdviseChannel::MidTurn => {
@@ -1153,8 +1143,7 @@ pub async fn run_policy_tick(
                 .active_resume_marker(&session.id)
                 .await?
                 .is_some_and(|marker| {
-                    marker.reason == ResumeReason::ManuallyMarked
-                        && marker.resume_at.is_none()
+                    marker.reason == ResumeReason::ManuallyMarked && marker.resume_at.is_none()
                 });
             if stopped_on_this_window || manual_resume_waiting_for_schedule {
                 reconcile_resume_marker_with_token_rates(
@@ -1300,7 +1289,9 @@ async fn reconcile_resume_marker_with_token_rates(
             ) else {
                 return Ok(false);
             };
-            let resume_at = marker.requested_at.map_or(floor, |requested| requested.max(floor));
+            let resume_at = marker
+                .requested_at
+                .map_or(floor, |requested| requested.max(floor));
             store.set_resume_at(marker.id, resume_at).await?;
             Ok(true)
         }
@@ -1314,8 +1305,7 @@ async fn reconcile_resume_marker_with_token_rates(
                 model,
                 history,
                 token_burn_rate,
-            )
-            else {
+            ) else {
                 return Ok(false);
             };
             store.insert_resume_marker(marker).await?;
@@ -1330,15 +1320,15 @@ fn scaled_token_burn_rate(
     sessions: &[SessionSummary],
     token_rates: &HashMap<SessionId, f64>,
 ) -> Option<f64> {
-    let global = uw_policy::burn_rate_pct_per_hour_available(block, Duration::minutes(30))?
-        as f64
+    let global = uw_policy::burn_rate_pct_per_hour_available(
+        block,
+        uw_policy::burn_rate_lookback(&block.key.provider),
+    )? as f64
         / 60.0;
     let target = *token_rates.get(&session.id)?;
     let total: f64 = sessions
         .iter()
-        .filter(|other| {
-            other.harness == session.harness && other.account == session.account
-        })
+        .filter(|other| other.harness == session.harness && other.account == session.account)
         .filter_map(|other| token_rates.get(&other.id))
         .sum();
     (total > 0.0).then_some(global * target / total)
@@ -1385,7 +1375,7 @@ fn resume_floor_with_burn(
     }
     let lookback_minutes = match block.key.kind {
         WindowKind::Rolling { minutes } => u64::from(minutes).clamp(1, 30),
-        _ => 30,
+        _ => uw_policy::burn_rate_lookback(&block.key.provider).num_minutes() as u64,
     };
     let burn = token_burn_rate.unwrap_or_else(|| {
         uw_policy::burn_rate_pct_per_hour_available(
@@ -1476,7 +1466,9 @@ pub async fn run_resume_tick(
                 .await?;
             continue;
         };
-        let result = adapter.resume_session(&session, marker.message.as_deref()).await;
+        let result = adapter
+            .resume_session(&session, marker.message.as_deref())
+            .await;
         store
             .update_resume(
                 marker.id,
@@ -1585,12 +1577,10 @@ pub async fn run_production_ticks(
                 profile.idle_compact.tiers = tiers.clone();
             }
             if matches!(session.harness, Provider::ClaudeCode | Provider::Codex) {
-                profile
-                    .cache_ttl_by_provider
-                    .insert(
-                        session.harness.clone(),
-                        Duration::minutes(CACHE_WARM_APPROXIMATION_MINUTES),
-                    );
+                profile.cache_ttl_by_provider.insert(
+                    session.harness.clone(),
+                    Duration::minutes(CACHE_WARM_APPROXIMATION_MINUTES),
+                );
             }
             if auto_reseed.is_some() {
                 profile.reseed_auto = ReseedAutoConfig {
@@ -1664,9 +1654,9 @@ fn parse_idle_compact_tiers(value: &str) -> anyhow::Result<Vec<TokenTier>> {
             .split_once(':')
             .ok_or_else(|| anyhow::anyhow!("expected FLOOR:TOKENS, got {item:?}"))?;
         tiers.push(TokenTier {
-            window_size_floor: window_size_floor.parse().map_err(|_| {
-                anyhow::anyhow!("invalid context-window floor in {item:?}")
-            })?,
+            window_size_floor: window_size_floor
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid context-window floor in {item:?}"))?,
             token_threshold: token_threshold
                 .parse()
                 .map_err(|_| anyhow::anyhow!("invalid token threshold in {item:?}"))?,
@@ -1773,9 +1763,8 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
     let paseo_fallback: Arc<dyn HarnessAdapter> = Arc::new(
         uw_adapters::fallback::MessageCompactionAdapter::new(paseo_messenger),
     );
-    let mut codex: Arc<dyn HarnessAdapter> = Arc::new(
-        uw_adapters::codex::CodexAdapter::real().with_hook_channel(hook_channel),
-    );
+    let mut codex: Arc<dyn HarnessAdapter> =
+        Arc::new(uw_adapters::codex::CodexAdapter::real().with_hook_channel(hook_channel));
     let mut adapters: HashMap<Provider, Arc<dyn HarnessAdapter>> = HashMap::from([
         (Provider::Codex, codex.clone()),
         (
@@ -1783,6 +1772,12 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
             Arc::new(claude) as Arc<dyn HarnessAdapter>,
         ),
     ]);
+    if let Some(auth) = cursor_auth_from_environment() {
+        adapters.insert(
+            Provider::Cursor,
+            Arc::new(uw_adapters::cursor::CursorAdapter::real(auth)),
+        );
+    }
     if let Ok(command) = std::env::var("UW_GENERIC_USAGE_COMMAND") {
         let command: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
         if !command.is_empty() {
@@ -1819,17 +1814,13 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
             }
         };
         if let Some(auth) = auth {
-            let t3code: Arc<dyn HarnessAdapter> = Arc::new(
-                uw_adapters::t3code::T3CodeAdapter::real(base_url, auth),
-            );
+            let t3code: Arc<dyn HarnessAdapter> =
+                Arc::new(uw_adapters::t3code::T3CodeAdapter::real(base_url, auth));
             codex = Arc::new(uw_adapters::fallback::FallbackCompactionAdapter::new(
                 codex,
                 t3code.clone(),
             ));
-            adapters.insert(
-                Provider::Other("t3code".into()),
-                t3code,
-            );
+            adapters.insert(Provider::Other("t3code".into()), t3code);
         }
     }
     codex = Arc::new(uw_adapters::fallback::FallbackCompactionAdapter::new(
@@ -1860,6 +1851,25 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
     tokio::select! {
         result = server => result.map_err(Into::into),
         result = run_production_ticks(daemon_store, &adapters, &liveness, std::time::Duration::from_secs(60)) => result,
+    }
+}
+
+fn cursor_auth_from_environment() -> Option<uw_adapters::cursor::CursorAuth> {
+    match (
+        std::env::var("UW_CURSOR_ACCESS_TOKEN").ok(),
+        std::env::var("UW_CURSOR_SESSION_COOKIE").ok(),
+    ) {
+        (Some(token), None) if !token.is_empty() => {
+            Some(uw_adapters::cursor::CursorAuth::Bearer(token))
+        }
+        (None, Some(cookie)) if !cookie.is_empty() => {
+            Some(uw_adapters::cursor::CursorAuth::Cookie(cookie))
+        }
+        (Some(_), Some(_)) => {
+            tracing::warn!("both Cursor auth variables are set; Cursor adapter disabled");
+            None
+        }
+        _ => None,
     }
 }
 
@@ -2193,10 +2203,7 @@ mod tests {
 
         // A warm cache warrants an immediate resume even with a fast burn rate.
         session.last_seen = now - Duration::minutes(1);
-        block.points = vec![
-            (now - Duration::minutes(10), 0.0),
-            (now, 50.0),
-        ];
+        block.points = vec![(now - Duration::minutes(10), 0.0), (now, 50.0)];
         block.point_resets_at = vec![None, None];
         assert_eq!(
             resume_floor(&session, &block, now, &profile, "claude", &[]),
@@ -2206,10 +2213,7 @@ mod tests {
         // An uncached chat still resumes immediately when exhaustion is not
         // expected within the 30-minute safety horizon.
         session.last_seen = now - Duration::minutes(10);
-        block.points = vec![
-            (now - Duration::minutes(31), 0.0),
-            (now, 1.0),
-        ];
+        block.points = vec![(now - Duration::minutes(31), 0.0), (now, 1.0)];
         block.point_resets_at = vec![None, None];
         assert_eq!(
             resume_floor(&session, &block, now, &profile, "claude", &[]),
@@ -2233,8 +2237,9 @@ mod tests {
             (now, 90.0),
         ];
         block.point_resets_at = vec![None, None, None];
-        assert!(resume_floor(&session, &block, now, &profile, "claude", &[])
-            .is_some_and(|at| at > now));
+        assert!(
+            resume_floor(&session, &block, now, &profile, "claude", &[]).is_some_and(|at| at > now)
+        );
     }
 
     #[test]
@@ -2246,18 +2251,10 @@ mod tests {
         let mut second = session();
         second.id = SessionId("other".into());
         let rates = HashMap::from([(first.id.clone(), 2.0), (second.id.clone(), 0.3)]);
-        let scaled = scaled_token_burn_rate(
-            &block,
-            &first,
-            &[first.clone(), second],
-            &rates,
-        )
-        .expect("the block has a usable quota burn rate");
-        let global = uw_policy::burn_rate_pct_per_hour_available(
-            &block,
-            Duration::minutes(30),
-        )
-        .unwrap() as f64
+        let scaled = scaled_token_burn_rate(&block, &first, &[first.clone(), second], &rates)
+            .expect("the block has a usable quota burn rate");
+        let global = uw_policy::burn_rate_pct_per_hour_available(&block, Duration::minutes(30))
+            .unwrap() as f64
             / 60.0;
         assert!((scaled - global * 2.0 / 2.3).abs() < 0.0001);
     }
@@ -2265,12 +2262,7 @@ mod tests {
     #[test]
     fn unsupported_compaction_is_failed_without_send_plan() {
         assert_eq!(
-            plan_compaction_tick(
-                &request(),
-                &caps(false, false, false),
-                true,
-                &session(),
-            ),
+            plan_compaction_tick(&request(), &caps(false, false, false), true, &session(),),
             CompactionPlan::SkipUnsupported(
                 "adapter cannot honor destructive compaction requests".into()
             )
@@ -2572,7 +2564,10 @@ mod tests {
         assert_eq!(report.stops_recorded, 1);
         assert_eq!(
             store.stops.lock().unwrap().as_slice(),
-            &[(SessionId("s".into()), StopReason::UsageLimit { window: key })]
+            &[(
+                SessionId("s".into()),
+                StopReason::UsageLimit { window: key }
+            )]
         );
     }
 
@@ -2870,10 +2865,7 @@ mod tests {
             source: UsageSource::ProviderReported,
             provider,
             account: None,
-            windows: HashMap::from([(
-                window,
-                UsageWindowState::new(1.0, false, true, None, None),
-            )]),
+            windows: HashMap::from([(window, UsageWindowState::new(1.0, false, true, None, None))]),
             credits: None,
         };
         Store::open(&path_string)
@@ -3072,7 +3064,11 @@ mod tests {
             *self.inserts.lock().unwrap() += 1;
             Ok(())
         }
-        async fn set_resume_at(&self, id: uuid::Uuid, resume_at: DateTime<Utc>) -> anyhow::Result<()> {
+        async fn set_resume_at(
+            &self,
+            id: uuid::Uuid,
+            resume_at: DateTime<Utc>,
+        ) -> anyhow::Result<()> {
             self.resolved.lock().unwrap().push((id, resume_at));
             Ok(())
         }
