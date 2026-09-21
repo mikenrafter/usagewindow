@@ -272,6 +272,29 @@ pub trait DaemonStore: Send + Sync {
     }
     async fn resume_owner(&self, session_id: &SessionId) -> anyhow::Result<SessionSummary>;
     async fn update_resume(&self, id: uuid::Uuid, status: ResumeStatus) -> anyhow::Result<()>;
+    /// Cancels this session's active (pending/scheduled) resume marker, if any.
+    /// Used when a hard-boundary compaction fails: a stopped session must never
+    /// resume into a context that was never verified to have been compacted.
+    async fn cancel_resume_markers(&self, _session_id: &SessionId) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// All compaction requests ever recorded for this session, oldest first.
+    /// Used to find the most recent hard-boundary compaction attempt.
+    async fn compaction_requests_for_session(
+        &self,
+        _session_id: &SessionId,
+    ) -> anyhow::Result<Vec<CompactionRequest>> {
+        Ok(Vec::new())
+    }
+    /// All compaction events recorded for this session, oldest first. A
+    /// `completed_at` entry started after a compaction request's `created_at`
+    /// is the only evidence that request's compaction actually finished.
+    async fn compaction_events_for_session(
+        &self,
+        _session_id: &SessionId,
+    ) -> anyhow::Result<Vec<CompactionEvent>> {
+        Ok(Vec::new())
+    }
 }
 
 #[async_trait]
@@ -291,6 +314,12 @@ pub trait KeepaliveStore: Send + Sync {
     async fn keepalive_sessions(&self) -> anyhow::Result<Vec<SessionSummary>>;
     async fn keepalive_state(&self, id: &SessionId) -> anyhow::Result<KeepaliveState>;
     async fn record_keepalive_ping(&self, id: &SessionId, at: DateTime<Utc>) -> anyhow::Result<()>;
+    /// Persists whether keepalive is armed for this session, independent of
+    /// any single tick's delivery. A no-op default for stores that don't
+    /// persist keepalive state across ticks.
+    async fn set_keepalive_enabled(&self, _id: &SessionId, _enabled: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -477,6 +506,27 @@ impl DaemonStore for SqliteDaemonStore {
     async fn claim_resume_marker(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
         self.blocking(move |s| Ok(s.claim_resume_marker(id)?)).await
     }
+    async fn cancel_resume_markers(&self, id: &SessionId) -> anyhow::Result<()> {
+        let id = id.clone();
+        self.blocking(move |s| Ok(s.cancel_resume_markers(&id)?))
+            .await
+    }
+    async fn compaction_requests_for_session(
+        &self,
+        id: &SessionId,
+    ) -> anyhow::Result<Vec<CompactionRequest>> {
+        let id = id.clone();
+        self.blocking(move |s| Ok(s.compaction_requests_for_session(&id)?))
+            .await
+    }
+    async fn compaction_events_for_session(
+        &self,
+        id: &SessionId,
+    ) -> anyhow::Result<Vec<CompactionEvent>> {
+        let id = id.clone();
+        self.blocking(move |s| Ok(s.compaction_events_for_session(&id)?))
+            .await
+    }
 }
 
 #[async_trait]
@@ -517,6 +567,11 @@ impl KeepaliveStore for SqliteDaemonStore {
     async fn record_keepalive_ping(&self, id: &SessionId, at: DateTime<Utc>) -> anyhow::Result<()> {
         let id = id.clone();
         self.blocking(move |s| Ok(s.record_keepalive_ping(&id, at)?))
+            .await
+    }
+    async fn set_keepalive_enabled(&self, id: &SessionId, enabled: bool) -> anyhow::Result<()> {
+        let id = id.clone();
+        self.blocking(move |s| Ok(s.set_keepalive(&id, enabled)?))
             .await
     }
 }
@@ -926,7 +981,7 @@ pub async fn run_keepalive_tick(
         }
         if matches!(
             adapter.advise(&session.id, KEEPALIVE_MARKER).await,
-            Ok(DeliveryOutcome::Delivered | DeliveryOutcome::QueuedForNextIdle)
+            Ok(DeliveryOutcome::Delivered)
         ) {
             store.record_keepalive_ping(&session.id, now).await?;
             sent += 1;
@@ -1104,6 +1159,7 @@ pub async fn run_policy_tick(
         for sample in &samples {
             keys.extend(sample.windows.keys().cloned());
         }
+        let mut suppress_idle = false;
         for key in keys {
             let blocks = uw_policy::segment_blocks(&samples, &key, session.account.as_ref());
             let Some(block) = blocks.last() else {
@@ -1112,38 +1168,70 @@ pub async fn run_policy_tick(
             let Some((_, current_pct)) = block.points.last() else {
                 continue;
             };
-            let ask_key = (session.id.clone(), key.clone(), block.resets_at);
-            let previous = state.asked.get(&ask_key).copied();
-            let outcome = run_near_limit_tick(
-                &samples,
-                adapter.as_ref(),
-                session,
-                &key,
-                profile,
-                previous.map(|entry| entry.0),
-                previous.map_or(0, |entry| entry.1),
-            )
-            .await?;
-            if matches!(
-                outcome,
-                NearLimitOutcome::Advised | NearLimitOutcome::Checkpointed
-            ) {
-                state.asked.insert(
-                    ask_key,
-                    (*current_pct, previous.map_or(1, |entry| entry.1 + 1)),
-                );
-            }
+            let current_pct = *current_pct;
             let stopped_on_this_window = matches!(
                 session.stopped_reason.as_ref(),
                 Some(StopReason::UsageLimit { window }) if window == &key
             );
+            let hard_boundary_active =
+                current_pct >= profile.plan_pressure_pct || stopped_on_this_window;
+            let compact_band_active = !hard_boundary_active && current_pct >= profile.compact_pct;
+
+            if hard_boundary_active {
+                suppress_idle = true;
+                keepalive_store
+                    .set_keepalive_enabled(&session.id, false)
+                    .await?;
+                handle_hard_boundary(store, session, block, profile, now, sessions, &token_rates)
+                    .await?;
+            } else if compact_band_active {
+                suppress_idle = true;
+                keepalive_store
+                    .set_keepalive_enabled(&session.id, true)
+                    .await?;
+                let mut effective_state = keepalive_store.keepalive_state(&session.id).await?;
+                effective_state.enabled = true;
+                if should_fire_keepalive(now, session, &effective_state, profile)
+                    && matches!(
+                        adapter.advise(&session.id, KEEPALIVE_MARKER).await,
+                        Ok(DeliveryOutcome::Delivered)
+                    )
+                {
+                    keepalive_store
+                        .record_keepalive_ping(&session.id, now)
+                        .await?;
+                }
+            } else {
+                let ask_key = (session.id.clone(), key.clone(), block.resets_at);
+                let previous = state.asked.get(&ask_key).copied();
+                let outcome = run_near_limit_tick(
+                    &samples,
+                    adapter.as_ref(),
+                    session,
+                    &key,
+                    profile,
+                    previous.map(|entry| entry.0),
+                    previous.map_or(0, |entry| entry.1),
+                )
+                .await?;
+                if matches!(
+                    outcome,
+                    NearLimitOutcome::Advised | NearLimitOutcome::Checkpointed
+                ) {
+                    state.asked.insert(
+                        ask_key,
+                        (current_pct, previous.map_or(1, |entry| entry.1 + 1)),
+                    );
+                }
+            }
+
             let manual_resume_waiting_for_schedule = store
                 .active_resume_marker(&session.id)
                 .await?
                 .is_some_and(|marker| {
                     marker.reason == ResumeReason::ManuallyMarked && marker.resume_at.is_none()
                 });
-            if stopped_on_this_window || manual_resume_waiting_for_schedule {
+            if manual_resume_waiting_for_schedule {
                 reconcile_resume_marker_with_token_rates(
                     store,
                     session,
@@ -1158,7 +1246,9 @@ pub async fn run_policy_tick(
                 .await?;
             }
         }
-        if let Some(cache_ttl) = profile.cache_ttl_by_provider.get(&session.harness) {
+        if !suppress_idle
+            && let Some(cache_ttl) = profile.cache_ttl_by_provider.get(&session.harness)
+        {
             state
                 .idle
                 .tick(
@@ -1227,6 +1317,70 @@ impl IdleEpisodeTracker {
         }
         Ok(false)
     }
+}
+
+pub const HARD_BOUNDARY_REASON: &str = "hard quota boundary";
+
+/// Drives the plan_pressure_pct hard boundary: stop, queue a blocking
+/// compaction, and only schedule an automatic resume once that specific
+/// compaction is verified complete. A failed hard-boundary compaction cancels
+/// any resume marker and is never retried — delivery success is not proof of
+/// completion, so this waits for a `CompactionEvent` started after the
+/// request before treating it as done.
+async fn handle_hard_boundary(
+    store: &(dyn DaemonStore + Send + Sync),
+    session: &SessionSummary,
+    block: &WindowBlock,
+    profile: &ThresholdProfile,
+    now: DateTime<Utc>,
+    sessions: &[SessionSummary],
+    token_rates: &HashMap<SessionId, f64>,
+) -> anyhow::Result<()> {
+    let requests = store.compaction_requests_for_session(&session.id).await?;
+    let latest = requests
+        .iter()
+        .filter(|request| request.reason.contains(HARD_BOUNDARY_REASON))
+        .max_by_key(|request| request.created_at);
+    match latest {
+        None => {
+            store
+                .enqueue_compaction(CompactionRequest {
+                    id: uuid::Uuid::new_v4(),
+                    session_id: session.id.clone(),
+                    kind: CompactionKind::AgentRequested,
+                    prompt: uw_core::compaction::instruction_body(HARD_BOUNDARY_REASON),
+                    reason: HARD_BOUNDARY_REASON.into(),
+                    status: CompactionStatus::Pending,
+                    created_at: now,
+                })
+                .await?;
+        }
+        Some(request) if matches!(request.status, CompactionStatus::Failed(_)) => {
+            store.cancel_resume_markers(&session.id).await?;
+        }
+        Some(request) if matches!(request.status, CompactionStatus::Sent) => {
+            let events = store.compaction_events_for_session(&session.id).await?;
+            let verified = events.iter().any(|event| {
+                event.completed_at.is_some() && event.started_at >= request.created_at
+            });
+            if verified {
+                reconcile_resume_marker_with_token_rates(
+                    store,
+                    session,
+                    block,
+                    now,
+                    profile,
+                    session.model.as_ref().map_or("", |model| model.0.as_str()),
+                    &[],
+                    sessions,
+                    token_rates,
+                )
+                .await?;
+            }
+        }
+        Some(_) => {}
+    }
+    Ok(())
 }
 
 /// Reconciles the session's single active resume marker (the DB enforces at
@@ -3482,7 +3636,10 @@ mod tests {
                 .unwrap()
                 .iter()
                 .find(|marker| {
-                    matches!(marker.status, ResumeStatus::Pending | ResumeStatus::Scheduled)
+                    matches!(
+                        marker.status,
+                        ResumeStatus::Pending | ResumeStatus::Scheduled
+                    )
                 })
                 .cloned())
         }
@@ -3523,11 +3680,7 @@ mod tests {
         async fn resume_owner(&self, _: &SessionId) -> anyhow::Result<SessionSummary> {
             Ok(self.session.clone())
         }
-        async fn update_resume(
-            &self,
-            id: uuid::Uuid,
-            status: ResumeStatus,
-        ) -> anyhow::Result<()> {
+        async fn update_resume(&self, id: uuid::Uuid, status: ResumeStatus) -> anyhow::Result<()> {
             if let Some(marker) = self
                 .resume_markers
                 .lock()
@@ -3596,11 +3749,7 @@ mod tests {
         ) -> AdapterResult<DeliveryOutcome> {
             Ok(DeliveryOutcome::Delivered)
         }
-        async fn resume_session(
-            &self,
-            _: &SessionSummary,
-            _: Option<&str>,
-        ) -> AdapterResult<()> {
+        async fn resume_session(&self, _: &SessionSummary, _: Option<&str>) -> AdapterResult<()> {
             self.resume_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -3621,13 +3770,7 @@ mod tests {
                 account: None,
                 windows: HashMap::from([(
                     key.clone(),
-                    UsageWindowState::new(
-                        pct,
-                        false,
-                        true,
-                        Some(now + Duration::hours(1)),
-                        None,
-                    ),
+                    UsageWindowState::new(pct, false, true, Some(now + Duration::hours(1)), None),
                 )]),
                 credits: None,
             })
@@ -3897,10 +4040,7 @@ mod tests {
             advised: StdMutex::new(vec![]),
             resume_calls: AtomicUsize::new(0),
         });
-        let adapters = HashMap::from([(
-            Provider::ClaudeCode,
-            adapter as Arc<dyn HarnessAdapter>,
-        )]);
+        let adapters = HashMap::from([(Provider::ClaudeCode, adapter as Arc<dyn HarnessAdapter>)]);
         let profiles = HashMap::from([(stopped.id.clone(), boundary_profile())]);
         let mut runtime = PolicyRuntimeState::default();
 
@@ -4018,11 +4158,7 @@ mod tests {
             ) -> AdapterResult<DeliveryOutcome> {
                 Ok(DeliveryOutcome::QueuedForNextIdle)
             }
-            async fn advise(
-                &self,
-                _: &SessionId,
-                _: &str,
-            ) -> AdapterResult<DeliveryOutcome> {
+            async fn advise(&self, _: &SessionId, _: &str) -> AdapterResult<DeliveryOutcome> {
                 Ok(DeliveryOutcome::QueuedForNextIdle)
             }
             async fn compact(
