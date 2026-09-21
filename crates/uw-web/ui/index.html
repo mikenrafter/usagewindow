@@ -72,8 +72,8 @@
   .card { background: #0d0f14; border: 1px solid var(--border); border-radius: 8px; padding: 0.8rem; }
   .card .head { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.6rem; }
   .card .prov { font-weight: 600; }
-  .card .acct { color: var(--muted); font-size: 0.8rem; filter: blur(5px); transition: filter 0.15s; cursor: pointer; user-select: none; }
-  .card .acct.revealed { filter: none; }
+  .acct { color: var(--muted); font-size: 0.8rem; filter: blur(5px); transition: filter 0.15s; cursor: pointer; user-select: none; }
+  .acct.revealed { filter: none; }
   .card .stale { margin-left: auto; }
   .barrow { margin-bottom: 0.7rem; }
   .barrow:last-child { margin-bottom: 0; }
@@ -187,7 +187,8 @@
       <select id="harness">
         <option value="">any harness</option>
         <option value="Codex">Codex</option>
-        <option value="ClaudeCode">ClaudeCode</option>
+        <option value="ClaudeCode">Claude</option>
+        <option value="Cursor">Cursor</option>
       </select>
       <label class="chk"><input type="checkbox" id="inactive"> include inactive sessions</label>
     </div>
@@ -206,7 +207,7 @@
       <form id="create" class="edit">
         <div class="row2">
           <input name="id" placeholder="session id" required>
-          <select name="harness"><option>Codex</option><option>ClaudeCode</option></select>
+          <select name="harness"><option>Codex</option><option>ClaudeCode</option><option>Cursor</option></select>
         </div>
         <input name="cwd" placeholder="cwd" required>
         <input name="model" placeholder="model (optional)">
@@ -330,8 +331,13 @@ function escapeHtml(v) {
   return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+document.addEventListener('click', event => {
+  const account = event.target.closest('.acct');
+  if (account) account.classList.toggle('revealed');
+});
+
 function providerLabel(p) {
-  if (typeof p === 'string') return p;
+  if (typeof p === 'string') return ({ ClaudeCode: 'Claude', Codex: 'Codex', Cursor: 'Cursor' })[p] || p;
   if (p && p.Other) return p.Other;
   return escapeHtml(p);
 }
@@ -397,7 +403,8 @@ function renderUsage(status) {
     const bars = sortWindows(u.windows).map(w => {
       const pct = Math.min(100, Math.max(0, w.pct));
       const sev = severityClass(pct);
-      const burn = w.burn_rate_pct_per_hour != null ? (w.burn_rate_pct_per_hour / 2) : null; // per-hour -> per-30m
+      const burnWindowMinutes = u.provider === 'Cursor' ? 1440 : 30;
+      const burn = w.burn_rate_pct_per_hour != null ? (w.burn_rate_pct_per_hour * burnWindowMinutes / 60) : null;
       const burnPos = burn != null ? Math.min(100, pct + burn) : null;
       const burnPct = burn != null ? (burn >= 0 ? '+' : '') + burn.toFixed(1) + '%' : '-';
       const sessions = `${w.active_sessions} session${w.active_sessions === 1 ? '' : 's'}`;
@@ -406,11 +413,11 @@ function renderUsage(status) {
           <div class="title">${escapeHtml(windowLabel(w.window))}${w.exceeded ? ' · exceeded' : ''}</div>
           <div class="label">
             <span class="pct-val">${pct.toFixed(1)}%</span>
-            <span class="burn-val"><span class="burnlabel">burn/30m</span> ${sessions} @ <b>${burnPct}</b></span>
+            <span class="burn-val"><span class="burnlabel">burn/${burnWindowMinutes === 1440 ? '24h' : '30m'}</span> ${sessions} @ <b>${burnPct}</b></span>
           </div>
           <div class="bar">
             <div class="fill ${sev}" style="width:${pct}%"></div>
-            ${burnPos != null ? `<div class="burnmark" style="left:${burnPos}%" title="projected in 30m"></div>` : ''}
+            ${burnPos != null ? `<div class="burnmark" style="left:${burnPos}%" title="projected in ${burnWindowMinutes === 1440 ? '24h' : '30m'}"></div>` : ''}
           </div>
           <div class="meta">
             <span>resets in <b>${countdown(w.resets_at)}</b></span>
@@ -428,7 +435,6 @@ function renderUsage(status) {
         ${bars}
       </div>`;
   }).join('');
-  $$('.card .acct', box).forEach(el => el.addEventListener('click', () => el.classList.toggle('revealed')));
 }
 
 async function loadStatus() {
@@ -499,9 +505,9 @@ async function loadSessions() {
     rows.innerHTML = items.map(s => `
       <tr data-id="${escapeHtml(s.id)}" class="${s.id === selectedId ? 'selected' : ''}">
         <td data-label="id">${escapeHtml(s.id)}</td>
-        <td data-label="harness">${escapeHtml(s.harness)}</td>
+        <td data-label="harness">${escapeHtml(providerLabel(s.harness))}</td>
         <td data-label="model">${escapeHtml(s.model || '-')}</td>
-        <td data-label="account" class="muted">${escapeHtml(s.account || '-')}</td>
+        <td data-label="account" class="muted acct">${escapeHtml(s.account || '-')}</td>
         <td data-label="last seen">${fmtDate(s.last_seen)}</td>
         <td data-label="status">${pillFor(s)}${s.keepalive ? ' <span class="pill keepalive">keepalive</span>' : ''}</td>
       </tr>`).join('');
@@ -533,9 +539,9 @@ async function selectSession(id) {
     ${d.errors.length ? `<div class="errorbox"><h3>Errors</h3><ul>${d.errors.map(error => `<li>${escapeHtml(error)}</li>`).join('')}</ul></div>` : ''}
     <div class="kv">
       <div class="k">id</div><div class="v">${escapeHtml(s.id)}</div>
-      <div class="k">harness</div><div class="v">${escapeHtml(s.harness)}</div>
+      <div class="k">harness</div><div class="v">${escapeHtml(providerLabel(s.harness))}</div>
       <div class="k">model</div><div class="v">${escapeHtml(s.model)}</div>
-      <div class="k">account</div><div class="v">${escapeHtml(s.account)}</div>
+      <div class="k">account</div><div class="v acct">${escapeHtml(s.account)}</div>
       <div class="k">cwd</div><div class="v">${escapeHtml(s.cwd)}</div>
       <div class="k">state path</div><div class="v">${escapeHtml(s.state_path)}</div>
       <div class="k">first seen</div><div class="v">${fmtDate(s.first_seen)}</div>

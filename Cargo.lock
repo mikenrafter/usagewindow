@@ -1713,6 +1713,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "thiserror",

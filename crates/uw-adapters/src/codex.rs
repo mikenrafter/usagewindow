@@ -213,7 +213,7 @@ impl CodexAdapter {
             seed_modes: vec![SeedMode::InitialPrompt, SeedMode::ForkWithHistory],
         }
     }
-    async fn limits(&self) -> AdapterResult<Value> {
+    async fn limits(&self) -> AdapterResult<(Value, Value)> {
         self.transport.call("initialize",json!({"clientInfo":{"name":"usagewindow","title":"usagewindow","version":"0.1.0"}})).await?;
         let account = self
             .transport
@@ -226,10 +226,11 @@ impl CodexAdapter {
             .transport
             .call("account/rateLimits/read", json!({}))
             .await?;
-        response
+        let result = response
             .pointer("/result")
             .cloned()
-            .ok_or_else(|| AdapterError::Other("missing rateLimits".into()))
+            .ok_or_else(|| AdapterError::Other("missing rateLimits".into()))?;
+        Ok((account, result))
     }
     fn rate_limits(result: &Value) -> AdapterResult<&Value> {
         result
@@ -247,7 +248,8 @@ impl HarnessAdapter for CodexAdapter {
         Self::capabilities_static()
     }
     async fn fetch_usage(&self, _: Option<&AccountId>) -> AdapterResult<UsageSample> {
-        let result = self.limits().await?;
+        let (account_response, result) = self.limits().await?;
+        let account = account_from_response(&account_response);
         let limits = Self::rate_limits(&result)?;
         let limited = limits
             .get("rateLimitReachedType")
@@ -288,13 +290,13 @@ impl HarnessAdapter for CodexAdapter {
             fetched_at: Some(at),
             source: UsageSource::ProviderReported,
             provider: Provider::Codex,
-            account: None,
+            account,
             windows,
             credits: None,
         })
     }
     async fn detect_stop(&self, _: &SessionId) -> AdapterResult<Option<StopReason>> {
-        let result = self.limits().await?;
+        let (_, result) = self.limits().await?;
         let limits = Self::rate_limits(&result)?;
         if limits
             .get("rateLimitReachedType")
@@ -523,6 +525,14 @@ impl HarnessAdapter for CodexAdapter {
         .map_err(|e| AdapterError::Other(e.to_string()))?
         .ok_or(AdapterError::Unsupported)
     }
+}
+
+fn account_from_response(value: &Value) -> Option<AccountId> {
+    ["email", "id", "accountId"]
+        .into_iter()
+        .filter_map(|field| value.pointer(&format!("/result/{field}"))?.as_str())
+        .find(|value| !value.is_empty())
+        .map(|value| AccountId(value.to_owned()))
 }
 
 /// Every `*.jsonl` file under `root`, recursively (rollout files live under
@@ -917,7 +927,7 @@ done
             _params: serde_json::Value,
         ) -> AdapterResult<serde_json::Value> {
             Ok(match method {
-                "account/read" => json!({"result":{"id":"acct"}}),
+                "account/read" => json!({"result":{"id":"acct","email":"codex@example.com"}}),
                 "account/rateLimits/read" => {
                     json!({"result":{"ordinaryUsageAllowed":true,"rateLimits":{"primary":{"usedPercent":1,"windowDurationMins":10080,"resetsAt":1800000000},"secondary":{"usedPercent":2,"windowDurationMins":300,"resetsAt":1800000100}}}})
                 }
@@ -931,6 +941,7 @@ done
             .fetch_usage(None)
             .await
             .unwrap();
+        assert_eq!(sample.account, Some(AccountId("codex@example.com".into())));
         assert_eq!(
             sample.windows[&WindowKey {
                 provider: Provider::Codex,

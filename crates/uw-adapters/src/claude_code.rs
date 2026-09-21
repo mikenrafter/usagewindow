@@ -264,6 +264,7 @@ impl ClaudeCodeAdapter {
     async fn fetch_live(&self) -> AdapterResult<UsageSample> {
         let value: Value = serde_json::from_str(&self.credentials.read().await?)
             .map_err(|e| AdapterError::Other(e.to_string()))?;
+        let account = account_from_credentials(&value);
         let token = value
             .pointer("/claudeAiOauth/accessToken")
             .and_then(Value::as_str)
@@ -313,12 +314,25 @@ impl ClaudeCodeAdapter {
             fetched_at: Some(at),
             source: UsageSource::ProviderReported,
             provider: Provider::ClaudeCode,
-            account: None,
+            account,
             windows,
             credits: None,
         })
     }
 }
+fn account_from_credentials(value: &Value) -> Option<AccountId> {
+    [
+        "/claudeAiOauth/email",
+        "/claudeAiOauth/accountEmail",
+        "/claudeAiOauth/accountUuid",
+        "/claudeAiOauth/organizationUuid",
+    ]
+    .into_iter()
+    .filter_map(|path| value.pointer(path).and_then(Value::as_str))
+    .find(|value| !value.is_empty())
+    .map(|value| AccountId(value.to_owned()))
+}
+
 #[derive(Deserialize)]
 struct UsageResponse {
     five_hour: ApiWindow,
@@ -825,7 +839,7 @@ mod tests {
     #[async_trait::async_trait]
     impl CredentialsReader for Credentials {
         async fn read(&self) -> AdapterResult<String> {
-            Ok(r#"{"claudeAiOauth":{"accessToken":"secret"}}"#.into())
+            Ok(r#"{"claudeAiOauth":{"accessToken":"secret","email":"claude@example.com"}}"#.into())
         }
     }
 
@@ -890,6 +904,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.windows.len(), 2);
+        assert_eq!(result.account, Some(AccountId("claude@example.com".into())));
         assert_eq!(
             result.windows[&WindowKey {
                 provider: Provider::ClaudeCode,

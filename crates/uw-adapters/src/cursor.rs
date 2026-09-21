@@ -76,6 +76,7 @@ impl CursorUsageTransport for CursorHttpTransport {
 pub struct CursorAdapter {
     transport: Arc<dyn CursorUsageTransport>,
     now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+    account: Option<AccountId>,
 }
 
 impl CursorAdapter {
@@ -83,11 +84,17 @@ impl CursorAdapter {
         Self {
             transport,
             now: Arc::new(Utc::now),
+            account: None,
         }
     }
 
     pub fn real(auth: CursorAuth) -> Self {
-        Self::new(Arc::new(CursorHttpTransport::new(auth)))
+        Self::new(Arc::new(CursorHttpTransport::new(auth))).with_account(read_cached_email())
+    }
+
+    pub fn with_account(mut self, account: Option<AccountId>) -> Self {
+        self.account = account;
+        self
     }
 
     pub fn with_clock(mut self, now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>) -> Self {
@@ -114,6 +121,7 @@ impl CursorAdapter {
         let reset = value.get("billingCycleEnd").and_then(parse_epoch_millis);
         let auto = percentage(plan_usage, "autoPercentUsed")?;
         let api = percentage(plan_usage, "apiPercentUsed")?;
+        let account = account_from_usage(value).or_else(|| self.account.clone());
         let mut windows = HashMap::new();
         for (name, pct) in [("auto", auto), ("api", api)] {
             windows.insert(
@@ -130,11 +138,53 @@ impl CursorAdapter {
             fetched_at: Some(at),
             source: UsageSource::ProviderReported,
             provider: Provider::Cursor,
-            account: None,
+            account,
             windows,
             credits: None,
         })
     }
+}
+
+fn account_from_usage(value: &Value) -> Option<AccountId> {
+    ["email", "accountEmail", "userEmail"]
+        .into_iter()
+        .chain(["/user/email", "/account/email"])
+        .filter_map(|path| {
+            if path.starts_with('/') {
+                value.pointer(path).and_then(Value::as_str)
+            } else {
+                value.get(path).and_then(Value::as_str)
+            }
+        })
+        .find(|value| !value.is_empty())
+        .map(|value| AccountId(value.to_owned()))
+}
+
+/// Cursor IDE keeps the signed-in email beside its access token in the local
+/// VS Code-compatible state database. It is read-only and optional: API-only
+/// credentials may not have this file, and the usage response can still carry
+/// an email in that case.
+fn read_cached_email() -> Option<AccountId> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+    let configured = std::env::var_os("CURSOR_STATE_DB").map(std::path::PathBuf::from);
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    let path = configured.unwrap_or_else(|| xdg.join("Cursor/User/globalStorage/state.vscdb"));
+    let connection = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .ok()?;
+    connection
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = 'cursorAuth/cachedEmail'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .filter(|email| !email.is_empty())
+        .map(AccountId)
 }
 
 fn percentage(value: &Value, field: &str) -> AdapterResult<f32> {
@@ -216,6 +266,7 @@ mod tests {
     async fn parses_cursor_two_bar_monthly_usage() {
         let adapter = CursorAdapter::new(Arc::new(FakeTransport(json!({
             "billingCycleEnd": "1771077734000",
+            "email": "cursor@example.com",
             "planUsage": {
                 "autoPercentUsed": 12.5,
                 "apiPercentUsed": 87.25
@@ -224,6 +275,7 @@ mod tests {
         let sample = adapter.fetch_usage(None).await.unwrap();
         let reset = Utc.timestamp_millis_opt(1771077734000).single();
         assert_eq!(sample.provider, Provider::Cursor);
+        assert_eq!(sample.account, Some(AccountId("cursor@example.com".into())));
         assert_eq!(sample.windows.len(), 2);
         assert_eq!(
             sample.windows[&WindowKey {
