@@ -1835,9 +1835,11 @@ pub async fn run_production_ticks(
             if let Some(tiers) = &idle_compact_tiers {
                 profile.idle_compact.tiers = tiers.clone();
             }
-            if matches!(session.harness, Provider::ClaudeCode) {
-                // Codex cache TTL is unresearched — architecture forbids a
-                // guessed default that would enable opportunistic idle-compact.
+            if matches!(session.harness, Provider::ClaudeCode | Provider::Codex) {
+                // Five minutes is the shared warm-cache approximation for both
+                // harnesses until usagewindow can emit explicit cache-control
+                // markers. Codex has no documented user-facing TTL; this is the
+                // same heuristic, not a researched provider value.
                 profile.cache_ttl_by_provider.insert(
                     session.harness.clone(),
                     Duration::minutes(CACHE_WARM_APPROXIMATION_MINUTES),
