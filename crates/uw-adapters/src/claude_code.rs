@@ -24,17 +24,84 @@ pub struct ClaudeTranscriptFileSystem;
 /// by the provider's own reported usage, rather than some unrelated error.
 const NEAR_LIMIT_STOP_PCT: f32 = 95.0;
 
+/// Phrases that mark a Claude Code transcript record as a real quota ceiling
+/// (verified 2026-09-21 against session `9675ac22-…` and local
+/// `isApiErrorMessage` samples). Auth / model-selection errors also set
+/// `isApiErrorMessage` and must not match.
+fn quota_limit_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("spend limit")
+        || lower.contains("usage limit")
+        || lower.contains("session limit")
+        || lower.contains("rate limit")
+        || lower.contains("cc_cli_limit_message")
+}
+
+fn assistant_text(message: &Value) -> Option<String> {
+    let content = message.get("content")?;
+    if let Some(text) = content.as_str() {
+        return Some(text.to_owned());
+    }
+    let parts = content.as_array()?;
+    let mut out = String::new();
+    for part in parts {
+        if let Some(text) = part.get("text").and_then(Value::as_str) {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(text);
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Verified Claude Code quota markers (see docs/research-claude-code.md):
+/// - `assistant` + `isApiErrorMessage` with quota-shaped text
+/// - `system` / `local_command` whose content carries `<local-command-stderr>`
+///   spend/usage/session limit text (e.g. failed `/compact`)
+/// - legacy `type:"error"` / `error.type:"rate_limit_error"` if a future
+///   Claude release emits it
 fn transcript_has_quota_error(content: &str) -> bool {
     content.lines().any(|line| {
         let Ok(record) = serde_json::from_str::<Value>(line) else {
             return false;
         };
-        record.get("type").and_then(Value::as_str) == Some("error")
-            && record
-                .get("error")
-                .and_then(|error| error.get("type"))
-                .and_then(Value::as_str)
-                == Some("rate_limit_error")
+        match record.get("type").and_then(Value::as_str) {
+            Some("error") => {
+                record
+                    .get("error")
+                    .and_then(|error| error.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("rate_limit_error")
+                    || record
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(Value::as_str)
+                        .is_some_and(quota_limit_text)
+            }
+            Some("assistant")
+                if record
+                    .get("isApiErrorMessage")
+                    .and_then(Value::as_bool)
+                    == Some(true) =>
+            {
+                record
+                    .get("message")
+                    .and_then(assistant_text)
+                    .is_some_and(|text| quota_limit_text(&text))
+            }
+            Some("system")
+                if record.get("subtype").and_then(Value::as_str) == Some("local_command") =>
+            {
+                record
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| {
+                        content.contains("local-command-stderr") && quota_limit_text(content)
+                    })
+            }
+            _ => false,
+        }
     })
 }
 
@@ -1318,6 +1385,102 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[tokio::test]
+    async fn stop_detection_accepts_verified_local_command_spend_limit_stderr() {
+        // Captured from real session 9675ac22-f2d9-490c-80c5-76f6517bfcf4
+        // (Claude Code 2.1.267) after /compact failed at the monthly spend ceiling.
+        let id = "9675ac22-f2d9-490c-80c5-76f6517bfcf4";
+        let adapter = adapter(
+            200,
+            Arc::new(Cache {
+                entry: Mutex::new(None),
+            }),
+            Arc::new(Mutex::new(0)),
+        )
+        .with_transcript_fs(Arc::new(TranscriptFixture {
+            path: format!("/tmp/{id}.jsonl"),
+            content: format!(
+                r#"{{"type":"system","subtype":"local_command","sessionId":"{id}","content":"<local-command-stderr>Error during compaction: You've hit your monthly spend limit · raise it at claude.ai/settings/usage?from=cc_cli_limit_message · your session limit resets 10:40pm (America/Denver)</local-command-stderr>"}}"#
+            ),
+        }));
+        assert_eq!(
+            adapter
+                .detect_stop_with_usage(&SessionId(id.into()), Some(&near_limit_sample(Utc::now())))
+                .await
+                .unwrap(),
+            Some(StopReason::UsageLimit {
+                window: WindowKey {
+                    provider: Provider::ClaudeCode,
+                    kind: WindowKind::Rolling { minutes: 300 },
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_detection_accepts_verified_is_api_error_message_spend_limit() {
+        let id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b40";
+        let adapter = adapter(
+            200,
+            Arc::new(Cache {
+                entry: Mutex::new(None),
+            }),
+            Arc::new(Mutex::new(0)),
+        )
+        .with_transcript_fs(Arc::new(TranscriptFixture {
+            path: format!("/tmp/{id}.jsonl"),
+            content: format!(
+                r#"{{"type":"assistant","sessionId":"{id}","isApiErrorMessage":true,"message":{{"role":"assistant","content":[{{"type":"text","text":"You've hit your monthly spend limit. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue."}}]}}}}"#
+            ),
+        }));
+        assert!(adapter
+            .detect_stop_with_usage(&SessionId(id.into()), Some(&near_limit_sample(Utc::now())))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn stop_detection_ignores_is_api_error_message_auth_failures() {
+        let id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b40";
+        let adapter = adapter(
+            200,
+            Arc::new(Cache {
+                entry: Mutex::new(None),
+            }),
+            Arc::new(Mutex::new(0)),
+        )
+        .with_transcript_fs(Arc::new(TranscriptFixture {
+            path: format!("/tmp/{id}.jsonl"),
+            content: format!(
+                r#"{{"type":"assistant","sessionId":"{id}","isApiErrorMessage":true,"message":{{"role":"assistant","content":[{{"type":"text","text":"Login expired · Please run /login"}}]}}}}"#
+            ),
+        }));
+        assert_eq!(
+            adapter
+                .detect_stop_with_usage(&SessionId(id.into()), Some(&near_limit_sample(Utc::now())))
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn transcript_quota_detector_matches_verified_shapes_only() {
+        assert!(transcript_has_quota_error(
+            r#"{"type":"system","subtype":"local_command","content":"<local-command-stderr>Error during compaction: You've hit your monthly spend limit · cc_cli_limit_message</local-command-stderr>"}"#
+        ));
+        assert!(transcript_has_quota_error(
+            r#"{"type":"assistant","isApiErrorMessage":true,"message":{"content":[{"type":"text","text":"You've hit your monthly spend limit"}]}}"#
+        ));
+        assert!(!transcript_has_quota_error(
+            r#"{"type":"assistant","isApiErrorMessage":true,"message":{"content":[{"type":"text","text":"Failed to authenticate: OAuth session expired"}]}}"#
+        ));
+        assert!(!transcript_has_quota_error(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"You've hit your monthly spend limit"}]}}"#
+        ));
     }
 
     #[tokio::test]

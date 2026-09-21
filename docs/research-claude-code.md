@@ -177,14 +177,37 @@ requires the documented transcript path and rejects a mismatch, and destructive
 operations refuse a superseded owner. Hook payload consistency is not authentication;
 the hook endpoint remains a loopback-only local trust boundary.
 
+## Stop detection: verified quota-error shapes (verified 2026-09-21)
+
+Session `9675ac22-f2d9-490c-80c5-76f6517bfcf4` (Claude Code 2.1.267, native
+`claude --resume`, not T3Code) hit a real monthly spend / session limit while
+usagewindow was trying `/compact`. The transcript did **not** contain a
+top-level `type:"error"` / `error.type:"rate_limit_error"` record — that shape
+was previously assumed and has zero hits across local `~/.claude/projects`
+transcripts on this machine. The verified markers are:
+
+1. `system` / `subtype:"local_command"` whose `content` includes
+   `<local-command-stderr>Error during compaction: You've hit your monthly
+   spend limit · raise it at claude.ai/settings/usage?from=cc_cli_limit_message
+   · your session limit resets …</local-command-stderr>`
+2. `assistant` records with `"isApiErrorMessage":true` whose text content is
+   quota-shaped (contains `spend limit` / `usage limit` / `session limit` /
+   `rate limit` / `cc_cli_limit_message`). Local samples include both the
+   "Switch to another model…" and "raise it at claude.ai/settings/usage…"
+   phrasings. Auth failures (`Login expired`, `OAuth session expired`) also
+   set `isApiErrorMessage` and must **not** count as UsageLimit evidence.
+
+`ClaudeCodeAdapter::detect_stop_with_usage` therefore requires one of these
+per-session transcript markers (still corroborated by near-limit usage ≥
+`NEAR_LIMIT_STOP_PCT`), and keeps accepting a legacy `rate_limit_error`
+record if a future Claude release emits one.
+
 ## Remaining local verification gaps
 
-- Usage-limit stop detection also remains unverified because no local Claude Code
-  session was at a usage limit during this implementation pass. The concrete next test
-  is to capture the final transcript record and hook sequence from a session that
-  reaches a real provider limit, then correlate it with an OAuth usage response near
-  100%. Until that fixture exists, `ClaudeCodeAdapter::detect_stop` returns no reason and
-  automatic resume does not guess.
+- Correlating the verified spend-limit transcript markers above with a
+  simultaneous OAuth usage sample near 100% for the same account/window is
+  still useful (this capture proved the transcript shape; the usage
+  corroboration threshold is already unit-tested).
 - The documented Stop-hook advice channel only delivers while Claude Code is processing
   that hook. A daemon tick that queues a keepalive after the Stop hook has returned
   cannot make the current turn continue. Verifying a safe idle-time delivery primitive
