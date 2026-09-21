@@ -25,7 +25,7 @@
           mkUsagewindow = { profile ? "release" }:
           pkgs.rustPlatform.buildRustPackage {
             pname = "usagewindow";
-            version = "0.1.0";
+            version = "0.1.1";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
             nativeBuildInputs = [ pkgs.pkg-config ];
@@ -65,7 +65,7 @@
           };
           dynamicBins = pkgs.buildDynamicCrate {
             pname = "usagewindow";
-            version = "0.1.0";
+            version = "0.1.1";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
             nativeBuildInputs = [ pkgs.pkg-config ];

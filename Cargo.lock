@@ -1707,7 +1707,7 @@ dependencies = [
 
 [[package]]
 name = "uw-adapters"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1725,7 +1725,7 @@ dependencies = [
 
 [[package]]
 name = "uw-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1742,7 +1742,7 @@ dependencies = [
 
 [[package]]
 name = "uw-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1754,7 +1754,7 @@ dependencies = [
 
 [[package]]
 name = "uw-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1775,7 +1775,7 @@ dependencies = [
 
 [[package]]
 name = "uw-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1793,7 +1793,7 @@ dependencies = [
 
 [[package]]
 name = "uw-policy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "uw-core",
@@ -1801,7 +1801,7 @@ dependencies = [
 
 [[package]]
 name = "uw-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -1815,7 +1815,7 @@ dependencies = [
 
 [[package]]
 name = "uw-web"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "argon2",

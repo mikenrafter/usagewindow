@@ -1126,10 +1126,14 @@ async fn static_asset() -> Response<Body> {
             .body(Body::empty())
             .unwrap();
     };
+    let html = String::from_utf8_lossy(&asset.data).replace(
+        "__UW_VERSION__",
+        env!("CARGO_PKG_VERSION"),
+    );
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .body(Body::from(asset.data.into_owned()))
+        .body(Body::from(html))
         .unwrap()
 }
 
@@ -1421,7 +1425,12 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("usagewindow"));
+        let html = String::from_utf8_lossy(&body);
+        assert!(
+            html.contains(&format!("Usagewindow v{}", env!("CARGO_PKG_VERSION"))),
+            "expected versioned title in html"
+        );
+        assert!(!html.contains("__UW_VERSION__"));
     }
 
     #[tokio::test]
@@ -1753,10 +1762,7 @@ mod tests {
             String::from_utf8_lossy(&response_body)
         );
         let compact_status: CompactStatusResponse = serde_json::from_slice(&response_body).unwrap();
-        assert_eq!(
-            compact_status.requests.last().unwrap().prompt,
-            "/compact test"
-        );
+        assert_eq!(compact_status.requests.last().unwrap().prompt, "test");
         let threshold = ThresholdSetRequest {
             scope: ThresholdScope {
                 provider: Provider::Codex,
