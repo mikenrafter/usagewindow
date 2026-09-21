@@ -1260,6 +1260,58 @@ mod tests {
                 if detail == "app-server rejected thread/compact/start"
         ));
     }
+
+    #[test]
+    fn hard_boundary_failure_and_voided_resume_survive_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "usagewindow-hard-boundary-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let path_string = path.to_string_lossy().into_owned();
+        let sid = SessionId("blocked-session".into());
+        let compaction_id = uuid::Uuid::new_v4();
+        let marker_id = uuid::Uuid::new_v4();
+        {
+            let store = Store::open(&path_string).unwrap();
+            store.insert_session(&session(&sid)).unwrap();
+            store
+                .insert_compaction_request(&CompactionRequest {
+                    id: compaction_id,
+                    session_id: sid.clone(),
+                    kind: CompactionKind::AgentRequested,
+                    prompt: "compact".into(),
+                    reason: "hard quota boundary".into(),
+                    status: CompactionStatus::Failed("provider rejected compaction".into()),
+                    created_at: Utc::now(),
+                })
+                .unwrap();
+            store
+                .insert_resume_marker(&ResumeMarker {
+                    id: marker_id,
+                    session_id: sid.clone(),
+                    reason: ResumeReason::AutoDetectedLimit,
+                    resume_at: Some(Utc::now()),
+                    requested_at: None,
+                    created_at: Utc::now(),
+                    status: ResumeStatus::Scheduled,
+                    message: None,
+                })
+                .unwrap();
+            store.cancel_resume_markers(&sid).unwrap();
+        }
+
+        let reopened = Store::open(&path_string).unwrap();
+        assert!(matches!(
+            &reopened.compaction_requests_for_session(&sid).unwrap()[0].status,
+            CompactionStatus::Failed(reason) if reason == "provider rejected compaction"
+        ));
+        let markers = reopened.resume_markers_for_session(&sid).unwrap();
+        assert_eq!(markers[0].id, marker_id);
+        assert_eq!(markers[0].status, ResumeStatus::Cancelled);
+        assert!(reopened.due_resume_markers(Utc::now()).unwrap().is_empty());
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
     #[test]
     fn threshold_key_is_unique() {
         let s = Store::open_memory().unwrap();

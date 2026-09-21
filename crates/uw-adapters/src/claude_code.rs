@@ -1158,6 +1158,115 @@ mod tests {
         ));
         assert!(record.lock().unwrap().is_none());
     }
+
+    fn near_limit_sample(at: DateTime<Utc>) -> UsageSample {
+        UsageSample {
+            at,
+            fetched_at: Some(at),
+            source: UsageSource::ProviderReported,
+            provider: Provider::ClaudeCode,
+            account: None,
+            windows: HashMap::from([(
+                WindowKey {
+                    provider: Provider::ClaudeCode,
+                    kind: WindowKind::Rolling { minutes: 300 },
+                },
+                UsageWindowState::new(99.8, false, true, None, None),
+            )]),
+            credits: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_detection_requires_quota_error_evidence_and_matching_near_limit_usage() {
+        let id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b40";
+        let adapter = adapter(
+            200,
+            Arc::new(Cache {
+                entry: Mutex::new(None),
+            }),
+            Arc::new(Mutex::new(0)),
+        )
+        .with_transcript_fs(Arc::new(TranscriptFixture {
+            path: format!("/tmp/{id}.jsonl"),
+            content: format!(
+                r#"{{"timestamp":"2026-09-17T23:32:32Z","sessionId":"{id}","type":"error","error":{{"type":"rate_limit_error","message":"usage limit reached"}}}}"#
+            ),
+        }));
+        let sample = near_limit_sample(Utc::now());
+
+        assert_eq!(
+            adapter
+                .detect_stop_with_usage(&SessionId(id.into()), Some(&sample))
+                .await
+                .unwrap(),
+            Some(StopReason::UsageLimit {
+                window: WindowKey {
+                    provider: Provider::ClaudeCode,
+                    kind: WindowKind::Rolling { minutes: 300 },
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn near_limit_usage_without_quota_error_evidence_does_not_invent_a_stop() {
+        let id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b40";
+        let adapter = adapter(
+            200,
+            Arc::new(Cache {
+                entry: Mutex::new(None),
+            }),
+            Arc::new(Mutex::new(0)),
+        )
+        .with_transcript_fs(Arc::new(TranscriptFixture {
+            path: format!("/tmp/{id}.jsonl"),
+            content: format!(
+                r#"{{"timestamp":"2026-09-17T23:32:32Z","sessionId":"{id}","type":"assistant","message":{{"content":"done"}}}}"#
+            ),
+        }));
+        let sample = near_limit_sample(Utc::now());
+
+        assert_eq!(
+            adapter
+                .detect_stop_with_usage(&SessionId(id.into()), Some(&sample))
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_error_without_near_limit_usage_does_not_invent_a_stop() {
+        let id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b40";
+        let adapter = adapter(
+            200,
+            Arc::new(Cache {
+                entry: Mutex::new(None),
+            }),
+            Arc::new(Mutex::new(0)),
+        )
+        .with_transcript_fs(Arc::new(TranscriptFixture {
+            path: format!("/tmp/{id}.jsonl"),
+            content: format!(
+                r#"{{"timestamp":"2026-09-17T23:32:32Z","sessionId":"{id}","type":"error","error":{{"type":"rate_limit_error","message":"usage limit reached"}}}}"#
+            ),
+        }));
+        let mut sample = near_limit_sample(Utc::now());
+        sample
+            .windows
+            .values_mut()
+            .for_each(|window| window.pct = 42.0);
+
+        assert_eq!(
+            adapter
+                .detect_stop_with_usage(&SessionId(id.into()), Some(&sample))
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
     struct NoHook;
     #[async_trait::async_trait]
     impl HookChannel for NoHook {

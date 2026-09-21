@@ -967,6 +967,37 @@ done
             Some(StopReason::UsageLimit { .. })
         ));
     }
+
+    #[tokio::test]
+    async fn stop_detection_does_not_invent_a_window_duration() {
+        struct LimitWithoutWindow;
+        #[async_trait::async_trait]
+        impl AppServerTransport for LimitWithoutWindow {
+            async fn call(
+                &self,
+                method: &str,
+                _: serde_json::Value,
+            ) -> AdapterResult<serde_json::Value> {
+                if method == "account/rateLimits/read" {
+                    Ok(json!({
+                        "result": {
+                            "ordinaryUsageAllowed": false,
+                            "rateLimits": {"rateLimitReachedType": "primary"}
+                        }
+                    }))
+                } else {
+                    Ok(json!({"result": {}}))
+                }
+            }
+        }
+
+        let adapter = CodexAdapter::new(Arc::new(LimitWithoutWindow));
+        assert!(adapter
+            .detect_stop(&SessionId("s".into()))
+            .await
+            .is_err());
+    }
+
     struct RpcWithLimit;
     #[async_trait::async_trait]
     impl AppServerTransport for RpcWithLimit {

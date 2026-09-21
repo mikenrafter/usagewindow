@@ -120,4 +120,14 @@ mod tests {
             Err(AdapterError::Unsupported)
         ));
     }
+
+    #[tokio::test]
+    async fn missing_stop_signal_is_reported_as_unsupported() {
+        assert!(matches!(
+            GenericHookAdapter::new(None)
+                .detect_stop(&SessionId("generic-session".into()))
+                .await,
+            Err(AdapterError::Unsupported)
+        ));
+    }
 }

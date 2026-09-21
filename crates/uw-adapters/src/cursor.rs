@@ -396,6 +396,15 @@ mod tests {
         assert!(!CursorAdapter::capabilities_static().reports_token_counts);
     }
 
+    #[tokio::test]
+    async fn unsupported_stop_detection_is_explicit() {
+        let adapter = CursorAdapter::new(Arc::new(FakeTransport(json!({}))));
+        assert!(matches!(
+            adapter.detect_stop(&SessionId("cursor-session".into())).await,
+            Err(AdapterError::Unsupported)
+        ));
+    }
+
     #[test]
     fn discovers_access_token_from_cursor_ide_state_database() {
         let path =

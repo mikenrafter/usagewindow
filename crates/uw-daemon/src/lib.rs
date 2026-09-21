@@ -3434,4 +3434,510 @@ mod tests {
             "[[uw-keepalive]] no action needed, acknowledge briefly"
         );
     }
+
+    struct BoundaryStore {
+        session: SessionSummary,
+        samples: Vec<UsageSample>,
+        keepalive: KeepaliveState,
+        enqueued: StdMutex<Vec<CompactionRequest>>,
+        resume_markers: StdMutex<Vec<ResumeMarker>>,
+        recorded_pings: StdMutex<u32>,
+    }
+
+    #[async_trait]
+    impl DaemonStore for BoundaryStore {
+        async fn pending_compactions(&self) -> anyhow::Result<Vec<CompactionRequest>> {
+            Ok(vec![])
+        }
+        async fn compaction_owner(&self, _: &SessionId) -> anyhow::Result<SessionSummary> {
+            Ok(self.session.clone())
+        }
+        async fn claim_compaction(&self, _: uuid::Uuid) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn update_compaction(
+            &self,
+            _: uuid::Uuid,
+            _: CompactionStatus,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn enqueue_compaction(&self, request: CompactionRequest) -> anyhow::Result<()> {
+            self.enqueued.lock().unwrap().push(request);
+            Ok(())
+        }
+        async fn usage_samples(&self, _: &SessionSummary) -> anyhow::Result<Vec<UsageSample>> {
+            Ok(self.samples.clone())
+        }
+        async fn token_usage(&self, _: &SessionId) -> anyhow::Result<Vec<TokenUsageRecord>> {
+            Ok(vec![])
+        }
+        async fn active_resume_marker(
+            &self,
+            _: &SessionId,
+        ) -> anyhow::Result<Option<ResumeMarker>> {
+            Ok(self
+                .resume_markers
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|marker| {
+                    matches!(marker.status, ResumeStatus::Pending | ResumeStatus::Scheduled)
+                })
+                .cloned())
+        }
+        async fn insert_resume_marker(&self, marker: ResumeMarker) -> anyhow::Result<()> {
+            self.resume_markers.lock().unwrap().push(marker);
+            Ok(())
+        }
+        async fn set_resume_at(
+            &self,
+            id: uuid::Uuid,
+            resume_at: DateTime<Utc>,
+        ) -> anyhow::Result<()> {
+            if let Some(marker) = self
+                .resume_markers
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .find(|marker| marker.id == id)
+            {
+                marker.resume_at = Some(resume_at);
+                marker.status = ResumeStatus::Scheduled;
+            }
+            Ok(())
+        }
+        async fn due_resume_markers(
+            &self,
+            now: DateTime<Utc>,
+        ) -> anyhow::Result<Vec<ResumeMarker>> {
+            Ok(self
+                .resume_markers
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|marker| marker.resume_at.is_some_and(|at| at <= now))
+                .cloned()
+                .collect())
+        }
+        async fn resume_owner(&self, _: &SessionId) -> anyhow::Result<SessionSummary> {
+            Ok(self.session.clone())
+        }
+        async fn update_resume(
+            &self,
+            id: uuid::Uuid,
+            status: ResumeStatus,
+        ) -> anyhow::Result<()> {
+            if let Some(marker) = self
+                .resume_markers
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .find(|marker| marker.id == id)
+            {
+                marker.status = status;
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl KeepaliveStore for BoundaryStore {
+        async fn keepalive_sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
+            Ok(vec![self.session.clone()])
+        }
+        async fn keepalive_state(&self, _: &SessionId) -> anyhow::Result<KeepaliveState> {
+            Ok(self.keepalive.clone())
+        }
+        async fn record_keepalive_ping(
+            &self,
+            _: &SessionId,
+            _: DateTime<Utc>,
+        ) -> anyhow::Result<()> {
+            *self.recorded_pings.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    struct BoundaryAdapter {
+        advised: StdMutex<Vec<String>>,
+        resume_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl HarnessAdapter for BoundaryAdapter {
+        fn provider(&self) -> Provider {
+            Provider::ClaudeCode
+        }
+        fn capabilities(&self) -> Capabilities {
+            caps(true, true, true)
+        }
+        async fn fetch_usage(&self, _: Option<&AccountId>) -> AdapterResult<UsageSample> {
+            Err(AdapterError::Unsupported)
+        }
+        async fn detect_stop(&self, _: &SessionId) -> AdapterResult<Option<StopReason>> {
+            Err(AdapterError::Unsupported)
+        }
+        async fn emit_status(
+            &self,
+            _: &SessionId,
+            _: StatusEvent,
+        ) -> AdapterResult<DeliveryOutcome> {
+            Ok(DeliveryOutcome::Delivered)
+        }
+        async fn advise(&self, _: &SessionId, text: &str) -> AdapterResult<DeliveryOutcome> {
+            self.advised.lock().unwrap().push(text.into());
+            Ok(DeliveryOutcome::Delivered)
+        }
+        async fn compact(
+            &self,
+            _: &SessionSummary,
+            _: &CompactionRequest,
+        ) -> AdapterResult<DeliveryOutcome> {
+            Ok(DeliveryOutcome::Delivered)
+        }
+        async fn resume_session(
+            &self,
+            _: &SessionSummary,
+            _: Option<&str>,
+        ) -> AdapterResult<()> {
+            self.resume_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn boundary_samples(now: DateTime<Utc>, pct: f32) -> Vec<UsageSample> {
+        let key = WindowKey {
+            provider: Provider::ClaudeCode,
+            kind: WindowKind::Rolling { minutes: 300 },
+        };
+        [now - Duration::minutes(31), now]
+            .into_iter()
+            .map(|at| UsageSample {
+                at,
+                fetched_at: Some(at),
+                source: UsageSource::ProviderReported,
+                provider: Provider::ClaudeCode,
+                account: None,
+                windows: HashMap::from([(
+                    key.clone(),
+                    UsageWindowState::new(
+                        pct,
+                        false,
+                        true,
+                        Some(now + Duration::hours(1)),
+                        None,
+                    ),
+                )]),
+                credits: None,
+            })
+            .collect()
+    }
+
+    fn boundary_profile() -> ThresholdProfile {
+        let mut profile = ThresholdProfile {
+            keepalive: Some(KeepaliveConfig {
+                enabled: true,
+                daily_cap: 10,
+            }),
+            ..ThresholdProfile::default()
+        };
+        profile
+            .cache_ttl_by_provider
+            .insert(Provider::ClaudeCode, Duration::minutes(5));
+        profile
+    }
+
+    fn boundary_store(now: DateTime<Utc>, pct: f32) -> BoundaryStore {
+        let session = SessionSummary {
+            last_seen: now - Duration::minutes(10),
+            ..session()
+        };
+        BoundaryStore {
+            keepalive: KeepaliveState {
+                session_id: session.id.clone(),
+                enabled: false,
+                last_ping_at: None,
+                ping_day: None,
+                ping_count: 0,
+            },
+            session,
+            samples: boundary_samples(now, pct),
+            enqueued: StdMutex::new(vec![]),
+            resume_markers: StdMutex::new(vec![]),
+            recorded_pings: StdMutex::new(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_band_auto_keepalive_suppresses_opportunistic_compaction() {
+        let now = Utc::now();
+        let store = boundary_store(now, 92.0);
+        let adapter = Arc::new(BoundaryAdapter {
+            advised: StdMutex::new(vec![]),
+            resume_calls: AtomicUsize::new(0),
+        });
+        let adapters = HashMap::from([(
+            Provider::ClaudeCode,
+            adapter.clone() as Arc<dyn HarnessAdapter>,
+        )]);
+        let profiles = HashMap::from([(store.session.id.clone(), boundary_profile())]);
+
+        run_policy_tick(
+            &store,
+            &store,
+            &adapters,
+            &AlwaysIdle,
+            std::slice::from_ref(&store.session),
+            &profiles,
+            &mut PolicyRuntimeState::default(),
+            now,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            adapter.advised.lock().unwrap().as_slice(),
+            [KEEPALIVE_MARKER],
+            "the compact band must enable and deliver the marked keepalive"
+        );
+        assert_eq!(*store.recorded_pings.lock().unwrap(), 1);
+        assert!(
+            store.enqueued.lock().unwrap().is_empty(),
+            "automatic keepalive must win over opportunistic idle compaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_threshold_remains_advisory_only() {
+        let now = Utc::now();
+        let mut store = boundary_store(now, 86.0);
+        store.session.last_known_token_count = Some(1_000);
+        store.samples[0]
+            .windows
+            .values_mut()
+            .for_each(|window| window.pct = 70.0);
+        let adapter = Arc::new(BoundaryAdapter {
+            advised: StdMutex::new(vec![]),
+            resume_calls: AtomicUsize::new(0),
+        });
+        let adapters = HashMap::from([(
+            Provider::ClaudeCode,
+            adapter.clone() as Arc<dyn HarnessAdapter>,
+        )]);
+        let profiles = HashMap::from([(store.session.id.clone(), boundary_profile())]);
+
+        run_policy_tick(
+            &store,
+            &store,
+            &adapters,
+            &AlwaysIdle,
+            std::slice::from_ref(&store.session),
+            &profiles,
+            &mut PolicyRuntimeState::default(),
+            now,
+        )
+        .await
+        .unwrap();
+
+        let advised = adapter.advised.lock().unwrap();
+        assert_eq!(advised.len(), 1);
+        assert!(advised[0].starts_with("Usage is at 86.0%"));
+        assert!(!advised[0].contains("[[uw-keepalive]]"));
+        assert!(store.enqueued.lock().unwrap().is_empty());
+        assert_eq!(*store.recorded_pings.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn plan_pressure_boundary_disables_keepalive_and_enqueues_blocking_compaction() {
+        let now = Utc::now();
+        let store = boundary_store(now, 96.0);
+        let adapter = Arc::new(BoundaryAdapter {
+            advised: StdMutex::new(vec![]),
+            resume_calls: AtomicUsize::new(0),
+        });
+        let adapters = HashMap::from([(
+            Provider::ClaudeCode,
+            adapter.clone() as Arc<dyn HarnessAdapter>,
+        )]);
+        let profiles = HashMap::from([(store.session.id.clone(), boundary_profile())]);
+
+        run_policy_tick(
+            &store,
+            &store,
+            &adapters,
+            &AlwaysIdle,
+            std::slice::from_ref(&store.session),
+            &profiles,
+            &mut PolicyRuntimeState::default(),
+            now,
+        )
+        .await
+        .unwrap();
+
+        assert!(adapter.advised.lock().unwrap().is_empty());
+        assert_eq!(*store.recorded_pings.lock().unwrap(), 0);
+        let enqueued = store.enqueued.lock().unwrap();
+        assert_eq!(enqueued.len(), 1);
+        assert!(!matches!(
+            enqueued[0].kind,
+            CompactionKind::OpportunisticIdle
+        ));
+        assert!(enqueued[0].reason.contains("hard quota boundary"));
+    }
+
+    #[tokio::test]
+    async fn failed_hard_boundary_compaction_voids_resume_and_never_fires_after_reset() {
+        let now = Utc::now();
+        let key = WindowKey {
+            provider: Provider::ClaudeCode,
+            kind: WindowKind::Rolling { minutes: 300 },
+        };
+        let mut stopped = SessionSummary {
+            stopped_reason: Some(StopReason::UsageLimit {
+                window: key.clone(),
+            }),
+            ..session()
+        };
+        stopped.last_seen = now - Duration::minutes(10);
+        let store = Store::open_memory().unwrap();
+        store.insert_session(&stopped).unwrap();
+        for sample in boundary_samples(now, 96.0) {
+            store.insert_usage_sample(&sample).unwrap();
+        }
+        store
+            .insert_compaction_request(&CompactionRequest {
+                id: uuid::Uuid::new_v4(),
+                session_id: stopped.id.clone(),
+                kind: CompactionKind::AgentRequested,
+                prompt: "compact before reset".into(),
+                reason: "hard quota boundary".into(),
+                status: CompactionStatus::Failed("delivery failed".into()),
+                created_at: now - Duration::minutes(2),
+            })
+            .unwrap();
+        let provisional = ResumeMarker {
+            id: uuid::Uuid::new_v4(),
+            session_id: stopped.id.clone(),
+            reason: ResumeReason::AutoDetectedLimit,
+            resume_at: Some(now - Duration::seconds(1)),
+            requested_at: None,
+            created_at: now - Duration::minutes(1),
+            status: ResumeStatus::Scheduled,
+            message: None,
+        };
+        store.insert_resume_marker(&provisional).unwrap();
+        let store = SqliteDaemonStore::new(store);
+        let adapter = Arc::new(BoundaryAdapter {
+            advised: StdMutex::new(vec![]),
+            resume_calls: AtomicUsize::new(0),
+        });
+        let adapters = HashMap::from([(
+            Provider::ClaudeCode,
+            adapter.clone() as Arc<dyn HarnessAdapter>,
+        )]);
+        let profiles = HashMap::from([(stopped.id.clone(), boundary_profile())]);
+
+        run_policy_tick(
+            &store,
+            &store,
+            &adapters,
+            &AlwaysIdle,
+            &[stopped],
+            &profiles,
+            &mut PolicyRuntimeState::default(),
+            now,
+        )
+        .await
+        .unwrap();
+        run_compaction_tick(&store, &adapters, &AlwaysIdle)
+            .await
+            .unwrap();
+        run_resume_tick(&store, &adapters, now).await.unwrap();
+
+        assert_eq!(adapter.resume_calls.load(Ordering::SeqCst), 0);
+        let markers = store
+            .inner
+            .lock()
+            .unwrap()
+            .resume_markers_for_session(&SessionId("s".into()))
+            .unwrap();
+        assert!(matches!(markers[0].status, ResumeStatus::Cancelled));
+        let requests = store
+            .inner
+            .lock()
+            .unwrap()
+            .compaction_requests_for_session(&SessionId("s".into()))
+            .unwrap();
+        assert!(matches!(
+            requests[0].status,
+            CompactionStatus::Failed(ref reason) if reason == "delivery failed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn queued_keepalive_is_not_recorded_as_successful_delivery() {
+        struct QueuedAdapter;
+        #[async_trait]
+        impl HarnessAdapter for QueuedAdapter {
+            fn provider(&self) -> Provider {
+                Provider::ClaudeCode
+            }
+            fn capabilities(&self) -> Capabilities {
+                caps(false, true, true)
+            }
+            async fn fetch_usage(&self, _: Option<&AccountId>) -> AdapterResult<UsageSample> {
+                Err(AdapterError::Unsupported)
+            }
+            async fn detect_stop(&self, _: &SessionId) -> AdapterResult<Option<StopReason>> {
+                Err(AdapterError::Unsupported)
+            }
+            async fn emit_status(
+                &self,
+                _: &SessionId,
+                _: StatusEvent,
+            ) -> AdapterResult<DeliveryOutcome> {
+                Ok(DeliveryOutcome::QueuedForNextIdle)
+            }
+            async fn advise(
+                &self,
+                _: &SessionId,
+                _: &str,
+            ) -> AdapterResult<DeliveryOutcome> {
+                Ok(DeliveryOutcome::QueuedForNextIdle)
+            }
+            async fn compact(
+                &self,
+                _: &SessionSummary,
+                _: &CompactionRequest,
+            ) -> AdapterResult<DeliveryOutcome> {
+                Err(AdapterError::Unsupported)
+            }
+            async fn resume_session(
+                &self,
+                _: &SessionSummary,
+                _: Option<&str>,
+            ) -> AdapterResult<()> {
+                Err(AdapterError::Unsupported)
+            }
+        }
+
+        let now = Utc::now();
+        let mut store = boundary_store(now, 92.0);
+        store.keepalive.enabled = true;
+        let sent = run_keepalive_tick(
+            &store,
+            &HashMap::from([(
+                Provider::ClaudeCode,
+                Arc::new(QueuedAdapter) as Arc<dyn HarnessAdapter>,
+            )]),
+            now,
+            &HashMap::from([(store.session.id.clone(), boundary_profile())]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sent, 0);
+        assert_eq!(*store.recorded_pings.lock().unwrap(), 0);
+    }
 }

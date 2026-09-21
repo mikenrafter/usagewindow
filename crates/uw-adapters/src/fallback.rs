@@ -286,4 +286,22 @@ mod tests {
         adapter.compact(&session(), &request()).await.unwrap();
         assert_eq!(*meta.compact_calls.lock().unwrap(), 0);
     }
+
+    #[tokio::test]
+    async fn fallback_preserves_the_native_stop_detection_limitation() {
+        let native = Fake {
+            compact_result: Arc::new(Mutex::new(None)),
+            compact_calls: Arc::new(Mutex::new(0)),
+        };
+        let meta = Fake {
+            compact_result: Arc::new(Mutex::new(None)),
+            compact_calls: Arc::new(Mutex::new(0)),
+        };
+        let adapter = FallbackCompactionAdapter::new(Arc::new(native), Arc::new(meta));
+
+        assert!(matches!(
+            adapter.detect_stop(&session().id).await,
+            Err(AdapterError::Unsupported)
+        ));
+    }
 }

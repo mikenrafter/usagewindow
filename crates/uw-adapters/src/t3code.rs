@@ -268,7 +268,10 @@ mod tests {
         let calls = transport.calls.lock().unwrap();
         assert_eq!(calls[0].1["type"], "thread.turn.start");
         assert_eq!(calls[0].1["threadId"], session().id.0);
-        assert_eq!(calls[0].1["message"]["text"], request.prompt);
+        assert_eq!(
+            calls[0].1["message"]["text"],
+            "/compact Preserve the active goal."
+        );
     }
 
     #[test]
@@ -285,5 +288,16 @@ mod tests {
                 seed_modes: vec![],
             }
         );
+    }
+
+    #[tokio::test]
+    async fn unverified_stop_detection_is_reported_as_unsupported() {
+        let adapter = T3CodeAdapter::new(Arc::new(FakeTransport {
+            calls: Mutex::new(Vec::new()),
+        }));
+        assert!(matches!(
+            adapter.detect_stop(&session().id).await,
+            Err(AdapterError::Unsupported)
+        ));
     }
 }

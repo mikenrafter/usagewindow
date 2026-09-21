@@ -2023,6 +2023,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delivered_compaction_stays_in_progress_until_observation_verifies_it() {
+        let store = Store::open_memory().unwrap();
+        store.insert_session(&session()).unwrap();
+        store
+            .insert_compaction_request(&CompactionRequest {
+                id: uuid::Uuid::new_v4(),
+                session_id: SessionId("session-1".into()),
+                kind: CompactionKind::AgentRequested,
+                prompt: "compact".into(),
+                reason: "hard quota boundary".into(),
+                status: CompactionStatus::Sent,
+                created_at: Utc::now(),
+            })
+            .unwrap();
+
+        let response = app(store)
+            .oneshot(
+                Request::get("/api/actions/recent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let actions: Vec<RecentAction> = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, "compaction");
+        assert_eq!(actions[0].status, "in progress");
+    }
+
+    #[tokio::test]
+    async fn blocking_compaction_failure_is_persisted_and_visible_in_api_views() {
+        let store = Store::open_memory().unwrap();
+        store.insert_session(&session()).unwrap();
+        store
+            .insert_compaction_request(&CompactionRequest {
+                id: uuid::Uuid::new_v4(),
+                session_id: SessionId("session-1".into()),
+                kind: CompactionKind::AgentRequested,
+                prompt: "compact".into(),
+                reason: "hard quota boundary".into(),
+                status: CompactionStatus::Failed("provider rejected compaction".into()),
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        let router = app(store);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/api/sessions/session-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let detail: SessionDetail = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            detail.errors,
+            ["Blocking compaction failed: provider rejected compaction"]
+        );
+        assert!(!detail.resume_controls.can_resume);
+
+        let response = router
+            .oneshot(
+                Request::get("/api/actions/recent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let actions: Vec<RecentAction> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(actions[0].status, "blocked");
+        assert_eq!(
+            actions[0].error.as_deref(),
+            Some("provider rejected compaction")
+        );
+    }
+
+    #[test]
+    fn failed_blocking_compaction_is_a_blocked_recent_action() {
+        assert_eq!(
+            compact_action_status(&CompactionStatus::Failed(
+                "provider rejected compaction".into()
+            )),
+            (
+                "blocked".into(),
+                Some("provider rejected compaction".into())
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn session_crud_create_update_delete_round_trip() {
         let router = app(Store::open_memory().unwrap());
 
