@@ -15,7 +15,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
 };
-use uw_core::{adapter::HarnessAdapter, api::*, model::*};
+use uw_core::{adapter::HarnessAdapter, api::*, compaction::HARD_BOUNDARY_REASON, model::*};
 use uw_store::{Store, ThresholdOverride, ThresholdScopeKind};
 
 #[derive(RustEmbed)]
@@ -674,6 +674,9 @@ fn detail(store: &Store, id: &SessionId) -> anyhow::Result<SessionDetail> {
     let mut errors = compaction_log
         .iter()
         .filter_map(|request| match &request.status {
+            CompactionStatus::Failed(reason) if request.reason.contains(HARD_BOUNDARY_REASON) => {
+                Some(format!("Blocking compaction failed: {reason}"))
+            }
             CompactionStatus::Failed(reason) => Some(format!("Compaction failed: {reason}")),
             _ => None,
         })
@@ -1031,8 +1034,8 @@ fn compact_action_status(status: &CompactionStatus) -> (String, Option<String>) 
     match status {
         CompactionStatus::Pending => ("pending".into(), None),
         CompactionStatus::Sending => ("sending".into(), None),
-        CompactionStatus::Sent => ("successful".into(), None),
-        CompactionStatus::Failed(reason) => ("failed".into(), Some(reason.clone())),
+        CompactionStatus::Sent => ("in progress".into(), None),
+        CompactionStatus::Failed(reason) => ("blocked".into(), Some(reason.clone())),
         CompactionStatus::Cancelled => ("cancelled".into(), None),
     }
 }
@@ -1126,10 +1129,8 @@ async fn static_asset() -> Response<Body> {
             .body(Body::empty())
             .unwrap();
     };
-    let html = String::from_utf8_lossy(&asset.data).replace(
-        "__UW_VERSION__",
-        env!("CARGO_PKG_VERSION"),
-    );
+    let html =
+        String::from_utf8_lossy(&asset.data).replace("__UW_VERSION__", env!("CARGO_PKG_VERSION"));
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")

@@ -1319,7 +1319,7 @@ impl IdleEpisodeTracker {
     }
 }
 
-pub const HARD_BOUNDARY_REASON: &str = "hard quota boundary";
+pub use uw_core::compaction::HARD_BOUNDARY_REASON;
 
 /// Drives the plan_pressure_pct hard boundary: stop, queue a blocking
 /// compaction, and only schedule an automatic resume once that specific

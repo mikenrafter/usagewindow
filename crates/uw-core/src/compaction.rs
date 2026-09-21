@@ -1,5 +1,10 @@
 //! Provider-neutral compaction message construction.
 
+/// The `CompactionRequest.reason` marker for the plan_pressure_pct hard
+/// boundary: a blocking compaction the policy engine requires verified
+/// completion of before it will schedule an automatic resume.
+pub const HARD_BOUNDARY_REASON: &str = "hard quota boundary";
+
 /// The shared instruction body used when asking a harness to compact context.
 pub fn instruction_body(reason: &str) -> String {
     format!(
