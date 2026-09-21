@@ -864,9 +864,7 @@ async fn compact_ask(
                 id: uuid::Uuid::new_v4(),
                 session_id: id.clone(),
                 kind: CompactionKind::AgentRequested,
-                prompt: uw_adapters::claude_code::compact_instructions(
-                    request.reason.as_deref().unwrap_or(""),
-                ),
+                prompt: request.reason.clone().unwrap_or_default(),
                 reason: request.reason.unwrap_or_else(|| "manual request".into()),
                 status: CompactionStatus::Pending,
                 created_at: Utc::now(),

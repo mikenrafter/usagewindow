@@ -68,7 +68,7 @@ impl HarnessAdapter for MessageCompactionAdapter {
         session: &SessionSummary,
         request: &CompactionRequest,
     ) -> AdapterResult<DeliveryOutcome> {
-        let text = crate::claude_code::compact_instructions(&request.prompt);
+        let text = uw_core::compaction::message("/compact", &request.prompt);
         self.messenger.send(&session.id, &text).await
     }
     async fn resume_session(&self, _: &SessionSummary, _: Option<&str>) -> AdapterResult<()> {

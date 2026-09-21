@@ -218,6 +218,11 @@ an explicit "not supported for this harness" result, not a silently-dropped requ
   compaction — after grading confirms token count dropped, send a second continuation
   message (one of only two allowed unsolicited-send call sites in the whole adapter: the
   `/compact` itself, and this continuation).
+- Compaction message construction is provider-neutral: `uw-core::compaction` owns the
+  preserved/discarded-state template and idempotent command-prefix normalization. Each
+  adapter supplies only the provider command (`/compact`, `/compress`, etc.). Cursor's
+  current adapter remains unable to deliver compaction requests; its CLI command is
+  documented in `docs/research-cursor.md` but no external receive channel is verified.
 - `resume_session`: `claude --resume <session_id>` (or `claude -r`) in `session.cwd`.
   Launches Headless (`--print`/background) by default per `session.launch_mode`; an
   `Interactive`-launched session resuming Headless is a known, accepted UX tradeoff for

@@ -202,8 +202,6 @@ impl uw_adapters::claude_code::HookChannel for StoreHookChannel {
     }
 }
 
-pub const IDLE_COMPACT_PROMPT: &str = "/compact\nPreserve: the current goal, the step in progress and its exact next action, decisions already made and why, and every approach already tried and rejected.\nDiscard: file contents already read, superseded plans, and tool output that has been acted on.\nReason for compacting now: idle cache expiry";
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompactionPlan {
     SkipUnsupported(String),
@@ -1219,7 +1217,7 @@ impl IdleEpisodeTracker {
                     id: uuid::Uuid::new_v4(),
                     session_id: session.id.clone(),
                     kind: CompactionKind::OpportunisticIdle,
-                    prompt: IDLE_COMPACT_PROMPT.into(),
+                    prompt: uw_core::compaction::instruction_body("idle cache expiry"),
                     reason: "idle cache expiry".into(),
                     status: CompactionStatus::Pending,
                     created_at: Utc::now(),

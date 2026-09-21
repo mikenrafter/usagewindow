@@ -340,18 +340,7 @@ impl UsageResponse {
     }
 }
 pub fn compact_instructions(prompt: &str) -> String {
-    let prompt = prompt.trim();
-    let already_prefixed = prompt == "/compact"
-        || prompt
-            .strip_prefix("/compact")
-            .is_some_and(|rest| rest.starts_with(char::is_whitespace));
-    if already_prefixed {
-        prompt.to_owned()
-    } else if prompt.is_empty() {
-        "/compact".into()
-    } else {
-        format!("/compact {prompt}")
-    }
+    uw_core::compaction::message("/compact", prompt)
 }
 
 #[async_trait]
