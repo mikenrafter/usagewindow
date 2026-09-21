@@ -3876,6 +3876,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hard_boundary_delivery_waits_for_observed_completion_before_scheduling_resume() {
+        let now = Utc::now();
+        let key = WindowKey {
+            provider: Provider::ClaudeCode,
+            kind: WindowKind::Rolling { minutes: 300 },
+        };
+        let mut stopped = SessionSummary {
+            stopped_reason: Some(StopReason::UsageLimit { window: key }),
+            ..session()
+        };
+        stopped.last_seen = now - Duration::minutes(10);
+        let inner = Store::open_memory().unwrap();
+        inner.insert_session(&stopped).unwrap();
+        for sample in boundary_samples(now, 96.0) {
+            inner.insert_usage_sample(&sample).unwrap();
+        }
+        let store = SqliteDaemonStore::new(inner);
+        let adapter = Arc::new(BoundaryAdapter {
+            advised: StdMutex::new(vec![]),
+            resume_calls: AtomicUsize::new(0),
+        });
+        let adapters = HashMap::from([(
+            Provider::ClaudeCode,
+            adapter as Arc<dyn HarnessAdapter>,
+        )]);
+        let profiles = HashMap::from([(stopped.id.clone(), boundary_profile())]);
+        let mut runtime = PolicyRuntimeState::default();
+
+        run_policy_tick(
+            &store,
+            &store,
+            &adapters,
+            &AlwaysIdle,
+            std::slice::from_ref(&stopped),
+            &profiles,
+            &mut runtime,
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(
+            store
+                .inner
+                .lock()
+                .unwrap()
+                .resume_markers_for_session(&stopped.id)
+                .unwrap()
+                .is_empty(),
+            "queueing the hard-boundary compaction must not schedule resume"
+        );
+
+        run_compaction_tick(&store, &adapters, &AlwaysIdle)
+            .await
+            .unwrap();
+        run_policy_tick(
+            &store,
+            &store,
+            &adapters,
+            &AlwaysIdle,
+            std::slice::from_ref(&stopped),
+            &profiles,
+            &mut runtime,
+            now + Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+        assert!(
+            store
+                .inner
+                .lock()
+                .unwrap()
+                .resume_markers_for_session(&stopped.id)
+                .unwrap()
+                .is_empty(),
+            "successful delivery is not proof that compaction completed"
+        );
+
+        store
+            .inner
+            .lock()
+            .unwrap()
+            .insert_compaction_event(&CompactionEvent {
+                id: uuid::Uuid::new_v4(),
+                session_id: stopped.id.clone(),
+                source: CompactionSource::External,
+                trigger: Some("hard-boundary".into()),
+                context_pct_before: None,
+                usage_window_pct_before: Some(96.0),
+                tokens_before: stopped.last_known_token_count,
+                tokens_after: Some(1_000),
+                started_at: now + Duration::seconds(1),
+                completed_at: Some(now + Duration::seconds(2)),
+            })
+            .unwrap();
+        run_policy_tick(
+            &store,
+            &store,
+            &adapters,
+            &AlwaysIdle,
+            &[stopped.clone()],
+            &profiles,
+            &mut runtime,
+            now + Duration::seconds(2),
+        )
+        .await
+        .unwrap();
+
+        let markers = store
+            .inner
+            .lock()
+            .unwrap()
+            .resume_markers_for_session(&stopped.id)
+            .unwrap();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].reason, ResumeReason::AutoDetectedLimit);
+        assert_eq!(markers[0].status, ResumeStatus::Scheduled);
+    }
+
+    #[tokio::test]
     async fn queued_keepalive_is_not_recorded_as_successful_delivery() {
         struct QueuedAdapter;
         #[async_trait]
