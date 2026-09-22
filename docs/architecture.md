@@ -133,6 +133,10 @@ trait HarnessAdapter {
     /// Non-destructive: inject advisory text (near-limit pressure, a keepalive ping).
     /// The agent may ignore it entirely. Never queued/claimed — fire-and-forget best effort.
     async fn advise(&self, session_id: &SessionId, text: &str) -> Result<DeliveryOutcome>;
+    /// Interrupt a currently running turn. Used at the hard quota boundary before
+    /// queueing compaction; adapters without a live-turn control surface return
+    /// Unsupported and retain their existing compaction behavior.
+    async fn interrupt(&self, session_id: &SessionId) -> Result<DeliveryOutcome>;
     /// Destructive: only called when `capabilities().can_trigger_compaction`. Goes
     /// through the claim-before-send queue (see CompactionRequest below).
     async fn compact(&self, session_id: &SessionId, req: &CompactionRequest) -> Result<DeliveryOutcome>;

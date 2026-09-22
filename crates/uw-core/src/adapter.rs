@@ -136,6 +136,11 @@ pub trait HarnessAdapter: Send + Sync {
         status: StatusEvent,
     ) -> AdapterResult<DeliveryOutcome>;
     async fn advise(&self, session_id: &SessionId, text: &str) -> AdapterResult<DeliveryOutcome>;
+    /// Interrupt a currently running turn without otherwise changing session state.
+    /// Adapters that cannot target a live turn return `Unsupported`.
+    async fn interrupt(&self, _session_id: &SessionId) -> AdapterResult<DeliveryOutcome> {
+        Err(AdapterError::Unsupported)
+    }
     async fn compact(
         &self,
         session: &SessionSummary,

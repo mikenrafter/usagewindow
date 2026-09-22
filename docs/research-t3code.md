@@ -157,6 +157,9 @@ the agent from continuing the instruction turn before T3Code's native
 compaction operation runs. The interrupt command uses the same dispatch
 endpoint and includes `type`, `commandId`, `threadId`, and `createdAt`; no
 `turnId` is required because T3Code resolves the active turn for the thread.
+The adapter also exposes that interrupt as a standalone control operation so
+the daemon can stop an already-running thread as soon as it crosses the hard
+95% quota boundary, before the queued compaction delivery begins.
 
 ## Native-provider ownership mapping (verified 2026-09-21)
 

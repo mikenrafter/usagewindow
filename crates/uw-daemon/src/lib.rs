@@ -1249,6 +1249,8 @@ pub async fn run_policy_tick(
                         now,
                         sessions,
                         &token_rates,
+                        adapter.as_ref(),
+                        !liveness.is_idle(session).await,
                     )
                     .await?;
                 } else if quota_exhausted
@@ -1453,6 +1455,7 @@ pub fn should_enqueue_hard_boundary_compaction(
 /// any resume marker and is never retried — delivery success is not proof of
 /// completion, so this waits for a `CompactionEvent` started after the
 /// request before treating it as done.
+#[allow(clippy::too_many_arguments)]
 async fn handle_hard_boundary(
     store: &(dyn DaemonStore + Send + Sync),
     session: &SessionSummary,
@@ -1461,6 +1464,8 @@ async fn handle_hard_boundary(
     now: DateTime<Utc>,
     sessions: &[SessionSummary],
     token_rates: &HashMap<SessionId, f64>,
+    adapter: &dyn HarnessAdapter,
+    active: bool,
 ) -> anyhow::Result<()> {
     let requests = store.compaction_requests_for_session(&session.id).await?;
     let latest = requests
@@ -1469,6 +1474,29 @@ async fn handle_hard_boundary(
         .max_by_key(|request| request.created_at);
     match latest {
         None => {
+            if active {
+                match adapter.interrupt(&session.id).await {
+                    Ok(DeliveryOutcome::Delivered | DeliveryOutcome::QueuedForNextIdle) => {
+                        tracing::info!(
+                            session = %session.id.0,
+                            "interrupted active session at hard quota boundary"
+                        );
+                    }
+                    Ok(DeliveryOutcome::Unsupported) => {
+                        tracing::debug!(
+                            session = %session.id.0,
+                            "adapter cannot interrupt active session at hard quota boundary"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            session = %session.id.0,
+                            %error,
+                            "failed to interrupt active session at hard quota boundary"
+                        );
+                    }
+                }
+            }
             store
                 .enqueue_compaction(CompactionRequest {
                     id: uuid::Uuid::new_v4(),
@@ -2435,6 +2463,14 @@ mod tests {
     impl SessionLivenessChecker for AlwaysIdle {
         async fn is_idle(&self, _: &SessionSummary) -> bool {
             true
+        }
+    }
+
+    struct AlwaysActive;
+    #[async_trait]
+    impl SessionLivenessChecker for AlwaysActive {
+        async fn is_idle(&self, _: &SessionSummary) -> bool {
+            false
         }
     }
 
@@ -4395,6 +4431,8 @@ mod tests {
         resume_calls: AtomicUsize,
     }
 
+    static HARD_BOUNDARY_INTERRUPTS: AtomicUsize = AtomicUsize::new(0);
+
     #[async_trait]
     impl HarnessAdapter for BoundaryAdapter {
         fn provider(&self) -> Provider {
@@ -4418,6 +4456,10 @@ mod tests {
         }
         async fn advise(&self, _: &SessionId, text: &str) -> AdapterResult<DeliveryOutcome> {
             self.advised.lock().unwrap().push(text.into());
+            Ok(DeliveryOutcome::Delivered)
+        }
+        async fn interrupt(&self, _: &SessionId) -> AdapterResult<DeliveryOutcome> {
+            HARD_BOUNDARY_INTERRUPTS.fetch_add(1, Ordering::SeqCst);
             Ok(DeliveryOutcome::Delivered)
         }
         async fn compact(
@@ -4622,6 +4664,38 @@ mod tests {
             CompactionKind::OpportunisticIdle
         ));
         assert!(enqueued[0].reason.contains("hard quota boundary"));
+    }
+
+    #[tokio::test]
+    async fn plan_pressure_boundary_interrupts_a_continuing_session_before_compaction() {
+        HARD_BOUNDARY_INTERRUPTS.store(0, Ordering::SeqCst);
+        let now = Utc::now();
+        let store = boundary_store(now, 96.0);
+        let adapter = Arc::new(BoundaryAdapter {
+            advised: StdMutex::new(vec![]),
+            resume_calls: AtomicUsize::new(0),
+        });
+        let adapters = HashMap::from([(
+            Provider::ClaudeCode,
+            adapter.clone() as Arc<dyn HarnessAdapter>,
+        )]);
+        let profiles = HashMap::from([(store.session.id.clone(), boundary_profile())]);
+
+        run_policy_tick(
+            &store,
+            &store,
+            &adapters,
+            &AlwaysActive,
+            std::slice::from_ref(&store.session),
+            &profiles,
+            &mut PolicyRuntimeState::default(),
+            now,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(HARD_BOUNDARY_INTERRUPTS.load(Ordering::SeqCst), 1);
+        assert_eq!(store.enqueued.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

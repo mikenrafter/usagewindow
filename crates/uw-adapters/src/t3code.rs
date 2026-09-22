@@ -236,6 +236,15 @@ impl T3CodeAdapter {
             "createdAt": chrono::Utc::now(),
         })
     }
+
+    fn interrupt_payload(thread_id: &str) -> Value {
+        json!({
+            "type": "thread.turn.interrupt",
+            "commandId": uuid::Uuid::new_v4(),
+            "threadId": thread_id,
+            "createdAt": chrono::Utc::now(),
+        })
+    }
 }
 
 #[async_trait]
@@ -296,6 +305,13 @@ impl HarnessAdapter for T3CodeAdapter {
         Err(AdapterError::Unsupported)
     }
 
+    async fn interrupt(&self, session_id: &SessionId) -> AdapterResult<DeliveryOutcome> {
+        self.transport
+            .post_interrupt(Self::interrupt_payload(&session_id.0))
+            .await
+            .map(|_| DeliveryOutcome::Delivered)
+    }
+
     async fn compact(
         &self,
         session: &SessionSummary,
@@ -307,12 +323,7 @@ impl HarnessAdapter for T3CodeAdapter {
             .post_dispatch(Self::turn_start_payload(thread_id, &instructions))
             .await?;
         self.transport
-            .post_interrupt(json!({
-                "type": "thread.turn.interrupt",
-                "commandId": uuid::Uuid::new_v4(),
-                "threadId": thread_id,
-                "createdAt": chrono::Utc::now(),
-            }))
+            .post_interrupt(Self::interrupt_payload(thread_id))
             .await?;
         self.transport
             .post_dispatch(Self::turn_start_payload(thread_id, "/compact"))
