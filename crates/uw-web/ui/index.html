@@ -116,6 +116,7 @@
   .actions-panel > .panelhead h2 { margin: 0; }
   .actions-panel > .panelhead .muted { margin: 0; }
   .actions-panel #actions { padding: 0 0.8rem 0.8rem; }
+  .sessions-panel { container-type: inline-size; }
   #login { display: none; position: fixed; inset: 0; z-index: 20; place-items: center; background: rgba(15,17,21,0.92); }
   #login.show { display: grid; }
   #login form { width: min(22rem, calc(100vw - 2rem)); background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }
@@ -160,6 +161,26 @@
     tbody td[colspan] { display: block; text-align: left; }
     tbody td[colspan]::before { content: none; }
   }
+
+  /* The sessions panel can be narrow even when the viewport is wide (for
+     example beside the detail panel). Match the mobile table layout at the
+     component boundary, not only at the viewport boundary. */
+  @container (max-width: 760px) {
+    .sessions-panel table,
+    .sessions-panel thead,
+    .sessions-panel tbody,
+    .sessions-panel tr,
+    .sessions-panel th,
+    .sessions-panel td { display: block; }
+    .sessions-panel thead { display: none; }
+    .sessions-panel tbody tr { border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.6rem; margin-bottom: 0.6rem; }
+    .sessions-panel tbody tr:hover { background: none; }
+    .sessions-panel tbody td { display: flex; justify-content: space-between; align-items: baseline; gap: 0.6rem; border-bottom: none; padding: 0.3rem 0; min-width: 0; text-align: right; overflow-wrap: anywhere; }
+    .sessions-panel tbody td::before { content: attr(data-label); flex: 0 0 auto; color: var(--muted); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.03em; text-align: left; }
+    .sessions-panel tbody td:last-child { flex-wrap: wrap; justify-content: flex-start; text-align: left; }
+    .sessions-panel tbody td[colspan] { display: block; text-align: left; }
+    .sessions-panel tbody td[colspan]::before { content: none; }
+  }
 </style>
 </head>
 <body>
@@ -191,7 +212,7 @@
     <div id="actions"><p class="empty">loading…</p></div>
   </section>
 
-  <section class="panel">
+  <section class="panel sessions-panel">
     <h2>Sessions</h2>
     <div class="row">
       <input id="q" type="search" placeholder="search id / cwd / model…">
