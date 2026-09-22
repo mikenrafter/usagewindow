@@ -46,7 +46,9 @@
   .pill.inline { color: var(--ok); border-color: var(--ok); }
   .pill.external { color: var(--warn); border-color: var(--warn); }
   .muted { color: var(--muted); }
-  .sid-sub { font-size: 0.75rem; font-weight: 400; margin-top: 0.1rem; word-break: break-all; }
+  .session-label { display: inline-flex; flex-direction: column; align-items: flex-start; gap: 0.1rem; min-width: 0; }
+  .session-name { font-weight: 600; }
+  .sid-sub { display: block; font-size: 0.75rem; font-weight: 400; margin-top: 0.1rem; word-break: break-all; }
   .detail-title { margin: 0 0 0.8rem; font-size: 1rem; color: var(--text); }
   .kv { display: grid; grid-template-columns: 11rem 1fr; gap: 0.35rem 0.8rem; font-size: 0.85rem; margin-bottom: 1rem; }
   .kv .k { color: var(--muted); }
@@ -101,6 +103,9 @@
   .actionrow .meta { color: var(--muted); font-size: 0.78rem; display: flex; gap: 0.9rem; flex-wrap: wrap; }
   .actionrow { cursor: pointer; }
   .actionrow:hover { background: rgba(91,140,255,0.08); }
+  .actions-panel .actionrow { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: start; column-gap: 0.8rem; }
+  .actions-panel .action-details { min-width: 0; }
+  .actions-panel .action-status { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; justify-content: flex-end; }
   .action-error { color: var(--danger); margin-top: 0.35rem; font-size: 0.78rem; white-space: pre-wrap; overflow-wrap: anywhere; }
   .error-group { color: var(--danger); margin-top: 0.35rem; font-size: 0.78rem; }
   .error-group summary { color: var(--danger); margin: 0; }
@@ -376,8 +381,8 @@ document.addEventListener('click', event => {
 
 function sessionLabel(s) {
   const id = copySessionButton(s.id);
-  if (!s.title) return `${escapeHtml(s.id)} ${id}`;
-  return `${escapeHtml(s.title)}<div class="sid-sub muted">${escapeHtml(s.id)} ${id}</div>`;
+  if (!s.title) return `<span class="session-label">${escapeHtml(s.id)} ${id}</span>`;
+  return `<span class="session-label"><span class="session-name">${escapeHtml(s.title)}</span><span class="sid-sub muted">${escapeHtml(s.id)} ${id}</span></span>`;
 }
 
 function copySessionButton(id) {
@@ -602,17 +607,19 @@ function renderRecentActionGroup(group) {
     : `<div class="action-error">${escapeHtml(first.error)}</div>`;
   return `
     <div class="actionrow" data-id="${escapeHtml(first.session_id)}">
-      <div class="top">
-        <span class="sid">${session}</span>
-        <span class="pill">${escapeHtml(first.kind)}</span>
+      <div class="action-details">
+        <div class="top"><span class="sid">${session}</span></div>
+        <div class="meta">
+          ${first.detail ? `<span>${escapeHtml(first.detail)}</span>` : ''}
+          <span>${fmtDate(first.at)}</span>
+        </div>
+        ${first.error ? errorDetails : ''}
+      </div>
+      <span class="pill action-kind">${escapeHtml(first.kind)}</span>
+      <div class="action-status">
         <span class="pill ${statusClass}">${escapeHtml(status)}</span>
         ${errors.length > 1 ? `<span class="pill stopped">${errors.length} errors</span>` : ''}
       </div>
-      <div class="meta">
-        ${first.detail ? `<span>${escapeHtml(first.detail)}</span>` : ''}
-        <span>${fmtDate(first.at)}</span>
-      </div>
-      ${first.error ? errorDetails : ''}
     </div>`;
 }
 

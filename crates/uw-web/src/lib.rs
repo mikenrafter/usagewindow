@@ -1172,6 +1172,17 @@ fn resume_status(status: &ResumeStatus) -> (String, Option<String>) {
     }
 }
 
+fn completed_event_for_request<'a>(
+    request: &CompactionRequest,
+    events: &'a [CompactionEvent],
+) -> Option<&'a CompactionEvent> {
+    events.iter().find(|event| {
+        event.started_at >= request.created_at
+            && event.started_at <= request.created_at + Duration::minutes(5)
+            && event.completed_at.is_some()
+    })
+}
+
 async fn actions_recent(
     State(state): State<AppState>,
     Query(query): Query<CompactionsQuery>,
@@ -1186,23 +1197,36 @@ async fn actions_recent(
             let mut actions = Vec::new();
             for session in store.list_sessions()? {
                 let session_title = store.resolve_session_title(&session.id)?;
-                for request in store.compaction_requests_for_session(&session.id)? {
-                    let (status, error) = compact_action_status(&request.status);
+                let compaction_events = store.compaction_events_for_session(&session.id)?;
+                let compaction_requests = store.compaction_requests_for_session(&session.id)?;
+                for request in &compaction_requests {
                     if request.created_at < cutoff {
                         continue;
                     }
+                    let completed = completed_event_for_request(request, &compaction_events);
+                    let (status, error) = if completed.is_some() {
+                        ("successful".into(), None)
+                    } else {
+                        compact_action_status(&request.status)
+                    };
                     actions.push(RecentAction {
                         session_id: session.id.clone(),
                         session_title: session_title.clone(),
                         kind: "compaction".into(),
                         status,
                         at: request.created_at,
-                        detail: Some(request.reason),
+                        detail: Some(request.reason.clone()),
                         error,
                     });
                 }
-                for event in store.compaction_events_for_session(&session.id)? {
+                for event in compaction_events {
                     if event.started_at < cutoff {
+                        continue;
+                    }
+                    if compaction_requests
+                        .iter()
+                        .any(|request| completed_event_for_request(request, std::slice::from_ref(&event)).is_some())
+                    {
                         continue;
                     }
                     actions.push(RecentAction {
@@ -1673,6 +1697,8 @@ mod tests {
         assert!(html.contains("max context"));
         assert!(html.contains("recent context"));
         assert!(html.contains("repeated errors"));
+        assert!(html.contains("grid-template-columns: minmax(0, 1fr) auto auto"));
+        assert!(html.contains("session-label"));
     }
 
     #[tokio::test]
@@ -2474,6 +2500,54 @@ mod tests {
         assert_eq!(actions[0].kind, "compaction");
         assert_eq!(actions[0].status, "in progress");
         assert_eq!(actions[0].session_title.as_deref(), Some("Named session"));
+    }
+
+    #[tokio::test]
+    async fn observed_compaction_updates_the_recent_request_to_successful() {
+        let store = Store::open_memory().unwrap();
+        store.insert_session(&session()).unwrap();
+        let requested_at = Utc::now();
+        store
+            .insert_compaction_request(&CompactionRequest {
+                id: uuid::Uuid::new_v4(),
+                session_id: SessionId("session-1".into()),
+                kind: CompactionKind::AgentRequested,
+                prompt: "compact".into(),
+                reason: "test".into(),
+                status: CompactionStatus::Sent,
+                created_at: requested_at,
+            })
+            .unwrap();
+        store
+            .insert_compaction_event(&CompactionEvent {
+                id: uuid::Uuid::new_v4(),
+                session_id: SessionId("session-1".into()),
+                source: CompactionSource::Inline,
+                trigger: Some("manual".into()),
+                context_pct_before: None,
+                usage_window_pct_before: None,
+                tokens_before: None,
+                tokens_after: None,
+                started_at: requested_at + Duration::seconds(1),
+                completed_at: Some(requested_at + Duration::seconds(2)),
+            })
+            .unwrap();
+
+        let response = app(store)
+            .oneshot(
+                Request::get("/api/actions/recent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let actions: Vec<RecentAction> = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].status, "successful");
     }
 
     #[tokio::test]
