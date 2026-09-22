@@ -1664,6 +1664,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recent_actions_header_describes_the_24_hour_window() {
+        let response = app(Store::open_memory().unwrap())
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&body);
+
+        assert!(html.contains("latest 20 over 24h"));
+        assert!(!html.contains(">latest 20</span>"));
+    }
+
+    #[tokio::test]
     async fn hook_ingress_routes_supported_session_events_and_rejects_unknown_events() {
         let router = app(Store::open_memory().unwrap());
         let start = serde_json::json!({
