@@ -9,6 +9,8 @@ use uw_core::adapter::{
 };
 use uw_core::model::*;
 
+const COMPACTION_STEP_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The credential already issued by T3Code. Pairing/session creation is kept
 /// outside usagewindow so this adapter cannot silently create another owner.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -227,7 +229,7 @@ impl T3CodeAdapter {
         }
     }
 
-    fn compaction_instructions(prompt: &str) -> String {
+    fn compaction_instructions(prompt: &str, reason: &str) -> String {
         let mut instructions = prompt.trim();
         while let Some(rest) = instructions.strip_prefix("/compact") {
             if rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace) {
@@ -236,7 +238,12 @@ impl T3CodeAdapter {
                 break;
             }
         }
-        instructions.trim().to_owned()
+        let instructions = instructions.trim();
+        if instructions.is_empty() {
+            uw_core::compaction::instruction_body(reason)
+        } else {
+            instructions.to_owned()
+        }
     }
 
     fn turn_start_payload(thread_id: &str, text: &str) -> Value {
@@ -349,13 +356,19 @@ impl HarnessAdapter for T3CodeAdapter {
         request: &CompactionRequest,
     ) -> AdapterResult<DeliveryOutcome> {
         let thread_id = self.owned_thread(session).await?;
-        let instructions = Self::compaction_instructions(&request.prompt);
+        let instructions = Self::compaction_instructions(&request.prompt, &request.reason);
         self.transport
             .post_dispatch(Self::turn_start_payload(&thread_id.0, &instructions))
             .await?;
+        tokio::time::sleep(COMPACTION_STEP_DELAY).await;
         self.transport
             .post_interrupt(Self::interrupt_payload(&thread_id.0))
             .await?;
+        tokio::time::sleep(COMPACTION_STEP_DELAY).await;
+        self.transport
+            .post_interrupt(Self::interrupt_payload(&thread_id.0))
+            .await?;
+        tokio::time::sleep(COMPACTION_STEP_DELAY).await;
         self.transport
             .post_dispatch(Self::turn_start_payload(&thread_id.0, "/compact"))
             .await
@@ -402,6 +415,7 @@ mod tests {
 
     struct FakeTransport {
         calls: Mutex<Vec<(String, Value)>>,
+        call_times: Mutex<Vec<std::time::Instant>>,
         thread: Mutex<Option<Value>>,
     }
 
@@ -409,6 +423,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
+                call_times: Mutex::new(Vec::new()),
                 thread: Mutex::new(None),
             }
         }
@@ -416,6 +431,7 @@ mod tests {
         fn with_thread(thread: Value) -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
+                call_times: Mutex::new(Vec::new()),
                 thread: Mutex::new(Some(thread)),
             }
         }
@@ -424,6 +440,7 @@ mod tests {
     #[async_trait]
     impl T3CodeTransport for FakeTransport {
         async fn post_dispatch(&self, payload: Value) -> AdapterResult<Value> {
+            self.call_times.lock().unwrap().push(std::time::Instant::now());
             self.calls
                 .lock()
                 .unwrap()
@@ -432,6 +449,7 @@ mod tests {
         }
 
         async fn post_interrupt(&self, payload: Value) -> AdapterResult<Value> {
+            self.call_times.lock().unwrap().push(std::time::Instant::now());
             self.calls
                 .lock()
                 .unwrap()
@@ -444,6 +462,7 @@ mod tests {
             thread_id: &str,
             status: Option<Value>,
         ) -> AdapterResult<Value> {
+            self.call_times.lock().unwrap().push(std::time::Instant::now());
             self.calls.lock().unwrap().push((
                 "thread_status".into(),
                 serde_json::json!({"threadId": thread_id, "status": status}),
@@ -452,6 +471,7 @@ mod tests {
         }
 
         async fn get_thread(&self, thread_id: &str) -> AdapterResult<Value> {
+            self.call_times.lock().unwrap().push(std::time::Instant::now());
             self.calls
                 .lock()
                 .unwrap()
@@ -523,6 +543,14 @@ mod tests {
             status: CompactionStatus::Sending,
             created_at: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn empty_compaction_prompt_uses_the_shared_instruction_blurb() {
+        assert_eq!(
+            T3CodeAdapter::compaction_instructions("", "manual request"),
+            uw_core::compaction::instruction_body("manual request")
+        );
     }
 
     fn owner_db(rows: &[(&str, &str, &str)]) -> std::path::PathBuf {
@@ -692,7 +720,7 @@ mod tests {
             DeliveryOutcome::Delivered
         );
         let calls = transport.calls.lock().unwrap();
-        assert_eq!(calls.len(), 4);
+        assert_eq!(calls.len(), 5);
         assert_eq!(calls[0].0, "get_thread");
         assert_eq!(calls[1].1["type"], "thread.turn.start");
         assert_eq!(calls[1].1["threadId"], session().id.0);
@@ -701,10 +729,17 @@ mod tests {
         assert_eq!(calls[2].1["type"], "thread.turn.interrupt");
         assert_eq!(calls[2].1["threadId"], session().id.0);
         assert!(calls[2].1.get("turnId").is_none());
-        assert_eq!(calls[3].0, "dispatch");
-        assert_eq!(calls[3].1["type"], "thread.turn.start");
+        assert_eq!(calls[3].0, "interrupt");
+        assert_eq!(calls[3].1["type"], "thread.turn.interrupt");
         assert_eq!(calls[3].1["threadId"], session().id.0);
-        assert_eq!(calls[3].1["message"]["text"], "/compact");
+        assert_eq!(calls[4].0, "dispatch");
+        assert_eq!(calls[4].1["type"], "thread.turn.start");
+        assert_eq!(calls[4].1["threadId"], session().id.0);
+        assert_eq!(calls[4].1["message"]["text"], "/compact");
+        let call_times = transport.call_times.lock().unwrap();
+        assert!(call_times[2].duration_since(call_times[1]) >= std::time::Duration::from_secs(2));
+        assert!(call_times[3].duration_since(call_times[2]) >= std::time::Duration::from_secs(2));
+        assert!(call_times[4].duration_since(call_times[3]) >= std::time::Duration::from_secs(2));
     }
 
     #[tokio::test]
@@ -751,6 +786,7 @@ mod tests {
             assert_eq!(calls[1].1["threadId"], t3_thread_id);
             assert_eq!(calls[2].1["threadId"], t3_thread_id);
             assert_eq!(calls[3].1["threadId"], t3_thread_id);
+            assert_eq!(calls[4].1["threadId"], t3_thread_id);
             fs::remove_file(path).unwrap();
         }
     }
