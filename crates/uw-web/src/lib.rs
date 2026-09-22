@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use std::{
@@ -674,6 +674,16 @@ async fn sessions(
     ))
 }
 
+fn recent_history(mut history: Vec<SparklinePoint>, now: DateTime<Utc>) -> Vec<SparklinePoint> {
+    let cutoff = now - Duration::hours(24);
+    history.retain(|point| point.at >= cutoff);
+    history.sort_by_key(|point| point.at);
+    if history.len() > 20 {
+        history = history.split_off(history.len() - 20);
+    }
+    history
+}
+
 fn detail(store: &Store, id: &SessionId) -> anyhow::Result<SessionDetail> {
     let summary = store.read_session(id)?;
     let title = store.resolve_session_title(id)?;
@@ -690,6 +700,7 @@ fn detail(store: &Store, id: &SessionId) -> anyhow::Result<SessionDetail> {
             })
         })
         .collect();
+    let history = recent_history(history, Utc::now());
     let compaction_log = store.compaction_requests_for_session(id)?;
     let mut errors = compaction_log
         .iter()
@@ -1181,6 +1192,27 @@ mod tests {
     use std::collections::HashMap;
     use tower::ServiceExt;
     use uw_core::adapter::TokenUsageRecord;
+
+    #[test]
+    fn recent_history_keeps_only_last_twenty_points_from_past_24_hours() {
+        let now = Utc::now();
+        let history = (0..25)
+            .map(|hours_ago| SparklinePoint {
+                at: now - Duration::hours(hours_ago),
+                pct: hours_ago as f32,
+            })
+            .collect::<Vec<_>>();
+
+        let recent = recent_history(history, now);
+
+        assert_eq!(recent.len(), 20);
+        assert!(
+            recent
+                .iter()
+                .all(|point| point.at >= now - Duration::hours(24))
+        );
+        assert!(recent.iter().all(|point| point.pct <= 23.0));
+    }
 
     struct StubAdapter(uw_core::adapter::Capabilities);
     #[async_trait::async_trait]

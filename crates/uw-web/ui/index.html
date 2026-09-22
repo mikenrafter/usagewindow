@@ -644,8 +644,8 @@ async function selectSession(id) {
     <div id="preview"></div>
 
     <details>
-      <summary>raw usage history (${d.history.length} points)</summary>
-      <pre class="raw">${escapeHtml(d.history.slice(-20))}</pre>
+      <summary>last 20 over 24h (${d.history.length} points)</summary>
+      <pre class="raw">${escapeHtml(d.history)}</pre>
     </details>
 
     <h2 style="margin-top:1rem">Compaction requests (${d.compaction_log.length})</h2>
