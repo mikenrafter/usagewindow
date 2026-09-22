@@ -2433,6 +2433,15 @@ fn auto_reseed_runtime_from_env() -> Option<AutoReseedRuntime> {
     })
 }
 
+fn with_compaction_fallback(
+    native: Arc<dyn HarnessAdapter>,
+    meta: Arc<dyn HarnessAdapter>,
+) -> Arc<dyn HarnessAdapter> {
+    Arc::new(uw_adapters::fallback::FallbackCompactionAdapter::new(
+        native, meta,
+    ))
+}
+
 /// Entry point shared by the daemon binary and the Phase 6 CLI command. Service
 /// configuration (SQLite path and adapter registry) is intentionally still a later
 /// wiring concern; this preserves the same cadence/ownership point for Phase 7.
@@ -2462,10 +2471,10 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
     let paseo_fallback: Arc<dyn HarnessAdapter> = Arc::new(
         uw_adapters::fallback::MessageCompactionAdapter::new(paseo_messenger),
     );
-    let mut codex: Arc<dyn HarnessAdapter> =
+    let codex: Arc<dyn HarnessAdapter> =
         Arc::new(uw_adapters::codex::CodexAdapter::real().with_hook_channel(hook_channel));
-    let mut adapters: HashMap<Provider, Arc<dyn HarnessAdapter>> = HashMap::from([
-        (Provider::Codex, codex.clone()),
+    let mut native_adapters: HashMap<Provider, Arc<dyn HarnessAdapter>> = HashMap::from([
+        (Provider::Codex, codex),
         (
             Provider::ClaudeCode,
             Arc::new(claude) as Arc<dyn HarnessAdapter>,
@@ -2473,7 +2482,7 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
     ]);
     let cursor_auth = cursor_auth_from_environment();
     if !cursor_auth.is_empty() {
-        adapters.insert(
+        native_adapters.insert(
             Provider::Cursor,
             Arc::new(uw_adapters::cursor::CursorAdapter::real(cursor_auth)),
         );
@@ -2481,7 +2490,7 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
     if let Ok(command) = std::env::var("UW_GENERIC_USAGE_COMMAND") {
         let command: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
         if !command.is_empty() {
-            adapters.insert(
+            native_adapters.insert(
                 Provider::Other("generic".into()),
                 Arc::new(uw_adapters::generic_hook::GenericHookAdapter::new(Some(
                     command,
@@ -2489,7 +2498,7 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
             );
         }
     }
-    if let Ok(base_url) = std::env::var("UW_T3CODE_URL") {
+    let t3code = if let Ok(base_url) = std::env::var("UW_T3CODE_URL") {
         let auth = match (
             std::env::var("UW_T3CODE_BEARER_TOKEN").ok(),
             std::env::var("UW_T3CODE_COOKIE").ok(),
@@ -2513,21 +2522,30 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
                 None
             }
         };
-        if let Some(auth) = auth {
-            let t3code: Arc<dyn HarnessAdapter> =
-                Arc::new(uw_adapters::t3code::T3CodeAdapter::real(base_url, auth));
-            codex = Arc::new(uw_adapters::fallback::FallbackCompactionAdapter::new(
-                codex,
-                t3code.clone(),
-            ));
-            adapters.insert(Provider::Other("t3code".into()), t3code);
-        }
+        auth.map(|auth| {
+            Arc::new(uw_adapters::t3code::T3CodeAdapter::real(base_url, auth))
+                as Arc<dyn HarnessAdapter>
+        })
+    } else {
+        None
+    };
+    let meta_harness = t3code
+        .as_ref()
+        .map(|t3code| with_compaction_fallback(t3code.clone(), paseo_fallback.clone()))
+        .unwrap_or_else(|| paseo_fallback.clone());
+    let adapters: HashMap<Provider, Arc<dyn HarnessAdapter>> = native_adapters
+        .into_iter()
+        .map(|(provider, native)| {
+            (
+                provider,
+                with_compaction_fallback(native, meta_harness.clone()),
+            )
+        })
+        .collect();
+    let mut adapters = adapters;
+    if t3code.is_some() {
+        adapters.insert(Provider::Other("t3code".into()), meta_harness);
     }
-    codex = Arc::new(uw_adapters::fallback::FallbackCompactionAdapter::new(
-        codex,
-        paseo_fallback,
-    ));
-    adapters.insert(Provider::Codex, codex);
     let liveness = SystemSessionLivenessChecker {
         store: Arc::clone(&shared_store),
     };

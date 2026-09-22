@@ -564,11 +564,17 @@ async fn status(
                         record.at >= activity_cutoff && record.total_tokens > 0
                     });
                 let activity = records
-                    .into_iter()
+                    .iter()
                     .filter(|record| record.total_tokens > 0)
                     .map(|record| record.at)
                     .collect::<Vec<_>>();
-                Ok((session.id.clone(), active, activity))
+                let keptalive = store
+                    .keepalive_config(&session.id)
+                    .map(|config| config.enabled)
+                    .unwrap_or(false)
+                    && uw_core::model::is_keepalive_eligible(session, &records, now);
+                let scheduled = store.active_resume_marker(&session.id)?.is_some();
+                Ok((session.id.clone(), active, keptalive, scheduled, activity))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         let usage = latest.into_values().map(|sample| {
@@ -586,7 +592,7 @@ async fn status(
                     .iter()
                     .filter(|s| s.harness == provider && s.account == account)
                     .filter(|s| {
-                        session_activity.iter().any(|(id, active, activity)| {
+                        session_activity.iter().any(|(id, active, _, _, activity)| {
                             id == &s.id
                                 && if long_window {
                                     let cutoff = now - purview;
@@ -597,11 +603,39 @@ async fn status(
                         })
                     })
                     .count() as u32;
+                let keptalive_sessions = sessions
+                    .iter()
+                    .filter(|s| s.harness == provider && s.account == account)
+                    .filter(|s| {
+                        session_activity
+                            .iter()
+                            .any(|(id, _, keptalive, _, _)| id == &s.id && *keptalive)
+                    })
+                    .count() as u32;
+                let scheduled_sessions = sessions
+                    .iter()
+                    .filter(|s| s.harness == provider && s.account == account)
+                    .filter(|s| {
+                        session_activity
+                            .iter()
+                            .any(|(id, _, _, scheduled, _)| id == &s.id && *scheduled)
+                    })
+                    .count() as u32;
                 let depletes_at = burn_rate_pct_per_hour.filter(|rate| *rate > 0.0).map(|rate| {
                     let minutes_remaining = (100.0 - window.pct) / rate * 60.0;
                     now + chrono::Duration::minutes(minutes_remaining.max(0.0) as i64)
                 });
-                UsageWindowSummary { window: key.kind, pct: window.pct, resets_at: window.resets_at, exceeded: window.exceeded, burn_rate_pct_per_hour, active_sessions, depletes_at }
+                UsageWindowSummary {
+                    window: key.kind,
+                    pct: window.pct,
+                    resets_at: window.resets_at,
+                    exceeded: window.exceeded,
+                    burn_rate_pct_per_hour,
+                    active_sessions,
+                    keptalive_sessions,
+                    scheduled_sessions,
+                    depletes_at,
+                }
             }).collect();
             ProviderUsageSummary { provider, account, plan, windows }
         }).collect();

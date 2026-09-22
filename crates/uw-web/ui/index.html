@@ -81,19 +81,19 @@
   .card .stale { margin-left: auto; }
   .barrow { margin-bottom: 0.7rem; }
   .barrow:last-child { margin-bottom: 0; }
-  .barrow .title { font-size: 0.78rem; color: var(--muted); margin-bottom: 0.25rem; }
-  .barrow .label { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.25rem; }
-  .barrow .label .pct-val { text-align: left; font-size: 0.95rem; font-weight: 600; color: var(--text); }
-  .barrow .label .burn-val { text-align: right; font-size: 0.78rem; color: var(--muted); }
-  .barrow .label .burn-val b { color: var(--text); font-weight: 600; }
-  .barrow .label .burnlabel { color: var(--muted); margin-right: 0.2rem; }
-  .bar { position: relative; height: 10px; border-radius: 5px; background: #1c2028; overflow: hidden; }
-  .bar .seg { position: absolute; top: 0; bottom: 0; transition: left 0.3s, width 0.3s; }
-  .bar .seg.used { left: 0; border-radius: 5px 0 0 5px; }
-  .bar .seg.projected { border-radius: 0; }
-  .bar .seg.remain { border-radius: 0 5px 5px 0; }
-  .barrow .meta { display: flex; gap: 0.8rem; font-size: 0.72rem; color: var(--muted); margin-top: 0.25rem; flex-wrap: wrap; }
-  .barrow .meta b { color: var(--text); }
+  .barrow .title { text-align: center; font-size: 0.8rem; color: var(--text); font-weight: 600; margin-bottom: 0.35rem; }
+  .bar { position: relative; min-height: 3.7rem; border-radius: 0.65rem; background: #1c2028; overflow: hidden; padding: 0.55rem 0.65rem; display: flex; align-items: center; }
+  .bar .seg { position: absolute; top: 0; bottom: 0; transition: left 0.3s, right 0.3s, width 0.3s; }
+  .bar .seg.used { right: 0; left: auto; border-radius: 0.65rem 0 0 0.65rem; }
+  .bar .seg.remain { left: 0; border-radius: 0 0.65rem 0.65rem 0; }
+  .bar-copy { position: relative; z-index: 1; width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 0.35rem; flex-wrap: wrap; }
+  .bar-stat { padding: 0.18rem 0.35rem; border-radius: 0.35rem; background: rgba(0, 0, 0, 0.33); color: var(--text); font-size: 0.72rem; line-height: 1.15; white-space: nowrap; }
+  .bar-stat.primary { font-size: 0.86rem; font-weight: 650; }
+  .bar-stat.active { color: #86efac; }
+  .bar-stat.keptalive { color: #93c5fd; }
+  .bar-stat.scheduled { color: #fde68a; }
+  .bar-stat.reset { color: #d1d5db; }
+  .reset-icon { display: inline-flex; align-items: center; justify-content: center; width: 1.45rem; height: 1.45rem; border: 1px solid rgba(255,255,255,0.45); border-radius: 50%; color: var(--text); font-size: 1rem; }
 
   .actionrow { border-bottom: 1px solid var(--border); padding: 0.5rem 0; font-size: 0.82rem; }
   .actionrow:last-child { border-bottom: none; }
@@ -467,10 +467,19 @@ function hslColor(hue, sat, light = 48) {
   return `hsl(${hue.toFixed(1)}, ${sat}%, ${light}%)`;
 }
 
-function usedHazardBg(hue) {
-  const a = hslColor(hue, 30, 42);
-  const b = hslColor(hue, 20, 36);
-  return `repeating-linear-gradient(135deg, ${a} 0 3px, ${b} 3px 6px)`;
+function usedHazardBg(hue, sessionCount) {
+  const count = Math.max(1, Math.min(8, sessionCount || 1));
+  const colors = [
+    hslColor(hue, 30, 42),
+    hslColor(hue, 40, 39),
+  ];
+  const stops = [];
+  for (let index = 0; index < count; index += 1) {
+    const start = (index / count * 100).toFixed(2);
+    const end = ((index + 1) / count * 100).toFixed(2);
+    stops.push(`${colors[index % 2]} ${start}% ${end}%`);
+  }
+  return `repeating-linear-gradient(135deg, ${stops.join(', ')})`;
 }
 
 function burnDisplayWindow(provider, kind) {
@@ -491,32 +500,31 @@ function renderUsageBar(provider, w) {
   const burnConsumed = w.burn_rate_pct_per_hour != null
     ? w.burn_rate_pct_per_hour * burnWindowMinutes / 60
     : null;
-  const projected = burnConsumed != null ? Math.min(remaining, Math.max(0, burnConsumed)) : 0;
   const burnRounded = burnConsumed == null ? null : Math.abs(burnConsumed).toFixed(1);
   const burnPct = burnRounded == null || burnRounded === '0.0'
     ? '-'
     : (burnConsumed > 0 ? '-' : '+') + burnRounded + '%';
-  const sessions = `${w.active_sessions} session${w.active_sessions === 1 ? '' : 's'}`;
-  const usedStyle = `width:${used}%;background:${usedHazardBg(hue)}`;
-  const projStyle = projected > 0
-    ? `left:${used}%;width:${projected}%;background:${hslColor(hue, 50)}`
-    : '';
-  const remainStyle = `left:${used + projected}%;width:${Math.max(0, remaining - projected)}%;background:${hslColor(hue, 100)}`;
+  const sessionCount = (w.active_sessions || 0) + (w.keptalive_sessions || 0) + (w.scheduled_sessions || 0);
+  const usedStyle = `width:${used}%;background:${usedHazardBg(hue, sessionCount)}`;
+  const remainStyle = `width:${remaining}%;background:${hslColor(hue, 100)}`;
+  const exhaustedIn = w.depletes_at ? countdown(w.depletes_at) : '-';
+  const resetsIn = w.resets_at ? countdown(w.resets_at) : '-';
+  const resetLabel = w.resets_at ? `+100% in ${resetsIn}` : '';
   return `
     <div class="barrow">
       <div class="title">${escapeHtml(windowLabel(w.window))}${w.exceeded ? ' · exceeded' : ''}</div>
-      <div class="label">
-        <span class="pct-val">${remaining.toFixed(1)}% remaining</span>
-        <span class="burn-val"><span class="burnlabel">burn/${burnLabel}</span> ${sessions} @ <b>${burnPct}</b></span>
-      </div>
       <div class="bar">
-        ${used > 0 ? `<div class="seg used" style="${usedStyle}"></div>` : ''}
-        ${projected > 0 ? `<div class="seg projected" style="${projStyle}"></div>` : ''}
         <div class="seg remain" style="${remainStyle}"></div>
-      </div>
-      <div class="meta">
-        <span>resets in <b>${countdown(w.resets_at)}</b></span>
-        <span>exhausted in <b>${w.depletes_at ? countdown(w.depletes_at) : '-'}</b></span>
+        ${used > 0 ? `<div class="seg used" style="${usedStyle}"></div>` : ''}
+        <div class="bar-copy">
+          <span class="bar-stat primary">${remaining.toFixed(1)}% lasts ${escapeHtml(exhaustedIn)}</span>
+          <span class="bar-stat">${burnPct}/${burnLabel}</span>
+          <span class="bar-stat active">${w.active_sessions || 0} active</span>
+          <span class="bar-stat keptalive">${w.keptalive_sessions || 0} keptalive</span>
+          <span class="bar-stat scheduled">${w.scheduled_sessions || 0} scheduled</span>
+          ${resetLabel ? `<span class="bar-stat reset">${escapeHtml(resetLabel)}</span>` : ''}
+          ${w.resets_at ? '<span class="reset-icon" title="Reset window">↻</span>' : ''}
+        </div>
       </div>
     </div>`;
 }

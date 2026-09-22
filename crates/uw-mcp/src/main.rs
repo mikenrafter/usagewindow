@@ -126,6 +126,8 @@ fn get_usage(args: &Value, deps: &Deps) -> Result<Value, String> {
                     // per-window session counts are HTTP-API-only (see uw-web::status).
                     burn_rate_pct_per_hour: None,
                     active_sessions: 0,
+                    keptalive_sessions: 0,
+                    scheduled_sessions: 0,
                     depletes_at: None,
                 })
                 .collect(),

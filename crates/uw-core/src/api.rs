@@ -24,6 +24,8 @@ pub struct UsageWindowSummary {
     pub exceeded: bool,
     pub burn_rate_pct_per_hour: Option<f32>,
     pub active_sessions: u32,
+    pub keptalive_sessions: u32,
+    pub scheduled_sessions: u32,
     pub depletes_at: Option<DateTime<Utc>>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,6 +183,8 @@ mod tests {
                     exceeded: false,
                     burn_rate_pct_per_hour: Some(1.5),
                     active_sessions: 2,
+                    keptalive_sessions: 1,
+                    scheduled_sessions: 0,
                     depletes_at: None,
                 }],
             }],

@@ -88,7 +88,9 @@ impl HarnessAdapter for FallbackCompactionAdapter {
         self.native.provider()
     }
     fn capabilities(&self) -> Capabilities {
-        self.native.capabilities()
+        let mut capabilities = self.native.capabilities();
+        capabilities.can_trigger_compaction |= self.meta.capabilities().can_trigger_compaction;
+        capabilities
     }
     async fn fetch_usage(&self, account: Option<&AccountId>) -> AdapterResult<UsageSample> {
         self.native.fetch_usage(account).await
@@ -119,6 +121,7 @@ impl HarnessAdapter for FallbackCompactionAdapter {
         request: &CompactionRequest,
     ) -> AdapterResult<DeliveryOutcome> {
         match self.native.compact(session, request).await {
+            Ok(DeliveryOutcome::Unsupported) => self.meta.compact(session, request).await,
             Ok(outcome) => Ok(outcome),
             Err(native_error) => self.meta.compact(session, request).await.map_err(|meta_error| {
                 AdapterError::Other(format!("native compaction failed: {native_error}; meta-harness fallback failed: {meta_error}"))
@@ -159,6 +162,7 @@ mod tests {
 
     #[derive(Clone)]
     struct Fake {
+        can_trigger_compaction: bool,
         compact_result: Arc<Mutex<Option<AdapterResult<DeliveryOutcome>>>>,
         compact_calls: Arc<Mutex<u32>>,
     }
@@ -170,7 +174,7 @@ mod tests {
         }
         fn capabilities(&self) -> Capabilities {
             Capabilities {
-                can_trigger_compaction: true,
+                can_trigger_compaction: self.can_trigger_compaction,
                 can_advise_mid_turn: false,
                 can_inject_at_session_start: false,
                 can_observe_compaction: false,
@@ -254,12 +258,14 @@ mod tests {
     #[tokio::test]
     async fn tries_meta_harness_only_after_native_compaction_fails() {
         let native = Fake {
+            can_trigger_compaction: true,
             compact_result: Arc::new(Mutex::new(Some(Err(AdapterError::Transient(
                 "offline".into(),
             ))))),
             compact_calls: Arc::new(Mutex::new(0)),
         };
         let meta = Fake {
+            can_trigger_compaction: true,
             compact_result: Arc::new(Mutex::new(Some(Ok(DeliveryOutcome::Delivered)))),
             compact_calls: Arc::new(Mutex::new(0)),
         };
@@ -277,10 +283,12 @@ mod tests {
     #[tokio::test]
     async fn does_not_use_meta_harness_after_native_success() {
         let native = Fake {
+            can_trigger_compaction: true,
             compact_result: Arc::new(Mutex::new(Some(Ok(DeliveryOutcome::Delivered)))),
             compact_calls: Arc::new(Mutex::new(0)),
         };
         let meta = Fake {
+            can_trigger_compaction: true,
             compact_result: Arc::new(Mutex::new(Some(Ok(DeliveryOutcome::Delivered)))),
             compact_calls: Arc::new(Mutex::new(0)),
         };
@@ -294,10 +302,12 @@ mod tests {
     #[tokio::test]
     async fn fallback_preserves_the_native_stop_detection_limitation() {
         let native = Fake {
+            can_trigger_compaction: true,
             compact_result: Arc::new(Mutex::new(None)),
             compact_calls: Arc::new(Mutex::new(0)),
         };
         let meta = Fake {
+            can_trigger_compaction: true,
             compact_result: Arc::new(Mutex::new(None)),
             compact_calls: Arc::new(Mutex::new(0)),
         };
@@ -307,5 +317,29 @@ mod tests {
             adapter.detect_stop(&session().id).await,
             Err(AdapterError::Unsupported)
         ));
+    }
+
+    #[tokio::test]
+    async fn tries_meta_harness_when_native_reports_unsupported() {
+        let native = Fake {
+            can_trigger_compaction: false,
+            compact_result: Arc::new(Mutex::new(Some(Ok(DeliveryOutcome::Unsupported)))),
+            compact_calls: Arc::new(Mutex::new(0)),
+        };
+        let meta = Fake {
+            can_trigger_compaction: true,
+            compact_result: Arc::new(Mutex::new(Some(Ok(DeliveryOutcome::Delivered)))),
+            compact_calls: Arc::new(Mutex::new(0)),
+        };
+        let adapter =
+            FallbackCompactionAdapter::new(Arc::new(native.clone()), Arc::new(meta.clone()));
+
+        assert_eq!(
+            adapter.compact(&session(), &request()).await.unwrap(),
+            DeliveryOutcome::Delivered
+        );
+        assert!(adapter.capabilities().can_trigger_compaction);
+        assert_eq!(*native.compact_calls.lock().unwrap(), 1);
+        assert_eq!(*meta.compact_calls.lock().unwrap(), 1);
     }
 }
