@@ -1158,6 +1158,10 @@ pub async fn run_policy_tick(
     let mut token_rates = HashMap::new();
     let mut token_records = HashMap::new();
     for session in sessions {
+        let burn_lookback = uw_policy::burn_rate_lookback(&session.harness);
+        if !should_collect_token_burn_rate(session, burn_lookback) {
+            continue;
+        }
         let records = store.token_usage(&session.id).await?;
         token_records.insert(session.id.clone(), records.clone());
         let activity_weight = if is_cache_warm(session.last_seen, now) {
@@ -1168,7 +1172,7 @@ pub async fn run_policy_tick(
         if let Some(rate) = uw_policy::weighted_token_rate_per_minute(
             &records,
             now,
-            uw_policy::burn_rate_lookback(&session.harness),
+            burn_lookback,
             Duration::minutes(5),
             1.2,
             activity_weight,
@@ -1580,6 +1584,10 @@ async fn reconcile_resume_marker_with_token_rates(
             Ok(true)
         }
     }
+}
+
+fn should_collect_token_burn_rate(session: &SessionSummary, burn_lookback: Duration) -> bool {
+    burn_lookback > Duration::hours(2) || session.stopped_reason.is_none()
 }
 
 fn scaled_token_burn_rate(
@@ -2589,6 +2597,24 @@ mod tests {
             .unwrap() as f64
             / 60.0;
         assert!((scaled - global * 2.0 / 2.3).abs() < 0.0001);
+    }
+
+    #[test]
+    fn stopped_sessions_only_join_long_burn_windows() {
+        let mut stopped = session();
+        stopped.stopped_reason = Some(StopReason::UserQuit);
+        assert!(!should_collect_token_burn_rate(
+            &stopped,
+            Duration::hours(2)
+        ));
+        assert!(should_collect_token_burn_rate(
+            &stopped,
+            Duration::hours(24)
+        ));
+        assert!(should_collect_token_burn_rate(
+            &session(),
+            Duration::hours(2)
+        ));
     }
 
     #[test]
