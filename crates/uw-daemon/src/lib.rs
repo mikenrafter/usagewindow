@@ -353,6 +353,14 @@ pub trait ObservationStore: Send + Sync {
     async fn tracked_sessions(&self) -> anyhow::Result<Vec<SessionSummary>>;
     async fn record_usage(&self, sample: UsageSample) -> anyhow::Result<()>;
     async fn record_stop(&self, id: &SessionId, reason: StopReason) -> anyhow::Result<()>;
+    async fn supersede_stop(
+        &self,
+        _id: &SessionId,
+        _note: Option<&str>,
+        _at: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn last_hook_event(&self, id: &SessionId) -> anyhow::Result<Option<String>>;
     /// Registers a session the adapter found on disk but that usagewindow has never
     /// seen via a hook. A no-op if the session is already tracked.
@@ -635,6 +643,20 @@ impl ObservationStore for SqliteDaemonStore {
         self.blocking(move |store| Ok(store.update_session_stop(&id, Some(&reason))?))
             .await
     }
+    async fn supersede_stop(
+        &self,
+        id: &SessionId,
+        note: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let id = id.clone();
+        let note = note.map(str::to_owned);
+        self.blocking(move |store| {
+            store.supersede_stop_reason(&id, note.as_deref(), at)?;
+            Ok(())
+        })
+        .await
+    }
     async fn last_hook_event(&self, id: &SessionId) -> anyhow::Result<Option<String>> {
         let id = id.clone();
         self.blocking(move |store| Ok(store.latest_hook_event(&id)?))
@@ -793,7 +815,24 @@ pub async fn run_observation_tick(
                 store.record_stop(&session.id, reason).await?;
                 report.stops_recorded += 1;
             }
-            Ok(_) => {}
+            Ok(None) => {
+                if let Some(sample) = fetched_samples.get(&session.harness)
+                    && let Some(StopReason::UsageLimit { window }) = session.stopped_reason.as_ref()
+                    && sample
+                        .windows
+                        .get(window)
+                        .is_some_and(|state| !state.exceeded && state.pct < 100.0)
+                {
+                    store
+                        .supersede_stop(
+                            &session.id,
+                            Some("provider window recovered"),
+                            Utc::now(),
+                        )
+                        .await?;
+                }
+            }
+            Ok(Some(_)) => {}
             Err(error) => {
                 report.adapter_errors += 1;
                 tracing::warn!(session = %session.id.0, %error, "stop detection failed");
@@ -3215,6 +3254,7 @@ mod tests {
         sessions: Vec<SessionSummary>,
         samples: StdMutex<Vec<UsageSample>>,
         stops: StdMutex<Vec<(SessionId, StopReason)>>,
+        superseded: StdMutex<Vec<SessionId>>,
         last_hook_event: Option<String>,
     }
 
@@ -3229,6 +3269,15 @@ mod tests {
         }
         async fn record_stop(&self, id: &SessionId, reason: StopReason) -> anyhow::Result<()> {
             self.stops.lock().unwrap().push((id.clone(), reason));
+            Ok(())
+        }
+        async fn supersede_stop(
+            &self,
+            id: &SessionId,
+            _: Option<&str>,
+            _: DateTime<Utc>,
+        ) -> anyhow::Result<()> {
+            self.superseded.lock().unwrap().push(id.clone());
             Ok(())
         }
         async fn last_hook_event(&self, _: &SessionId) -> anyhow::Result<Option<String>> {
@@ -3399,6 +3448,7 @@ mod tests {
             }],
             samples: StdMutex::new(vec![]),
             stops: StdMutex::new(vec![]),
+            superseded: StdMutex::new(vec![]),
             last_hook_event: Some("SessionEnd".into()),
         };
         let adapter = Arc::new(ObservationAdapter {
@@ -3429,6 +3479,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observation_tick_supersedes_a_usage_limit_when_that_window_recovers() {
+        let now = Utc::now();
+        let key = WindowKey {
+            provider: Provider::ClaudeCode,
+            kind: WindowKind::Rolling { minutes: 300 },
+        };
+        let mut stopped = SessionSummary {
+            harness: Provider::ClaudeCode,
+            ..session()
+        };
+        stopped.stopped_reason = Some(StopReason::UsageLimit {
+            window: key.clone(),
+        });
+        let store = ObservationFake {
+            sessions: vec![stopped],
+            samples: StdMutex::new(vec![]),
+            stops: StdMutex::new(vec![]),
+            superseded: StdMutex::new(vec![]),
+            last_hook_event: None,
+        };
+        let adapter = Arc::new(ObservationAdapter {
+            sample: UsageSample {
+                at: now,
+                fetched_at: Some(now),
+                source: UsageSource::ProviderReported,
+                provider: Provider::ClaudeCode,
+                account: None,
+                plan: None,
+                windows: HashMap::from([(
+                    key,
+                    UsageWindowState::new(2.0, false, true, None, None),
+                )]),
+                credits: None,
+            },
+            stop: None,
+            has_error_marker: false,
+        });
+
+        run_observation_tick(
+            &store,
+            &HashMap::from([(Provider::ClaudeCode, adapter as Arc<dyn HarnessAdapter>)]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store.superseded.lock().unwrap().as_slice(),
+            &[SessionId("s".into())]
+        );
+    }
+
+    #[tokio::test]
     async fn observation_tick_does_not_stop_uncached_sessions_from_account_exceeded() {
         let key = WindowKey {
             provider: Provider::Codex,
@@ -3447,6 +3549,7 @@ mod tests {
             sessions: vec![cold, warm],
             samples: StdMutex::new(vec![]),
             stops: StdMutex::new(vec![]),
+            superseded: StdMutex::new(vec![]),
             last_hook_event: None,
         };
         let adapter = Arc::new(ObservationAdapter {
@@ -3502,6 +3605,7 @@ mod tests {
             sessions: vec![first, second],
             samples: StdMutex::new(vec![]),
             stops: StdMutex::new(vec![]),
+            superseded: StdMutex::new(vec![]),
             last_hook_event: None,
         };
         let provider_requests = Arc::new(AtomicUsize::new(0));
@@ -3556,6 +3660,7 @@ mod tests {
             }],
             samples: StdMutex::new(vec![]),
             stops: StdMutex::new(vec![]),
+            superseded: StdMutex::new(vec![]),
             last_hook_event: None,
         };
         let adapter = Arc::new(ObservationAdapter {
@@ -3611,6 +3716,7 @@ mod tests {
             }],
             samples: StdMutex::new(vec![]),
             stops: StdMutex::new(vec![]),
+            superseded: StdMutex::new(vec![]),
             last_hook_event: Some("PostToolUse".into()),
         };
         let adapter = Arc::new(ObservationAdapter {
@@ -3656,6 +3762,7 @@ mod tests {
             }],
             samples: StdMutex::new(vec![]),
             stops: StdMutex::new(vec![]),
+            superseded: StdMutex::new(vec![]),
             last_hook_event: Some("SessionEnd".into()),
         };
         let adapter = Arc::new(ObservationAdapter {
