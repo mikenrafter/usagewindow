@@ -21,6 +21,12 @@ pub enum T3CodeAuth {
 pub trait T3CodeTransport: Send + Sync {
     async fn post_dispatch(&self, payload: Value) -> AdapterResult<Value>;
     async fn post_interrupt(&self, payload: Value) -> AdapterResult<Value>;
+    /// Mutates T3Code's producer-owned external status overlay. `None` clears it.
+    async fn post_thread_status(
+        &self,
+        thread_id: &str,
+        status: Option<Value>,
+    ) -> AdapterResult<Value>;
     /// `GET /api/orchestration/threads/:thread_id`. Returns the raw response
     /// body; callers read `thread.session.status`/`lastError` out of it.
     async fn get_thread(&self, thread_id: &str) -> AdapterResult<Value>;
@@ -91,6 +97,19 @@ impl T3CodeTransport for T3CodeHttpTransport {
                 .json(&payload),
         );
         self.send(request, "interrupt").await
+    }
+
+    async fn post_thread_status(
+        &self,
+        thread_id: &str,
+        status: Option<Value>,
+    ) -> AdapterResult<Value> {
+        let request = self.authed(
+            self.client
+                .post(format!("{}/api/orchestration/threads/{thread_id}/status", self.base_url))
+                .json(&json!({ "status": status })),
+        );
+        self.send(request, "thread status").await
     }
 
     async fn get_thread(&self, thread_id: &str) -> AdapterResult<Value> {
@@ -194,6 +213,20 @@ impl T3CodeAdapter {
             Err(AdapterError::Other(_)) => Err(AdapterError::Unsupported),
             Err(error) => Err(error),
         }
+    }
+
+    /// Set or clear the producer-owned T3Code status overlay for this session.
+    /// Native session lifecycle state remains T3Code's responsibility.
+    pub async fn set_external_status(
+        &self,
+        session: &SessionSummary,
+        status: Option<Value>,
+    ) -> AdapterResult<()> {
+        let thread_id = self.owned_thread(session).await?;
+        self.transport
+            .post_thread_status(&thread_id.0, status)
+            .await
+            .map(|_| ())
     }
 
     pub fn capabilities_static() -> Capabilities {
@@ -408,6 +441,18 @@ mod tests {
             Ok(serde_json::json!({"sequence": 108563}))
         }
 
+        async fn post_thread_status(
+            &self,
+            thread_id: &str,
+            status: Option<Value>,
+        ) -> AdapterResult<Value> {
+            self.calls.lock().unwrap().push((
+                "thread_status".into(),
+                serde_json::json!({"threadId": thread_id, "status": status}),
+            ));
+            Ok(serde_json::json!({"sequence": 108564}))
+        }
+
         async fn get_thread(&self, thread_id: &str) -> AdapterResult<Value> {
             self.calls
                 .lock()
@@ -540,6 +585,40 @@ mod tests {
         let calls = transport.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "get_thread");
+    }
+
+    #[tokio::test]
+    async fn sets_and_clears_external_status_through_the_owned_t3_thread() {
+        let owned_thread = serde_json::json!({
+            "thread": {
+                "id": session().id.0,
+                "session": {"status": "stopped", "providerName": "claudeAgent"}
+            }
+        });
+        let transport = std::sync::Arc::new(FakeTransport::with_thread(owned_thread));
+        let adapter = T3CodeAdapter::new(transport.clone());
+        let status = serde_json::json!({
+            "source": "usagewindow",
+            "key": "paused",
+            "text": "Paused",
+            "icon": "pause",
+            "color": "slate",
+            "notifyUser": false,
+            "expiresAt": null,
+            "updatedAt": "2026-09-22T12:00:00.000Z"
+        });
+
+        adapter
+            .set_external_status(&session(), Some(status.clone()))
+            .await
+            .unwrap();
+        adapter.set_external_status(&session(), None).await.unwrap();
+
+        let calls = transport.calls.lock().unwrap();
+        assert_eq!(calls[1].0, "thread_status");
+        assert_eq!(calls[1].1["threadId"], session().id.0);
+        assert_eq!(calls[1].1["status"], status);
+        assert_eq!(calls[3].1["status"], Value::Null);
     }
 
     #[tokio::test]
