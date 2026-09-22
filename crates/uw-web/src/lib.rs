@@ -1697,7 +1697,7 @@ mod tests {
         assert!(html.contains("max context"));
         assert!(html.contains("recent context"));
         assert!(html.contains("repeated errors"));
-        assert!(html.contains("grid-template-columns: minmax(0, 1fr) auto auto"));
+        assert!(html.contains("grid-template-columns: 7rem minmax(0, 1fr) auto"));
         assert!(html.contains("session-label"));
     }
 
