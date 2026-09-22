@@ -689,6 +689,7 @@ mod tests {
             "color": "slate",
             "notifyUser": false,
             "expiresAt": null,
+            "clearsOn": "work",
             "updatedAt": "2026-09-22T12:00:00.000Z"
         });
 

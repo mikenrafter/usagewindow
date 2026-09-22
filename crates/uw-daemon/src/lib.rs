@@ -1020,9 +1020,10 @@ fn t3_external_status(
     icon: &str,
     color: &str,
     notify_user: bool,
-    expires_at: Option<DateTime<Utc>>,
+    lifecycle: (Option<DateTime<Utc>>, Option<&str>),
     now: DateTime<Utc>,
 ) -> serde_json::Value {
+    let (expires_at, clears_on) = lifecycle;
     serde_json::json!({
         "source": "usagewindow",
         "key": key,
@@ -1031,6 +1032,7 @@ fn t3_external_status(
         "color": color,
         "notifyUser": notify_user,
         "expiresAt": expires_at.map(t3_timestamp),
+        "clearsOn": clears_on,
         "updatedAt": t3_timestamp(now),
     })
 }
@@ -1079,7 +1081,7 @@ fn resolve_t3_external_status(
             "shrink",
             "amber",
             false,
-            None,
+            (None, None),
             now,
         ));
     }
@@ -1095,7 +1097,7 @@ fn resolve_t3_external_status(
             "clock",
             "indigo",
             true,
-            marker.resume_at,
+            (marker.resume_at, Some("work")),
             now,
         ));
     }
@@ -1113,13 +1115,19 @@ fn resolve_t3_external_status(
             "check",
             "emerald",
             false,
-            None,
+            (None, Some("work")),
             now,
         ));
     }
     if matches!(stopped_reason, Some(StopReason::UsageLimit { .. })) {
         return Some(t3_external_status(
-            "paused", "Paused", "pause", "slate", true, None, now,
+            "paused",
+            "Paused",
+            "pause",
+            "slate",
+            true,
+            (None, Some("work")),
+            now,
         ));
     }
     None
@@ -2651,6 +2659,7 @@ mod tests {
             scheduled["expiresAt"],
             at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
         );
+        assert_eq!(scheduled["clearsOn"], "work");
         let paused = resolve_t3_external_status(
             &[],
             &[],
@@ -2666,6 +2675,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(paused["key"], "paused");
+        assert_eq!(paused["clearsOn"], "work");
     }
 
     #[test]
@@ -2686,17 +2696,11 @@ mod tests {
             started_at: now - Duration::seconds(1),
             completed_at: Some(now),
         };
-        let status = resolve_t3_external_status(
-            &[compacted],
-            &[event],
-            None,
-            None,
-            now,
-            now,
-        )
-        .unwrap();
+        let status =
+            resolve_t3_external_status(&[compacted], &[event], None, None, now, now).unwrap();
         assert_eq!(status["key"], "compacted");
         assert_eq!(status["text"], "Compacted");
+        assert_eq!(status["clearsOn"], "work");
     }
 
     #[test]
