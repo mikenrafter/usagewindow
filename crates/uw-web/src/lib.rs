@@ -1150,10 +1150,14 @@ async fn actions_recent(
         .min(MAX_COMPACTIONS_LIMIT);
     Ok(Json(
         read(state, move |store| {
+            let cutoff = Utc::now() - Duration::hours(24);
             let mut actions = Vec::new();
             for session in store.list_sessions()? {
                 for request in store.compaction_requests_for_session(&session.id)? {
                     let (status, error) = compact_action_status(&request.status);
+                    if request.created_at < cutoff {
+                        continue;
+                    }
                     actions.push(RecentAction {
                         session_id: session.id.clone(),
                         kind: "compaction".into(),
@@ -1164,6 +1168,9 @@ async fn actions_recent(
                     });
                 }
                 for event in store.compaction_events_for_session(&session.id)? {
+                    if event.started_at < cutoff {
+                        continue;
+                    }
                     actions.push(RecentAction {
                         session_id: session.id.clone(),
                         kind: "compaction".into(),
@@ -1179,6 +1186,9 @@ async fn actions_recent(
                 }
                 for marker in store.resume_markers_for_session(&session.id)? {
                     let (status, error) = resume_status(&marker.status);
+                    if marker.created_at < cutoff {
+                        continue;
+                    }
                     actions.push(RecentAction {
                         session_id: session.id.clone(),
                         kind: "resume".into(),
@@ -1191,6 +1201,9 @@ async fn actions_recent(
                 if let Ok(keepalive) = store.keepalive_config(&session.id)
                     && keepalive.enabled
                 {
+                    if keepalive.last_ping_at.unwrap_or(session.last_seen) < cutoff {
+                        continue;
+                    }
                     actions.push(RecentAction {
                         session_id: session.id.clone(),
                         kind: "keepalive".into(),
@@ -2318,6 +2331,44 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].kind, "compaction");
         assert_eq!(actions[0].status, "in progress");
+    }
+
+    #[tokio::test]
+    async fn recent_actions_excludes_entries_older_than_24_hours() {
+        let store = Store::open_memory().unwrap();
+        store.insert_session(&session()).unwrap();
+        let now = Utc::now();
+        for (id, created_at) in [
+            (uuid::Uuid::new_v4(), now - Duration::hours(25)),
+            (uuid::Uuid::new_v4(), now - Duration::hours(1)),
+        ] {
+            store
+                .insert_compaction_request(&CompactionRequest {
+                    id,
+                    session_id: SessionId("session-1".into()),
+                    kind: CompactionKind::AgentRequested,
+                    prompt: "compact".into(),
+                    reason: "test".into(),
+                    status: CompactionStatus::Sent,
+                    created_at,
+                })
+                .unwrap();
+        }
+
+        let response = app(store)
+            .oneshot(
+                Request::get("/api/actions/recent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let actions: Vec<RecentAction> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].at >= now - Duration::hours(24));
     }
 
     #[tokio::test]

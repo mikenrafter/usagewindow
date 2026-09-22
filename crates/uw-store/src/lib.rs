@@ -82,10 +82,63 @@ impl Store {
                 return Err(err.into());
             }
         }
+        self.reconcile_obsolete_usage_windows()?;
         Ok(())
+    }
+
+    /// Removes window identities that no longer occur in the latest complete
+    /// provider snapshot for an account. This keeps old plan/window metadata
+    /// from surviving an upgrade or plan change without deleting history for
+    /// identities that are still current.
+    fn reconcile_obsolete_usage_windows(&self) -> StoreResult<usize> {
+        let provider_reported = json(&UsageSource::ProviderReported)?;
+        Ok(self.connection.execute(
+            "DELETE FROM usage_samples AS old WHERE old.source=?1 AND NOT EXISTS (SELECT 1 FROM usage_samples AS latest WHERE latest.provider=old.provider AND latest.account IS old.account AND latest.window_kind=old.window_kind AND latest.window_scope_value=old.window_scope_value AND latest.source=?1 AND latest.at=(SELECT MAX(candidate.at) FROM usage_samples AS candidate WHERE candidate.provider=old.provider AND candidate.account IS old.account AND candidate.source=?1))",
+            [provider_reported],
+        )?)
     }
     pub fn insert_usage_sample(&self, s: &UsageSample) -> StoreResult<i64> {
         let tx = self.connection.unchecked_transaction()?;
+        // A provider usage response is a complete snapshot of that provider's
+        // windows. Remove window identities left behind by an older plan or
+        // provider response before inserting the new snapshot. This is an
+        // online data migration: existing databases converge on the next
+        // successful fetch and need no manual cleanup step.
+        let current_keys: Vec<(String, String)> = s
+            .windows
+            .keys()
+            .map(|key| {
+                let (kind, value) = encode_kind(&key.kind);
+                (kind.to_owned(), value)
+            })
+            .collect();
+        let latest_at: Option<DateTime<Utc>> = tx.query_row(
+            "SELECT MAX(at) FROM usage_samples WHERE provider=?1 AND account IS ?2",
+            params![json(&s.provider)?, opt_json(&s.account)?],
+            |row| row.get(0),
+        )?;
+        let is_newer_snapshot = latest_at.is_none_or(|latest| s.at > latest);
+        if is_newer_snapshot
+            && !current_keys.is_empty()
+            && matches!(s.source, UsageSource::ProviderReported)
+        {
+            let mut stale = tx.prepare(
+                "SELECT DISTINCT window_kind,window_scope_value FROM usage_samples WHERE provider=?1 AND account IS ?2",
+            )?;
+            let existing = stale.query_map(
+                params![json(&s.provider)?, opt_json(&s.account)?],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            for key in existing {
+                let key = key?;
+                if !current_keys.contains(&key) {
+                    tx.execute(
+                        "DELETE FROM usage_samples WHERE provider=?1 AND account IS ?2 AND window_kind=?3 AND window_scope_value=?4",
+                        params![json(&s.provider)?, opt_json(&s.account)?, key.0, key.1],
+                    )?;
+                }
+            }
+        }
         let mut id = 0;
         for (k, w) in &s.windows {
             let (kind, val) = encode_kind(&k.kind);
@@ -1222,6 +1275,47 @@ mod tests {
         };
         let id = s.insert_usage_sample(&sample).unwrap();
         assert_eq!(s.read_usage_sample(id).unwrap(), sample);
+    }
+
+    #[test]
+    fn new_provider_snapshot_removes_obsolete_window_identities() {
+        let s = Store::open_memory().unwrap();
+        let at = Utc::now();
+        let old = UsageSample {
+            at,
+            fetched_at: None,
+            source: UsageSource::ProviderReported,
+            provider: Provider::Codex,
+            account: None,
+            plan: Some("old-plan".into()),
+            windows: HashMap::from([(
+                WindowKey {
+                    provider: Provider::Codex,
+                    kind: WindowKind::Rolling { minutes: 60 },
+                },
+                UsageWindowState::new(90., false, true, None, None),
+            )]),
+            credits: None,
+        };
+        s.insert_usage_sample(&old).unwrap();
+
+        let fresh = UsageSample {
+            at: at + Duration::minutes(1),
+            plan: Some("new-plan".into()),
+            windows: HashMap::from([(
+                WindowKey {
+                    provider: Provider::Codex,
+                    kind: WindowKind::Rolling { minutes: 300 },
+                },
+                UsageWindowState::new(12., false, true, None, None),
+            )]),
+            ..old.clone()
+        };
+        s.insert_usage_sample(&fresh).unwrap();
+
+        let samples = s.all_usage_samples().unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0], fresh);
     }
 
     #[test]
