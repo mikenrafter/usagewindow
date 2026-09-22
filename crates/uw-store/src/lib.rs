@@ -315,7 +315,7 @@ impl Store {
     }
     pub fn upsert_session(&self, s: &SessionSummary) -> StoreResult<()> {
         self.connection.execute(
-            "INSERT INTO sessions(id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,stopped_window_kind,superseded_by,reseeded_from) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET harness=excluded.harness,model=COALESCE(excluded.model,sessions.model),account=COALESCE(excluded.account,sessions.account),cwd=excluded.cwd,state_path=COALESCE(excluded.state_path,sessions.state_path),context_window_size=COALESCE(excluded.context_window_size,sessions.context_window_size),last_known_token_count=COALESCE(excluded.last_known_token_count,sessions.last_known_token_count),pid=COALESCE(excluded.pid,sessions.pid),last_seen=MAX(sessions.last_seen,excluded.last_seen)",
+            "INSERT INTO sessions(id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,stopped_window_kind,superseded_by,reseeded_from) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET harness=excluded.harness,model=COALESCE(excluded.model,sessions.model),account=COALESCE(excluded.account,sessions.account),cwd=excluded.cwd,state_path=COALESCE(excluded.state_path,sessions.state_path),context_window_size=CASE WHEN excluded.last_seen > sessions.last_seen THEN COALESCE(excluded.context_window_size,sessions.context_window_size) ELSE sessions.context_window_size END,last_known_token_count=CASE WHEN excluded.last_seen > sessions.last_seen THEN COALESCE(excluded.last_known_token_count,sessions.last_known_token_count) ELSE sessions.last_known_token_count END,pid=COALESCE(excluded.pid,sessions.pid),last_seen=MAX(sessions.last_seen,excluded.last_seen)",
             params![s.id.0,json(&s.harness)?,opt_json(&s.model)?,opt_json(&s.account)?,s.cwd,s.state_path,s.context_window_size.map(|x|x as i64),s.last_known_token_count.map(|x|x as i64),json(&s.launch_mode)?,s.pid.map(|x|x as i64),s.first_seen,s.last_seen,opt_json(&s.stopped_reason)?,Option::<String>::None,s.superseded_by.as_ref().map(|x|&x.0),s.reseeded_from.as_ref().map(|x|&x.0)],
         )?;
         Ok(())
@@ -1626,6 +1626,25 @@ mod tests {
         assert_eq!(updated.context_window_size, Some(200_000));
         assert_eq!(updated.stopped_reason, Some(StopReason::UserQuit));
         assert_eq!(updated.reseeded_from, original.reseeded_from);
+    }
+
+    #[test]
+    fn discovered_session_upsert_does_not_regress_newer_token_observation() {
+        let s = Store::open_memory().unwrap();
+        let id = SessionId("discovery-order".into());
+        let mut newest = session(&id);
+        newest.last_seen = Utc::now();
+        newest.last_known_token_count = Some(211_425);
+        s.insert_session(&newest).unwrap();
+
+        let mut stale = newest.clone();
+        stale.last_seen -= chrono::Duration::minutes(20);
+        stale.last_known_token_count = Some(51_322);
+        s.upsert_session(&stale).unwrap();
+
+        let updated = s.read_session(&id).unwrap();
+        assert_eq!(updated.last_seen, newest.last_seen);
+        assert_eq!(updated.last_known_token_count, Some(211_425));
     }
 
     #[test]
