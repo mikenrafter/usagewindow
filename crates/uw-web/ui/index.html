@@ -97,6 +97,7 @@
   .actionrow:last-child { border-bottom: none; }
   .actionrow .top { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.2rem; flex-wrap: wrap; }
   .actionrow .sid { font-weight: 600; }
+  .copy-session { font-size: 0.72rem; padding: 0.12rem 0.35rem; }
   .actionrow .meta { color: var(--muted); font-size: 0.78rem; display: flex; gap: 0.9rem; flex-wrap: wrap; }
   .actionrow { cursor: pointer; }
   .actionrow:hover { background: rgba(91,140,255,0.08); }
@@ -370,9 +371,33 @@ document.addEventListener('click', event => {
 });
 
 function sessionLabel(s) {
-  if (!s.title) return escapeHtml(s.id);
-  return `${escapeHtml(s.title)}<div class="sid-sub muted">${escapeHtml(s.id)}</div>`;
+  const id = copySessionButton(s.id);
+  if (!s.title) return `${escapeHtml(s.id)} ${id}`;
+  return `${escapeHtml(s.title)}<div class="sid-sub muted">${escapeHtml(s.id)} ${id}</div>`;
 }
+
+function copySessionButton(id) {
+  return `<button type="button" class="action copy-session" data-copy-session="${escapeHtml(id)}" title="Copy session ID">copy</button>`;
+}
+
+async function copySessionId(button) {
+  const id = button.dataset.copySession;
+  try {
+    await navigator.clipboard.writeText(id);
+    button.textContent = 'copied';
+  } catch (_) {
+    button.textContent = 'copy failed';
+  }
+  setTimeout(() => { button.textContent = 'copy'; }, 1200);
+}
+
+document.addEventListener('click', event => {
+  const button = event.target.closest('[data-copy-session]');
+  if (!button) return;
+  event.preventDefault();
+  event.stopPropagation();
+  copySessionId(button);
+}, true);
 
 function providerLabel(p) {
   if (typeof p === 'string') return ({ ClaudeCode: 'Claude', Codex: 'Codex', Cursor: 'Cursor' })[p] || p;
@@ -534,7 +559,7 @@ async function loadActions() {
       return `
         <div class="actionrow" data-id="${escapeHtml(e.session_id)}">
           <div class="top">
-            <span class="sid">${escapeHtml(e.session_id)}</span>
+            <span class="sid">${escapeHtml(e.session_id)} ${copySessionButton(e.session_id)}</span>
             <span class="pill">${escapeHtml(e.kind)}</span>
             <span class="pill ${e.status === 'failed' ? 'stopped' : e.status === 'active' || e.status === 'successful' || e.status === 'resumed' ? 'ok' : 'pending'}">${escapeHtml(e.status)}</span>
           </div>
@@ -615,7 +640,7 @@ async function selectSession(id) {
     ${d.title ? `<h3 class="detail-title">${escapeHtml(d.title)}</h3>` : ''}
     ${d.errors.length ? `<div class="errorbox"><h3>Errors</h3><ul>${d.errors.map(error => `<li>${escapeHtml(error)}</li>`).join('')}</ul></div>` : ''}
     <div class="kv">
-      <div class="k">id</div><div class="v">${escapeHtml(s.id)}</div>
+      <div class="k">id</div><div class="v">${escapeHtml(s.id)} ${copySessionButton(s.id)}</div>
       <div class="k">harness</div><div class="v">${escapeHtml(providerLabel(s.harness))}</div>
       <div class="k">model</div><div class="v">${escapeHtml(s.model)}</div>
       <div class="k">account</div><div class="v acct">${escapeHtml(s.account)}</div>

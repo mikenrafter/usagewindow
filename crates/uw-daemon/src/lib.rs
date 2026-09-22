@@ -285,6 +285,11 @@ pub trait DaemonStore: Send + Sync {
     async fn insert_resume_marker(&self, marker: ResumeMarker) -> anyhow::Result<()>;
     async fn set_resume_at(&self, id: uuid::Uuid, resume_at: DateTime<Utc>) -> anyhow::Result<()>;
     async fn due_resume_markers(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<ResumeMarker>>;
+    /// Move a due marker out past a provider window that is still exhausted.
+    /// The marker remains scheduled and can be reconsidered after the reset.
+    async fn defer_resume(&self, _id: uuid::Uuid, _resume_at: DateTime<Utc>) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn claim_resume_marker(&self, _id: uuid::Uuid) -> anyhow::Result<bool> {
         Ok(false)
     }
@@ -517,6 +522,10 @@ impl DaemonStore for SqliteDaemonStore {
     }
     async fn due_resume_markers(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<ResumeMarker>> {
         self.blocking(move |s| Ok(s.due_resume_markers(now)?)).await
+    }
+    async fn defer_resume(&self, id: uuid::Uuid, resume_at: DateTime<Utc>) -> anyhow::Result<()> {
+        self.blocking(move |s| Ok(s.defer_resume_marker(id, resume_at)?))
+            .await
     }
     async fn resume_owner(&self, id: &SessionId) -> anyhow::Result<SessionSummary> {
         let id = id.clone();
@@ -754,10 +763,7 @@ pub async fn run_observation_tick(
             Ok(None)
         } else {
             adapter
-                .detect_stop_with_usage(
-                    &session.id,
-                    fetched_samples.get(&session.harness),
-                )
+                .detect_stop_with_usage(&session.id, fetched_samples.get(&session.harness))
                 .await
         };
         match detected {
@@ -1048,7 +1054,10 @@ fn resolve_t3_external_status(
         ));
     }
     if let Some(marker) = resume.filter(|marker| {
-        matches!(marker.status, ResumeStatus::Pending | ResumeStatus::Scheduled)
+        matches!(
+            marker.status,
+            ResumeStatus::Pending | ResumeStatus::Scheduled
+        )
     }) {
         return Some(t3_external_status(
             "scheduled",
@@ -1062,13 +1071,7 @@ fn resolve_t3_external_status(
     }
     if matches!(stopped_reason, Some(StopReason::UsageLimit { .. })) {
         return Some(t3_external_status(
-            "paused",
-            "Paused",
-            "pause",
-            "slate",
-            true,
-            None,
-            now,
+            "paused", "Paused", "pause", "slate", true, None, now,
         ));
     }
     None
@@ -1084,7 +1087,8 @@ async fn sync_t3_external_status(
     let Some(t3code) = adapters.get(&Provider::Other("t3code".into())) else {
         return;
     };
-    let status = resolve_t3_external_status(compactions, resume, session.stopped_reason.as_ref(), now);
+    let status =
+        resolve_t3_external_status(compactions, resume, session.stopped_reason.as_ref(), now);
     if let Err(error) = t3code.set_external_status(session, status).await {
         tracing::debug!(session = %session.id.0, %error, "could not publish T3Code external status");
     }
@@ -1423,8 +1427,7 @@ pub async fn run_policy_tick(
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
                 if is_keepalive_eligible(session, records, now) {
-                    let mut effective_state =
-                        keepalive_store.keepalive_state(&session.id).await?;
+                    let mut effective_state = keepalive_store.keepalive_state(&session.id).await?;
                     effective_state.enabled = true;
                     if should_fire_keepalive(now, session, &effective_state, profile)
                         && matches!(
@@ -1913,20 +1916,30 @@ pub async fn run_resume_tick(
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     for marker in store.due_resume_markers(now).await? {
+        let session = store.resume_owner(&marker.session_id).await?;
+        if let Some(resume_at) = exhausted_window_resume_at(store, &session, now).await? {
+            store.defer_resume(marker.id, resume_at).await?;
+            tracing::info!(
+                session = %session.id.0,
+                %resume_at,
+                "deferring resume until exhausted provider window resets"
+            );
+            continue;
+        }
         if !store.claim_resume_marker(marker.id).await? {
             continue;
         }
-        let session = store.resume_owner(&marker.session_id).await?;
         let mut route_errors = Vec::new();
         let is_t3_session = matches!(&session.harness, Provider::Other(name) if name == "t3code");
 
         // T3Code is the owner-preserving meta-harness. Give it first refusal
         // for native sessions; Unsupported means it has no ownership mapping,
         // while a transport failure still gets a native fallback attempt.
-        if !is_t3_session
-            && let Some(meta) = adapters.get(&Provider::Other("t3code".into()))
-        {
-            match meta.resume_session(&session, marker.message.as_deref()).await {
+        if !is_t3_session && let Some(meta) = adapters.get(&Provider::Other("t3code".into())) {
+            match meta
+                .resume_session(&session, marker.message.as_deref())
+                .await
+            {
                 Ok(()) => {
                     store.update_resume(marker.id, ResumeStatus::Fired).await?;
                     continue;
@@ -1963,6 +1976,27 @@ pub async fn run_resume_tick(
             .await?;
     }
     Ok(())
+}
+
+async fn exhausted_window_resume_at(
+    store: &dyn DaemonStore,
+    session: &SessionSummary,
+    now: DateTime<Utc>,
+) -> anyhow::Result<Option<DateTime<Utc>>> {
+    let reset = store
+        .usage_samples(session)
+        .await?
+        .into_iter()
+        .flat_map(|sample| {
+            sample.windows.into_values().filter_map(|state| {
+                (state.exceeded || state.pct >= 95.0)
+                    .then_some(state.resets_at)
+                    .flatten()
+            })
+        })
+        .filter(|at| *at > now)
+        .max();
+    Ok(reset)
 }
 
 fn provider_label(provider: &Provider) -> String {
@@ -2376,11 +2410,8 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
         Err(std::env::VarError::NotPresent) => None,
         Err(error) => return Err(error.into()),
     };
-    let app = uw_web::app_with_shared_store_and_auth(
-        shared_store,
-        adapters.clone(),
-        web_password_hash,
-    )?;
+    let app =
+        uw_web::app_with_shared_store_and_auth(shared_store, adapters.clone(), web_password_hash)?;
     let address = std::env::var("UW_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".into());
     let listener = tokio::net::TcpListener::bind(address).await?;
     let server = async move { axum::serve(listener, app).await };
@@ -2926,7 +2957,13 @@ mod tests {
     #[test]
     fn race_plan_requires_claim_before_send() {
         assert_eq!(
-            plan_compaction_tick(&request(), &caps(true, false, false), true, &session(), true),
+            plan_compaction_tick(
+                &request(),
+                &caps(true, false, false),
+                true,
+                &session(),
+                true
+            ),
             CompactionPlan::ClaimAndSend
         );
     }
@@ -2934,7 +2971,13 @@ mod tests {
     #[test]
     fn opportunistic_idle_is_skipped_once_cache_is_cold() {
         assert_eq!(
-            plan_compaction_tick(&request(), &caps(true, false, false), true, &session(), false),
+            plan_compaction_tick(
+                &request(),
+                &caps(true, false, false),
+                true,
+                &session(),
+                false
+            ),
             CompactionPlan::SkipUnsupported(
                 "cache already cold; idle compact missed the warm window".into()
             )
@@ -3903,6 +3946,8 @@ mod tests {
         owner: SessionSummary,
         due: Vec<ResumeMarker>,
         claim: Arc<StdMutex<bool>>,
+        samples: Vec<UsageSample>,
+        deferred: StdMutex<Vec<(uuid::Uuid, DateTime<Utc>)>>,
     }
     #[async_trait]
     impl DaemonStore for ResumeFake {
@@ -3926,7 +3971,7 @@ mod tests {
             Ok(())
         }
         async fn usage_samples(&self, _: &SessionSummary) -> anyhow::Result<Vec<UsageSample>> {
-            Ok(vec![])
+            Ok(self.samples.clone())
         }
         async fn token_usage(&self, _: &SessionId) -> anyhow::Result<Vec<TokenUsageRecord>> {
             Ok(vec![])
@@ -3951,6 +3996,14 @@ mod tests {
         }
         async fn due_resume_markers(&self, _: DateTime<Utc>) -> anyhow::Result<Vec<ResumeMarker>> {
             Ok(self.due.clone())
+        }
+        async fn defer_resume(
+            &self,
+            id: uuid::Uuid,
+            resume_at: DateTime<Utc>,
+        ) -> anyhow::Result<()> {
+            self.deferred.lock().unwrap().push((id, resume_at));
+            Ok(())
         }
         async fn claim_resume_marker(&self, _: uuid::Uuid) -> anyhow::Result<bool> {
             Ok(std::mem::replace(&mut *self.claim.lock().unwrap(), false))
@@ -4008,6 +4061,8 @@ mod tests {
             owner: stopped.clone(),
             due: vec![],
             claim: Arc::new(StdMutex::new(false)),
+            samples: vec![],
+            deferred: StdMutex::new(vec![]),
         };
         assert!(
             !reconcile_resume_marker(
@@ -4024,6 +4079,51 @@ mod tests {
         );
         assert_eq!(*store.inserts.lock().unwrap(), 0);
         assert!(store.resolved.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn due_resume_waits_for_an_exhausted_provider_window() {
+        let now = Utc::now();
+        let (mut stopped, _) = near_limit_session_and_block();
+        let key = match stopped.stopped_reason.as_ref().unwrap() {
+            StopReason::UsageLimit { window } => window.clone(),
+            _ => unreachable!(),
+        };
+        let reset = now + Duration::hours(1);
+        let marker = due_resume_marker();
+        let marker_id = marker.id;
+        let calls = Arc::new(StdMutex::new(vec![]));
+        let store = ResumeFake {
+            active: None,
+            inserts: StdMutex::new(0),
+            resolved: StdMutex::new(vec![]),
+            statuses: StdMutex::new(vec![]),
+            owner: stopped.clone(),
+            due: vec![marker],
+            claim: Arc::new(StdMutex::new(true)),
+            samples: vec![UsageSample {
+                at: now,
+                fetched_at: Some(now),
+                source: UsageSource::ProviderReported,
+                provider: Provider::ClaudeCode,
+                account: None,
+                plan: None,
+                windows: HashMap::from([(
+                    key,
+                    UsageWindowState::new(96.0, false, true, Some(reset), None),
+                )]),
+                credits: None,
+            }],
+            deferred: StdMutex::new(vec![]),
+        };
+        stopped.stopped_reason = store.owner.stopped_reason.clone();
+        let adapters = resume_routing_adapters(Ok(()), Ok(()), calls.clone());
+
+        run_resume_tick(&store, &adapters, now).await.unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new());
+        assert_eq!(*store.deferred.lock().unwrap(), vec![(marker_id, reset)]);
+        assert!(store.statuses.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4060,6 +4160,8 @@ mod tests {
             owner: stopped.clone(),
             due: vec![],
             claim: Arc::new(StdMutex::new(false)),
+            samples: vec![],
+            deferred: StdMutex::new(vec![]),
         };
         assert!(
             reconcile_resume_marker(
@@ -4090,6 +4192,8 @@ mod tests {
             owner: stopped.clone(),
             due: vec![],
             claim: Arc::new(StdMutex::new(false)),
+            samples: vec![],
+            deferred: StdMutex::new(vec![]),
         };
         assert!(
             reconcile_resume_marker(
@@ -4131,6 +4235,8 @@ mod tests {
             owner: session(),
             due: vec![marker],
             claim: Arc::new(StdMutex::new(true)),
+            samples: vec![],
+            deferred: StdMutex::new(vec![]),
         });
         let adapter = Arc::new(FakeAdapter {
             capabilities: caps(true, false, false),
@@ -4237,6 +4343,8 @@ mod tests {
             owner: session(),
             due: vec![marker],
             claim: Arc::new(StdMutex::new(true)),
+            samples: vec![],
+            deferred: StdMutex::new(vec![]),
         }
     }
 
@@ -4661,11 +4769,7 @@ mod tests {
             *self.recorded_pings.lock().unwrap() += 1;
             Ok(())
         }
-        async fn set_keepalive_enabled(
-            &self,
-            _: &SessionId,
-            enabled: bool,
-        ) -> anyhow::Result<()> {
+        async fn set_keepalive_enabled(&self, _: &SessionId, enabled: bool) -> anyhow::Result<()> {
             self.keepalive.lock().unwrap().enabled = enabled;
             Ok(())
         }
@@ -4997,10 +5101,7 @@ mod tests {
             advised: StdMutex::new(vec![]),
             resume_calls: AtomicUsize::new(0),
         });
-        let adapters = HashMap::from([(
-            Provider::ClaudeCode,
-            adapter as Arc<dyn HarnessAdapter>,
-        )]);
+        let adapters = HashMap::from([(Provider::ClaudeCode, adapter as Arc<dyn HarnessAdapter>)]);
         let profiles = HashMap::from([(store.session.id.clone(), boundary_profile())]);
 
         run_policy_tick(
@@ -5031,10 +5132,7 @@ mod tests {
             advised: StdMutex::new(vec![]),
             resume_calls: AtomicUsize::new(0),
         });
-        let adapters = HashMap::from([(
-            Provider::ClaudeCode,
-            adapter as Arc<dyn HarnessAdapter>,
-        )]);
+        let adapters = HashMap::from([(Provider::ClaudeCode, adapter as Arc<dyn HarnessAdapter>)]);
         let profiles = HashMap::from([(store.session.id.clone(), boundary_profile())]);
 
         run_policy_tick(
@@ -5328,10 +5426,7 @@ mod tests {
         let now = Utc::now();
         let store = boundary_store(now, 92.0);
         store.keepalive.lock().unwrap().enabled = true;
-        let token_records = HashMap::from([(
-            store.session.id.clone(),
-            boundary_token_usage(now),
-        )]);
+        let token_records = HashMap::from([(store.session.id.clone(), boundary_token_usage(now))]);
         let sent = run_keepalive_tick(
             &store,
             &HashMap::from([(

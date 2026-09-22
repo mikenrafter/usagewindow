@@ -158,13 +158,16 @@ impl Store {
             params![json(&s.provider)?, &provider_reported],
             |row| row.get(0),
         )?;
-        let is_newer_provider_snapshot =
-            latest_provider_at.is_none_or(|latest| s.at > latest);
+        let is_newer_provider_snapshot = latest_provider_at.is_none_or(|latest| s.at > latest);
         if is_newer_provider_snapshot && matches!(s.source, UsageSource::ProviderReported) {
             tx.execute(
                 "DELETE FROM usage_samples
                  WHERE provider=?1 AND source=?2 AND NOT (account IS ?3)",
-                params![json(&s.provider)?, &provider_reported, opt_json(&s.account)?],
+                params![
+                    json(&s.provider)?,
+                    &provider_reported,
+                    opt_json(&s.account)?
+                ],
             )?;
         }
         // A provider usage response is a complete snapshot of that provider's
@@ -193,10 +196,10 @@ impl Store {
             let mut stale = tx.prepare(
                 "SELECT DISTINCT window_kind,window_scope_value FROM usage_samples WHERE provider=?1 AND account IS ?2",
             )?;
-            let existing = stale.query_map(
-                params![json(&s.provider)?, opt_json(&s.account)?],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )?;
+            let existing = stale
+                .query_map(params![json(&s.provider)?, opt_json(&s.account)?], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
             for key in existing {
                 let key = key?;
                 if !current_keys.contains(&key) {
@@ -432,6 +435,13 @@ impl Store {
         let rows = stmt.query_map([now], decode_resume_marker_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+    pub fn defer_resume_marker(&self, id: uuid::Uuid, resume_at: DateTime<Utc>) -> StoreResult<()> {
+        self.connection.execute(
+            "UPDATE resume_markers SET resume_at=?,status='scheduled',status_detail=NULL WHERE id=? AND status IN ('pending','scheduled')",
+            params![resume_at, id.to_string()],
+        )?;
+        Ok(())
+    }
     pub fn insert_session(&self, s: &SessionSummary) -> StoreResult<()> {
         self.connection.execute("INSERT INTO sessions(id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,stopped_window_kind,superseded_by,reseeded_from) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![s.id.0,json(&s.harness)?,opt_json(&s.model)?,opt_json(&s.account)?,s.cwd,s.state_path,s.context_window_size.map(|x|x as i64),s.last_known_token_count.map(|x|x as i64),json(&s.launch_mode)?,s.pid.map(|x|x as i64),s.first_seen,s.last_seen,opt_json(&s.stopped_reason)?,Option::<String>::None,s.superseded_by.as_ref().map(|x|&x.0),s.reseeded_from.as_ref().map(|x|&x.0)])?;
         Ok(())
@@ -510,11 +520,7 @@ impl Store {
         )?;
         Ok(())
     }
-    pub fn set_session_last_seen_missing(
-        &self,
-        id: &SessionId,
-        missing: bool,
-    ) -> StoreResult<()> {
+    pub fn set_session_last_seen_missing(&self, id: &SessionId, missing: bool) -> StoreResult<()> {
         self.connection.execute(
             "UPDATE sessions SET last_seen_missing=? WHERE id=?",
             params![missing, id.0],
@@ -921,7 +927,15 @@ impl Store {
             ))
         })?;
         rows.map(|row| {
-            let (provider, account, last_attempt_at, last_success_at, last_error, failures, non_blocking) = row?;
+            let (
+                provider,
+                account,
+                last_attempt_at,
+                last_success_at,
+                last_error,
+                failures,
+                non_blocking,
+            ) = row?;
             Ok(ProviderFetchStatus {
                 provider: serde_json::from_str(&provider)?,
                 account: account.map(|x| serde_json::from_str(&x)).transpose()?,
@@ -1967,12 +1981,19 @@ mod tests {
 
     #[test]
     fn read_only_open_does_not_run_schema_or_allow_writes() {
-        let path = std::env::temp_dir().join(format!("usagewindow-read-only-{}.sqlite", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!(
+            "usagewindow-read-only-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
         let writable = Store::open(path.to_str().unwrap()).unwrap();
         drop(writable);
 
         let read_only = Store::open_read_only(path.to_str().unwrap()).unwrap();
-        assert!(read_only.insert_session(&session(&SessionId("read-only".into()))).is_err());
+        assert!(
+            read_only
+                .insert_session(&session(&SessionId("read-only".into())))
+                .is_err()
+        );
         drop(read_only);
         std::fs::remove_file(path).unwrap();
     }
