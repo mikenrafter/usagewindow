@@ -257,6 +257,8 @@ pub struct CompactionRequest {
     pub kind: CompactionKind,
     pub prompt: String,
     pub reason: String,
+    #[serde(default)]
+    pub resume_after_compaction: bool,
     pub status: CompactionStatus,
     pub created_at: DateTime<Utc>,
 }

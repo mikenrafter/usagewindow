@@ -280,7 +280,11 @@ pub fn execute<A: ApiClient, D: DirectReader>(
         } => serde_json::to_value(
             client
                 .api
-                .compact_ask(CompactAskRequest { session_id, reason })?,
+                .compact_ask(CompactAskRequest {
+                    session_id,
+                    reason,
+                    resume_after_compaction: false,
+                })?,
         )?,
         Command::Compact {
             command: CompactCommand::Cancel { session_id },

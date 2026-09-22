@@ -318,6 +318,9 @@ pub trait DaemonStore: Send + Sync {
     ) -> anyhow::Result<Vec<CompactionEvent>> {
         Ok(Vec::new())
     }
+    async fn mark_compaction_resume_queued(&self, _id: uuid::Uuid) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -557,6 +560,10 @@ impl DaemonStore for SqliteDaemonStore {
     ) -> anyhow::Result<Vec<CompactionEvent>> {
         let id = id.clone();
         self.blocking(move |s| Ok(s.compaction_events_for_session(&id)?))
+            .await
+    }
+    async fn mark_compaction_resume_queued(&self, id: uuid::Uuid) -> anyhow::Result<()> {
+        self.blocking(move |s| Ok(s.mark_compaction_resume_queued(id)?))
             .await
     }
 }
@@ -972,6 +979,7 @@ where
             kind: CompactionKind::AltModelReseed,
             prompt: String::new(),
             reason: "automatic idle reseed".into(),
+            resume_after_compaction: false,
             status: CompactionStatus::Pending,
             created_at: now,
         };
@@ -1031,10 +1039,32 @@ fn t3_timestamp(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+fn verified_resume_requested_compaction(
+    requests: &[CompactionRequest],
+    events: &[CompactionEvent],
+) -> Option<uuid::Uuid> {
+    requests.iter().find_map(|request| {
+        if request.resume_after_compaction
+            && matches!(request.status, CompactionStatus::Sent)
+            && events.iter().any(|event| {
+                event.completed_at.is_some()
+                    && event.started_at >= request.created_at
+                    && event.session_id == request.session_id
+            })
+        {
+            Some(request.id)
+        } else {
+            None
+        }
+    })
+}
+
 fn resolve_t3_external_status(
     compactions: &[CompactionRequest],
+    events: &[CompactionEvent],
     resume: Option<&ResumeMarker>,
     stopped_reason: Option<&StopReason>,
+    last_seen: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Option<serde_json::Value> {
     if compactions.iter().any(|request| {
@@ -1069,6 +1099,24 @@ fn resolve_t3_external_status(
             now,
         ));
     }
+    if compactions.iter().any(|request| {
+        matches!(request.status, CompactionStatus::Sent)
+            && events.iter().any(|event| {
+                event.completed_at.is_some_and(|completed_at| {
+                    completed_at >= last_seen && event.started_at >= request.created_at
+                })
+            })
+    }) {
+        return Some(t3_external_status(
+            "compacted",
+            "Compacted",
+            "check",
+            "emerald",
+            false,
+            None,
+            now,
+        ));
+    }
     if matches!(stopped_reason, Some(StopReason::UsageLimit { .. })) {
         return Some(t3_external_status(
             "paused", "Paused", "pause", "slate", true, None, now,
@@ -1081,14 +1129,21 @@ async fn sync_t3_external_status(
     adapters: &HashMap<Provider, Arc<dyn HarnessAdapter>>,
     session: &SessionSummary,
     compactions: &[CompactionRequest],
+    events: &[CompactionEvent],
     resume: Option<&ResumeMarker>,
     now: DateTime<Utc>,
 ) {
     let Some(t3code) = adapters.get(&Provider::Other("t3code".into())) else {
         return;
     };
-    let status =
-        resolve_t3_external_status(compactions, resume, session.stopped_reason.as_ref(), now);
+    let status = resolve_t3_external_status(
+        compactions,
+        events,
+        resume,
+        session.stopped_reason.as_ref(),
+        session.last_seen,
+        now,
+    );
     if let Err(error) = t3code.set_external_status(session, status).await {
         tracing::debug!(session = %session.id.0, %error, "could not publish T3Code external status");
     }
@@ -1514,8 +1569,34 @@ pub async fn run_policy_tick(
                 .await?;
         }
         let compactions = store.compaction_requests_for_session(&session.id).await?;
+        let events = store.compaction_events_for_session(&session.id).await?;
+        if let Some(compaction_id) = verified_resume_requested_compaction(&compactions, &events)
+            && store.active_resume_marker(&session.id).await?.is_none()
+        {
+            store
+                .insert_resume_marker(ResumeMarker {
+                    id: uuid::Uuid::new_v4(),
+                    session_id: session.id.clone(),
+                    reason: ResumeReason::ManuallyMarked,
+                    resume_at: None,
+                    requested_at: None,
+                    created_at: now,
+                    status: ResumeStatus::Pending,
+                    message: Some("resume after requested compaction".into()),
+                })
+                .await?;
+            store.mark_compaction_resume_queued(compaction_id).await?;
+        }
         let resume = store.active_resume_marker(&session.id).await?;
-        sync_t3_external_status(adapters, session, &compactions, resume.as_ref(), now).await;
+        sync_t3_external_status(
+            adapters,
+            session,
+            &compactions,
+            &events,
+            resume.as_ref(),
+            now,
+        )
+        .await;
     }
     run_keepalive_tick(keepalive_store, adapters, now, profiles, &token_records).await?;
     Ok(())
@@ -1563,6 +1644,7 @@ impl IdleEpisodeTracker {
                     kind: CompactionKind::OpportunisticIdle,
                     prompt: uw_core::compaction::instruction_body("idle cache expiry"),
                     reason: "idle cache expiry".into(),
+                    resume_after_compaction: false,
                     status: CompactionStatus::Pending,
                     created_at: Utc::now(),
                 })
@@ -1654,6 +1736,7 @@ async fn handle_hard_boundary(
                     kind: CompactionKind::AgentRequested,
                     prompt: uw_core::compaction::instruction_body(HARD_BOUNDARY_REASON),
                     reason: HARD_BOUNDARY_REASON.into(),
+                    resume_after_compaction: true,
                     status: CompactionStatus::Pending,
                     created_at: now,
                 })
@@ -2499,6 +2582,7 @@ mod tests {
             kind: CompactionKind::OpportunisticIdle,
             prompt: "p".into(),
             reason: "r".into(),
+            resume_after_compaction: false,
             status: CompactionStatus::Pending,
             created_at: Utc::now(),
         }
@@ -2531,6 +2615,7 @@ mod tests {
         };
         let status = resolve_t3_external_status(
             &[compact],
+            &[],
             Some(&marker),
             Some(&StopReason::UsageLimit {
                 window: WindowKey {
@@ -2538,6 +2623,7 @@ mod tests {
                     kind: WindowKind::Custom("quota".into()),
                 },
             }),
+            Utc::now(),
             Utc::now(),
         )
         .unwrap();
@@ -2557,13 +2643,16 @@ mod tests {
             status: ResumeStatus::Scheduled,
             message: None,
         };
-        let scheduled = resolve_t3_external_status(&[], Some(&marker), None, Utc::now()).unwrap();
+        let scheduled =
+            resolve_t3_external_status(&[], &[], Some(&marker), None, Utc::now(), Utc::now())
+                .unwrap();
         assert_eq!(scheduled["key"], "scheduled");
         assert_eq!(
             scheduled["expiresAt"],
             at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
         );
         let paused = resolve_t3_external_status(
+            &[],
             &[],
             None,
             Some(&StopReason::UsageLimit {
@@ -2573,9 +2662,76 @@ mod tests {
                 },
             }),
             Utc::now(),
+            Utc::now(),
         )
         .unwrap();
         assert_eq!(paused["key"], "paused");
+    }
+
+    #[test]
+    fn external_status_reports_completed_compaction() {
+        let mut compacted = request();
+        compacted.status = CompactionStatus::Sent;
+        let now = Utc::now();
+        compacted.created_at = now - Duration::seconds(2);
+        let event = CompactionEvent {
+            id: uuid::Uuid::new_v4(),
+            session_id: SessionId("s".into()),
+            source: CompactionSource::Inline,
+            trigger: None,
+            context_pct_before: None,
+            usage_window_pct_before: None,
+            tokens_before: None,
+            tokens_after: None,
+            started_at: now - Duration::seconds(1),
+            completed_at: Some(now),
+        };
+        let status = resolve_t3_external_status(
+            &[compacted],
+            &[event],
+            None,
+            None,
+            now,
+            now,
+        )
+        .unwrap();
+        assert_eq!(status["key"], "compacted");
+        assert_eq!(status["text"], "Compacted");
+    }
+
+    #[test]
+    fn only_opted_in_compactions_queue_a_resume_after_verification() {
+        let now = Utc::now();
+        let mut request = request();
+        request.status = CompactionStatus::Sent;
+        request.created_at = now - Duration::seconds(2);
+        let event = CompactionEvent {
+            id: uuid::Uuid::new_v4(),
+            session_id: request.session_id.clone(),
+            source: CompactionSource::Inline,
+            trigger: None,
+            context_pct_before: None,
+            usage_window_pct_before: None,
+            tokens_before: None,
+            tokens_after: None,
+            started_at: now - Duration::seconds(1),
+            completed_at: Some(now),
+        };
+        assert_eq!(
+            verified_resume_requested_compaction(
+                std::slice::from_ref(&request),
+                std::slice::from_ref(&event),
+            ),
+            None
+        );
+        request.resume_after_compaction = true;
+        assert_eq!(
+            verified_resume_requested_compaction(
+                std::slice::from_ref(&request),
+                std::slice::from_ref(&event),
+            ),
+            Some(request.id)
+        );
     }
 
     #[test]
@@ -2597,7 +2753,7 @@ mod tests {
             message: None,
         };
 
-        let status = resolve_t3_external_status(&[], Some(&marker), None, now).unwrap();
+        let status = resolve_t3_external_status(&[], &[], Some(&marker), None, now, now).unwrap();
 
         assert_eq!(status["updatedAt"], "2026-09-22T11:23:40.037Z");
         assert_eq!(status["expiresAt"], "2026-09-22T12:23:40.123Z");
@@ -5201,6 +5357,7 @@ mod tests {
                 kind: CompactionKind::AgentRequested,
                 prompt: "compact before reset".into(),
                 reason: "hard quota boundary".into(),
+                resume_after_compaction: true,
                 status: CompactionStatus::Failed("delivery failed".into()),
                 created_at: now - Duration::minutes(2),
             })

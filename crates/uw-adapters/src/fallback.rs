@@ -220,6 +220,7 @@ mod tests {
             kind: CompactionKind::AgentRequested,
             prompt: "/compact".into(),
             reason: "test".into(),
+            resume_after_compaction: false,
             status: CompactionStatus::Sending,
             created_at: now,
         }

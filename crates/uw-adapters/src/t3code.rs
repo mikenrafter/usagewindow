@@ -540,6 +540,7 @@ mod tests {
             kind: CompactionKind::AgentRequested,
             prompt: "/compact\nPreserve the active goal.".into(),
             reason: "test".into(),
+            resume_after_compaction: false,
             status: CompactionStatus::Sending,
             created_at: chrono::Utc::now(),
         }

@@ -64,6 +64,13 @@ impl Store {
         {
             return Err(err.into());
         }
+        if let Err(err) = self.connection.execute(
+            "ALTER TABLE compaction_requests ADD COLUMN resume_after_compaction INTEGER NOT NULL DEFAULT 0",
+            [],
+        ) && !err.to_string().contains("duplicate column name")
+        {
+            return Err(err.into());
+        }
         if let Err(err) = self
             .connection
             .execute("ALTER TABLE sessions ADD COLUMN title TEXT", [])
@@ -401,7 +408,7 @@ impl Store {
         &self,
         id: &SessionId,
     ) -> StoreResult<Vec<CompactionRequest>> {
-        let mut stmt = self.connection.prepare("SELECT id,session_id,kind,prompt,reason,status,status_detail,created_at FROM compaction_requests WHERE session_id=? ORDER BY created_at,id")?;
+        let mut stmt = self.connection.prepare("SELECT id,session_id,kind,prompt,reason,resume_after_compaction,status,status_detail,created_at FROM compaction_requests WHERE session_id=? ORDER BY created_at,id")?;
         let rows = stmt.query_map([id.0.as_str()], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -409,13 +416,14 @@ impl Store {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get(7)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get(8)?,
             ))
         })?;
         rows.map(|row| {
-            let (id, session_id, kind, prompt, reason, status, detail, created_at) = row?;
+            let (id, session_id, kind, prompt, reason, resume_after_compaction, status, detail, created_at) = row?;
             Ok(CompactionRequest {
                 id: uuid::Uuid::parse_str(&id)
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
@@ -424,6 +432,7 @@ impl Store {
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
                 prompt,
                 reason,
+                resume_after_compaction: resume_after_compaction != 0,
                 status: decode_compaction_status(&status, detail),
                 created_at,
             })
@@ -720,14 +729,21 @@ impl Store {
     }
     pub fn insert_compaction_request(&self, request: &CompactionRequest) -> StoreResult<()> {
         self.connection.execute(
-            "INSERT INTO compaction_requests(id,session_id,kind,prompt,reason,status,status_detail,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-            params![request.id.to_string(), request.session_id.0, json(&request.kind)?, request.prompt, request.reason, compaction_status_name(&request.status), compaction_status_detail(&request.status), request.created_at, request.created_at],
+            "INSERT INTO compaction_requests(id,session_id,kind,prompt,reason,resume_after_compaction,status,status_detail,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            params![request.id.to_string(), request.session_id.0, json(&request.kind)?, request.prompt, request.reason, boolean(request.resume_after_compaction), compaction_status_name(&request.status), compaction_status_detail(&request.status), request.created_at, request.created_at],
+        )?;
+        Ok(())
+    }
+    pub fn mark_compaction_resume_queued(&self, id: uuid::Uuid) -> StoreResult<()> {
+        self.connection.execute(
+            "UPDATE compaction_requests SET resume_after_compaction=0 WHERE id=?",
+            [id.to_string()],
         )?;
         Ok(())
     }
     pub fn pending_compaction_requests(&self) -> StoreResult<Vec<CompactionRequest>> {
         let mut statement = self.connection.prepare(
-            "SELECT id,session_id,kind,prompt,reason,status,status_detail,created_at FROM compaction_requests WHERE status='pending' ORDER BY created_at,id",
+            "SELECT id,session_id,kind,prompt,reason,resume_after_compaction,status,status_detail,created_at FROM compaction_requests WHERE status='pending' ORDER BY created_at,id",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -736,13 +752,14 @@ impl Store {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get(7)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get(8)?,
             ))
         })?;
         rows.map(|row| {
-            let (id, session_id, kind, prompt, reason, status, detail, created_at) = row?;
+            let (id, session_id, kind, prompt, reason, resume_after_compaction, status, detail, created_at) = row?;
             Ok(CompactionRequest {
                 id: uuid::Uuid::parse_str(&id)
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
@@ -750,6 +767,7 @@ impl Store {
                 kind: serde_json::from_str(&kind)?,
                 prompt,
                 reason,
+                resume_after_compaction: resume_after_compaction != 0,
                 status: decode_compaction_status(&status, detail),
                 created_at,
             })
@@ -1721,6 +1739,7 @@ mod tests {
             kind: CompactionKind::OpportunisticIdle,
             prompt: "p".into(),
             reason: "r".into(),
+            resume_after_compaction: false,
             status: CompactionStatus::Pending,
             created_at: Utc::now(),
         })
@@ -1753,6 +1772,7 @@ mod tests {
                 kind: CompactionKind::AgentRequested,
                 prompt: "compact".into(),
                 reason: "test".into(),
+                resume_after_compaction: false,
                 status: CompactionStatus::Pending,
                 created_at: Utc::now(),
             })
@@ -1788,6 +1808,7 @@ mod tests {
             kind: CompactionKind::AgentRequested,
             prompt: "compact".into(),
             reason: "test".into(),
+            resume_after_compaction: false,
             status: CompactionStatus::Pending,
             created_at: Utc::now(),
         })
@@ -1827,6 +1848,7 @@ mod tests {
                     kind: CompactionKind::AgentRequested,
                     prompt: "compact".into(),
                     reason: "hard quota boundary".into(),
+                    resume_after_compaction: true,
                     status: CompactionStatus::Failed("provider rejected compaction".into()),
                     created_at: Utc::now(),
                 })

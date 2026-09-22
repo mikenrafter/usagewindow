@@ -115,6 +115,8 @@ pub struct CancelResumeRequest {
 pub struct CompactAskRequest {
     pub session_id: SessionId,
     pub reason: Option<String>,
+    #[serde(default)]
+    pub resume_after_compaction: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CancelCompactRequest {
@@ -272,6 +274,7 @@ mod tests {
         round_trip(CompactAskRequest {
             session_id: SessionId("s".into()),
             reason: Some("r".into()),
+            resume_after_compaction: true,
         });
         round_trip(CancelCompactRequest {
             session_id: SessionId("s".into()),

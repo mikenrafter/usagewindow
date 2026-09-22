@@ -1339,6 +1339,7 @@ mod tests {
                     kind: CompactionKind::OpportunisticIdle,
                     prompt: "actual prompt".into(),
                     reason: "ignored routing metadata".into(),
+                    resume_after_compaction: false,
                     status: CompactionStatus::Pending,
                     created_at: Utc::now(),
                 },

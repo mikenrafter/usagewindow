@@ -960,6 +960,7 @@ async fn compact_ask(
                 kind: CompactionKind::AgentRequested,
                 prompt: request.reason.clone().unwrap_or_default(),
                 reason: request.reason.unwrap_or_else(|| "manual request".into()),
+                resume_after_compaction: request.resume_after_compaction,
                 status: CompactionStatus::Pending,
                 created_at: Utc::now(),
             };
@@ -1419,6 +1420,7 @@ mod tests {
                 kind: CompactionKind::AgentRequested,
                 prompt: "/compact".into(),
                 reason: "test".into(),
+                resume_after_compaction: false,
                 status: CompactionStatus::Failed("adapter error".into()),
                 created_at: Utc::now(),
             })
@@ -1868,6 +1870,7 @@ mod tests {
             kind: CompactionKind::AskNearLimit,
             prompt: "compact".into(),
             reason: "near limit".into(),
+            resume_after_compaction: false,
             status: CompactionStatus::Pending,
             created_at: Utc::now(),
         };
@@ -2023,6 +2026,7 @@ mod tests {
         let ask = CompactAskRequest {
             session_id: SessionId("session-1".into()),
             reason: Some("test".into()),
+            resume_after_compaction: false,
         };
         let response = router
             .clone()
@@ -2083,6 +2087,7 @@ mod tests {
                 kind: CompactionKind::AgentRequested,
                 prompt: "compact".into(),
                 reason: "manual".into(),
+                resume_after_compaction: false,
                 status: CompactionStatus::Pending,
                 created_at: Utc::now(),
             })
@@ -2143,6 +2148,7 @@ mod tests {
                         serde_json::to_vec(&CompactAskRequest {
                             session_id: SessionId("session-1".into()),
                             reason: None,
+                            resume_after_compaction: false,
                         })
                         .unwrap(),
                     ))
@@ -2478,6 +2484,7 @@ mod tests {
                 kind: CompactionKind::AgentRequested,
                 prompt: "compact".into(),
                 reason: "hard quota boundary".into(),
+                resume_after_compaction: true,
                 status: CompactionStatus::Sent,
                 created_at: Utc::now(),
             })
@@ -2514,6 +2521,7 @@ mod tests {
                 kind: CompactionKind::AgentRequested,
                 prompt: "compact".into(),
                 reason: "test".into(),
+                resume_after_compaction: false,
                 status: CompactionStatus::Sent,
                 created_at: requested_at,
             })
@@ -2566,6 +2574,7 @@ mod tests {
                     kind: CompactionKind::AgentRequested,
                     prompt: "compact".into(),
                     reason: "test".into(),
+                    resume_after_compaction: false,
                     status: CompactionStatus::Sent,
                     created_at,
                 })
@@ -2597,9 +2606,10 @@ mod tests {
                 id: uuid::Uuid::new_v4(),
                 session_id: SessionId("session-1".into()),
                 kind: CompactionKind::AgentRequested,
-                prompt: "compact".into(),
-                reason: "hard quota boundary".into(),
-                status: CompactionStatus::Failed("provider rejected compaction".into()),
+            prompt: "compact".into(),
+            reason: "hard quota boundary".into(),
+            resume_after_compaction: true,
+            status: CompactionStatus::Failed("provider rejected compaction".into()),
                 created_at: Utc::now(),
             })
             .unwrap();

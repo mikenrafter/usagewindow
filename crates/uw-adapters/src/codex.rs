@@ -1285,6 +1285,7 @@ done
             kind: CompactionKind::AskNearLimit,
             prompt: String::new(),
             reason: String::new(),
+            resume_after_compaction: false,
             status: CompactionStatus::Pending,
             created_at: chrono::Utc::now(),
         }

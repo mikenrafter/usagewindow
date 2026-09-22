@@ -65,7 +65,7 @@ fn tool_definitions() -> Value {
     json!({"tools":[
         {"name":"get_usage","description":"Read the latest usage-window state.","inputSchema":{"type":"object","properties":{"provider":{"type":"string"},"account":{"type":"string"}}}},
         {"name":"get_resume_state","description":"Read resume markers for the calling session, or a supplied session.","inputSchema":{"type":"object","properties":{"session_id":{"type":["string","null"]}}}},
-        {"name":"request_compaction","description":"Queue an agent-requested compaction for the calling session, or a supplied session, when its harness has a live message transport.","inputSchema":{"type":"object","properties":{"session_id":{"type":["string","null"]},"prompt":{"type":"string"},"reason":{"type":"string"}}}}
+        {"name":"request_compaction","description":"Queue an agent-requested compaction for the calling session, or a supplied session, when its harness has a live message transport.","inputSchema":{"type":"object","properties":{"session_id":{"type":["string","null"]},"prompt":{"type":"string"},"reason":{"type":"string"},"resume_after_compaction":{"type":"boolean","description":"Ask usagewindow to queue a policy-scheduled resume after verified compaction."}}}}
     ]})
 }
 
@@ -196,6 +196,10 @@ fn call_tool(
                 kind: CompactionKind::AgentRequested,
                 prompt,
                 reason,
+                resume_after_compaction: args
+                    .get("resume_after_compaction")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 status: CompactionStatus::Pending,
                 created_at: Utc::now(),
             };
@@ -275,6 +279,10 @@ fn call_tool(
             let request = CompactAskRequest {
                 session_id: session_id.clone(),
                 reason: Some(reason),
+                resume_after_compaction: args
+                    .get("resume_after_compaction")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             };
             let status: CompactStatusResponse = daemon_request(
                 deps.client
@@ -901,7 +909,7 @@ mod tests {
             }),
         );
         let response = handle_request(
-            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"request_compaction","arguments":{"session_id":"claude-session","prompt":"/compact"}}}),
+            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"request_compaction","arguments":{"session_id":"claude-session","prompt":"/compact","resume_after_compaction":true}}}),
             &deps,
         );
         assert_eq!(response["result"]["structuredContent"]["supported"], true);
@@ -914,6 +922,7 @@ mod tests {
             .pop()
             .unwrap();
         assert_eq!(request.kind, CompactionKind::AgentRequested);
+        assert!(request.resume_after_compaction);
     }
 
     #[test]
