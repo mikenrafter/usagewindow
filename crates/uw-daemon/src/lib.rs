@@ -1168,7 +1168,7 @@ pub async fn run_policy_tick(
         if let Some(rate) = uw_policy::weighted_token_rate_per_minute(
             &records,
             now,
-            Duration::minutes(30),
+            uw_policy::burn_rate_lookback(&session.harness),
             Duration::minutes(5),
             1.2,
             activity_weight,

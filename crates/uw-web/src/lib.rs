@@ -543,18 +543,8 @@ async fn status(
                 let blocks = uw_policy::segment_blocks(&all_samples, &window_key, account.as_ref());
                 let burn_lookback = uw_policy::burn_rate_display_lookback_for_provider(&provider, &key.kind);
                 let burn_rate_pct_per_hour = blocks.last().and_then(|block| uw_policy::burn_rate_pct_per_hour_available(block, burn_lookback));
-                let long_window = match &key.kind {
-                    WindowKind::Rolling { minutes } => *minutes > 120,
-                    WindowKind::WeeklyModel(_) | WindowKind::WeeklySurface(_) => true,
-                    WindowKind::Custom(_) => false,
-                };
-                let purview = match &key.kind {
-                    WindowKind::Rolling { minutes } => Some(Duration::minutes(*minutes as i64)),
-                    WindowKind::WeeklyModel(_) | WindowKind::WeeklySurface(_) => {
-                        Some(Duration::days(7))
-                    }
-                    WindowKind::Custom(_) => None,
-                };
+                let purview = uw_policy::burn_rate_display_lookback_for_provider(&provider, &key.kind);
+                let long_window = purview > Duration::hours(2);
                 let active_sessions = sessions
                     .iter()
                     .filter(|s| s.harness == provider && s.account == account)
@@ -562,7 +552,7 @@ async fn status(
                         session_activity.iter().any(|(id, active, activity)| {
                             id == &s.id
                                 && if long_window {
-                                    let cutoff = now - purview.expect("long windows have a purview");
+                                    let cutoff = now - purview;
                                     activity.iter().any(|at| *at >= cutoff)
                                 } else {
                                     *active
@@ -1371,13 +1361,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_counts_recent_sessions_for_long_windows() {
+    async fn status_counts_sessions_within_the_burn_window() {
         let store = Store::open_memory().unwrap();
-        let active = session();
+        let mut active = session();
         let mut idle = session();
         idle.id = SessionId("session-2".into());
         let mut outside = session();
         outside.id = SessionId("session-3".into());
+        active.harness = Provider::Cursor;
+        idle.harness = Provider::Cursor;
+        outside.harness = Provider::Cursor;
         store.insert_session(&active).unwrap();
         store.insert_session(&idle).unwrap();
         store.insert_session(&outside).unwrap();
@@ -1415,7 +1408,7 @@ mod tests {
             .insert_token_usage_records(
                 &outside.id,
                 &[TokenUsageRecord {
-                    at: Utc::now() - Duration::hours(6),
+                    at: Utc::now() - Duration::hours(30),
                     model: outside.model.clone(),
                     input_tokens: 80,
                     cached_input_tokens: 0,
@@ -1431,11 +1424,11 @@ mod tests {
                 at: Utc::now(),
                 fetched_at: None,
                 source: UsageSource::ProviderReported,
-                provider: Provider::Codex,
+                provider: Provider::Cursor,
                 account: None,
                 windows: HashMap::from([(
                     WindowKey {
-                        provider: Provider::Codex,
+                        provider: Provider::Cursor,
                         kind: WindowKind::Rolling { minutes: 300 },
                     },
                     UsageWindowState::new(42.0, false, true, None, None),
