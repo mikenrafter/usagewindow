@@ -406,7 +406,8 @@ function usedHazardBg(hue) {
   return `repeating-linear-gradient(135deg, ${a} 0 3px, ${b} 3px 6px)`;
 }
 
-function burnDisplayWindow(kind) {
+function burnDisplayWindow(provider, kind) {
+  if (provider === 'Cursor') return { minutes: 1440, label: '24h' };
   if (kind.WeeklyModel || kind.WeeklySurface) return { minutes: 1440, label: '24h' };
   if (kind.Rolling) {
     if (kind.Rolling.minutes >= 24 * 60) return { minutes: 1440, label: '24h' };
@@ -415,18 +416,19 @@ function burnDisplayWindow(kind) {
   return { minutes: 30, label: '30m' };
 }
 
-function renderUsageBar(w) {
+function renderUsageBar(provider, w) {
   const used = Math.min(100, Math.max(0, w.pct));
   const remaining = 100 - used;
   const hue = remainingHue(remaining);
-  const { minutes: burnWindowMinutes, label: burnLabel } = burnDisplayWindow(w.window);
+  const { minutes: burnWindowMinutes, label: burnLabel } = burnDisplayWindow(provider, w.window);
   const burnConsumed = w.burn_rate_pct_per_hour != null
     ? w.burn_rate_pct_per_hour * burnWindowMinutes / 60
     : null;
   const projected = burnConsumed != null ? Math.min(remaining, Math.max(0, burnConsumed)) : 0;
-  const burnPct = burnConsumed != null
-    ? (burnConsumed > 0 ? '-' : '+') + Math.abs(burnConsumed).toFixed(1) + '%'
-    : '-';
+  const burnRounded = burnConsumed == null ? null : Math.abs(burnConsumed).toFixed(1);
+  const burnPct = burnRounded == null || burnRounded === '0.0'
+    ? '-'
+    : (burnConsumed > 0 ? '-' : '+') + burnRounded + '%';
   const sessions = `${w.active_sessions} session${w.active_sessions === 1 ? '' : 's'}`;
   const usedStyle = `width:${used}%;background:${usedHazardBg(hue)}`;
   const projStyle = projected > 0
@@ -472,7 +474,7 @@ function renderUsage(status) {
     const staleBadge = fs && fs.last_error
       ? `<span class="pill stopped stale" title="${escapeHtml(fs.last_error)}">refresh failing (${fs.consecutive_failures}×) · last ok ${fs.last_success_at ? fmtDate(fs.last_success_at) : 'never'}</span>`
       : '';
-    const bars = sortWindows(u.windows).map(renderUsageBar).join('');
+    const bars = sortWindows(u.windows).map(w => renderUsageBar(providerLabel(u.provider), w)).join('');
     return `
       <div class="card">
         <div class="head">

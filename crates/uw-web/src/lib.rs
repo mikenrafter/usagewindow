@@ -519,34 +519,42 @@ async fn status(
         }
         let now = Utc::now();
         let activity_cutoff = now - Duration::minutes(30);
-        let active_session_ids = sessions
+        let session_activity = sessions
             .iter()
-            .filter(|session| session.stopped_reason.is_none())
             .map(|session| {
-                let active = store
-                    .token_usage_for_session(&session.id)?
-                    .into_iter()
-                    .any(|record| record.at >= activity_cutoff && record.total_tokens > 0);
-                Ok((session.id.clone(), active))
+                let records = store.token_usage_for_session(&session.id)?;
+                let active = session.stopped_reason.is_none()
+                    && records.iter().any(|record| {
+                        record.at >= activity_cutoff && record.total_tokens > 0
+                    });
+                let recent = records.iter().any(|record| {
+                    record.at >= now - Duration::hours(24) && record.total_tokens > 0
+                });
+                Ok((session.id.clone(), active, recent))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         let usage = latest.into_values().map(|sample| {
             let provider = sample.provider.clone();
             let account = sample.account.clone();
-            let active_sessions = sessions
-                .iter()
-                .filter(|s| {
-                    s.harness == provider
-                        && s.account == account
-                        && active_session_ids
-                            .iter()
-                            .any(|(id, active)| id == &s.id && *active)
-                })
-                .count() as u32;
             let windows = sample.windows.into_iter().map(|(key, window)| {
                 let window_key = WindowKey { provider: provider.clone(), kind: key.kind.clone() };
                 let blocks = uw_policy::segment_blocks(&all_samples, &window_key, account.as_ref());
-                let burn_rate_pct_per_hour = blocks.last().and_then(|block| uw_policy::burn_rate_pct_per_hour_available(block, uw_policy::burn_rate_display_lookback(&key.kind)));
+                let burn_lookback = uw_policy::burn_rate_display_lookback_for_provider(&provider, &key.kind);
+                let burn_rate_pct_per_hour = blocks.last().and_then(|block| uw_policy::burn_rate_pct_per_hour_available(block, burn_lookback));
+                let long_window = match &key.kind {
+                    WindowKind::Rolling { minutes } => *minutes > 120,
+                    WindowKind::WeeklyModel(_) | WindowKind::WeeklySurface(_) => true,
+                    WindowKind::Custom(_) => false,
+                };
+                let active_sessions = sessions
+                    .iter()
+                    .filter(|s| s.harness == provider && s.account == account)
+                    .filter(|s| {
+                        session_activity.iter().any(|(id, active, recent)| {
+                            id == &s.id && if long_window { *recent } else { *active }
+                        })
+                    })
+                    .count() as u32;
                 let depletes_at = burn_rate_pct_per_hour.filter(|rate| *rate > 0.0).map(|rate| {
                     let minutes_remaining = (100.0 - window.pct) / rate * 60.0;
                     now + chrono::Duration::minutes(minutes_remaining.max(0.0) as i64)
@@ -1348,7 +1356,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_counts_only_sessions_with_recent_token_usage_as_active() {
+    async fn status_counts_recent_sessions_for_long_windows() {
         let store = Store::open_memory().unwrap();
         let active = session();
         let mut idle = session();
@@ -1367,6 +1375,21 @@ mod tests {
                     output_tokens: 20,
                     reasoning_output_tokens: 0,
                     total_tokens: 120,
+                }],
+            )
+            .unwrap();
+        store
+            .insert_token_usage_records(
+                &idle.id,
+                &[TokenUsageRecord {
+                    at: Utc::now() - Duration::hours(1),
+                    model: idle.model.clone(),
+                    input_tokens: 80,
+                    cached_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 20,
+                    reasoning_output_tokens: 0,
+                    total_tokens: 100,
                 }],
             )
             .unwrap();
@@ -1397,7 +1420,7 @@ mod tests {
             .unwrap();
         let value: StatusResponse = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(value.usage[0].windows[0].active_sessions, 1);
+        assert_eq!(value.usage[0].windows[0].active_sessions, 2);
     }
 
     #[tokio::test]
