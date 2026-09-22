@@ -43,6 +43,8 @@ pub struct SessionListItem {
     pub keepalive: bool,
     pub active: bool,
     pub cached: bool,
+    pub context_window_size: Option<u64>,
+    pub last_known_token_count: Option<u64>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionsPage {
@@ -126,6 +128,7 @@ pub struct CompactStatusResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecentAction {
     pub session_id: SessionId,
+    pub session_title: Option<String>,
     pub kind: String,
     pub status: String,
     pub at: DateTime<Utc>,
@@ -201,6 +204,8 @@ mod tests {
             harness: Provider::Codex,
             model: None,
             account: None,
+            context_window_size: None,
+            last_known_token_count: None,
             last_seen: Utc::now(),
             stopped_reason: None,
             resume_status: None,

@@ -102,8 +102,12 @@
   .actionrow { cursor: pointer; }
   .actionrow:hover { background: rgba(91,140,255,0.08); }
   .action-error { color: var(--danger); margin-top: 0.35rem; font-size: 0.78rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .error-group { color: var(--danger); margin-top: 0.35rem; font-size: 0.78rem; }
+  .error-group summary { color: var(--danger); margin: 0; }
+  .error-group ul { margin: 0.35rem 0 0; padding-left: 1.2rem; }
+  .error-group li { padding: 0.15rem 0; }
   .errorbox { border: 1px solid var(--danger); border-radius: 6px; background: rgba(255,91,110,0.08); padding: 0.65rem 0.8rem; margin: 0 0 1rem; }
-  .errorbox h3 { color: var(--danger); font-size: 0.78rem; margin: 0 0 0.4rem; text-transform: uppercase; letter-spacing: 0.04em; }
+  .errorbox summary { color: var(--danger); font-size: 0.78rem; margin: 0; text-transform: uppercase; letter-spacing: 0.04em; cursor: pointer; }
   .errorbox ul { margin: 0; padding-left: 1.1rem; color: var(--danger); font-size: 0.82rem; }
   .actions-panel {
     background: #0d0f14; border: 1px solid var(--border); border-radius: 8px;
@@ -209,7 +213,7 @@
   </section>
 
   <section class="panel actions-panel">
-    <div class="panelhead"><h2>Recent actions</h2><span class="muted" style="font-size:.78rem">latest 20 over 24h</span></div>
+    <div class="panelhead"><h2>Recent actions</h2><span class="muted" style="font-size:.78rem">latest 20 over 24h <span id="actions-error-count"></span></span></div>
     <div id="actions"><p class="empty">loading…</p></div>
   </section>
 
@@ -228,7 +232,7 @@
     </div>
     <div id="err" class="err"></div>
     <table>
-      <thead><tr><th>session</th><th>harness</th><th>model</th><th>account</th><th>last seen</th><th>status</th></tr></thead>
+      <thead><tr><th>session</th><th>harness</th><th>model</th><th>account</th><th>max context</th><th>recent context</th><th>last seen</th><th>status</th></tr></thead>
       <tbody id="rows"><tr><td colspan="6" class="empty">loading…</td></tr></tbody>
     </table>
     <div class="pager">
@@ -377,7 +381,7 @@ function sessionLabel(s) {
 }
 
 function copySessionButton(id) {
-  return `<button type="button" class="action copy-session" data-copy-session="${escapeHtml(id)}" title="Copy session ID">copy</button>`;
+  return `<button type="button" class="action copy-session" data-copy-session="${escapeHtml(id)}" title="Copy session ID">copy ID</button>`;
 }
 
 async function copySessionId(button) {
@@ -388,7 +392,7 @@ async function copySessionId(button) {
   } catch (_) {
     button.textContent = 'copy failed';
   }
-  setTimeout(() => { button.textContent = 'copy'; }, 1200);
+  setTimeout(() => { button.textContent = 'copy ID'; }, 1200);
 }
 
 document.addEventListener('click', event => {
@@ -403,6 +407,15 @@ function providerLabel(p) {
   if (typeof p === 'string') return ({ ClaudeCode: 'Claude', Codex: 'Codex', Cursor: 'Cursor' })[p] || p;
   if (p && p.Other) return p.Other;
   return escapeHtml(p);
+}
+
+function formatTokens(value) {
+  if (value == null || !Number.isFinite(Number(value))) return '-';
+  const tokens = Math.max(0, Math.round(Number(value)));
+  if (tokens < 1000) return `${tokens}t`;
+  const thousands = tokens / 1000;
+  if (thousands < 10) return `${thousands.toFixed(1).replace(/\.0$/, '')}k`;
+  return `${Math.round(thousands)}k`;
 }
 
 function windowLabel(w) {
@@ -554,26 +567,53 @@ async function loadActions() {
   const box = $('#actions');
   try {
     const events = await api('/api/actions/recent?limit=20');
+    const errorCount = events.filter(e => e.error).length;
+    $('#actions-error-count').textContent = errorCount ? `· ${errorCount} error${errorCount === 1 ? '' : 's'}` : '';
     if (!events.length) { box.innerHTML = '<p class="empty">no recent actions</p>'; return; }
-    box.innerHTML = events.map(e => {
-      return `
-        <div class="actionrow" data-id="${escapeHtml(e.session_id)}">
-          <div class="top">
-            <span class="sid">${escapeHtml(e.session_id)} ${copySessionButton(e.session_id)}</span>
-            <span class="pill">${escapeHtml(e.kind)}</span>
-            <span class="pill ${e.status === 'failed' ? 'stopped' : e.status === 'active' || e.status === 'successful' || e.status === 'resumed' ? 'ok' : 'pending'}">${escapeHtml(e.status)}</span>
-          </div>
-          <div class="meta">
-            ${e.detail ? `<span>${escapeHtml(e.detail)}</span>` : ''}
-            <span>${fmtDate(e.at)}</span>
-          </div>
-          ${e.error ? `<div class="action-error">${escapeHtml(e.error)}</div>` : ''}
-        </div>`;
-    }).join('');
+    box.innerHTML = groupRecentActions(events).map(renderRecentActionGroup).join('');
     $$('#actions .actionrow').forEach(row => row.addEventListener('click', () => selectSession(row.dataset.id)));
   } catch (e) {
     // Same rule as loadStatus: a failed poll keeps whatever was last rendered.
   }
+}
+
+function groupRecentActions(events) {
+  const groups = [];
+  for (const event of events) {
+    const errorKey = event.error ? `${event.kind}\u0000${event.status}\u0000${event.error}` : null;
+    const previous = groups[groups.length - 1];
+    if (errorKey && previous && previous.errorKey === errorKey) {
+      previous.events.push(event);
+    } else {
+      groups.push({ errorKey, events: [event] });
+    }
+  }
+  return groups;
+}
+
+function renderRecentActionGroup(group) {
+  const first = group.events[0];
+  const status = first.status;
+  const statusClass = status === 'failed' ? 'stopped' : status === 'active' || status === 'successful' || status === 'resumed' ? 'ok' : 'pending';
+  const session = sessionLabel({ id: first.session_id, title: first.session_title });
+  const errors = group.events;
+  const errorDetails = errors.length > 1
+    ? `<details class="error-group"><summary>${errors.length} repeated errors</summary><ul>${errors.map(e => `<li>${escapeHtml(e.session_title || e.session_id)} · ${fmtDate(e.at)} · ${escapeHtml(e.error)}</li>`).join('')}</ul></details>`
+    : `<div class="action-error">${escapeHtml(first.error)}</div>`;
+  return `
+    <div class="actionrow" data-id="${escapeHtml(first.session_id)}">
+      <div class="top">
+        <span class="sid">${session}</span>
+        <span class="pill">${escapeHtml(first.kind)}</span>
+        <span class="pill ${statusClass}">${escapeHtml(status)}</span>
+        ${errors.length > 1 ? `<span class="pill stopped">${errors.length} errors</span>` : ''}
+      </div>
+      <div class="meta">
+        ${first.detail ? `<span>${escapeHtml(first.detail)}</span>` : ''}
+        <span>${fmtDate(first.at)}</span>
+      </div>
+      ${first.error ? errorDetails : ''}
+    </div>`;
 }
 
 async function loadSessions() {
@@ -599,7 +639,7 @@ async function loadSessions() {
   sessionsById = new Map(items.map(s => [s.id, s]));
   const rows = $('#rows');
   if (!items.length) {
-    rows.innerHTML = '<tr><td colspan="6" class="empty">no sessions match</td></tr>';
+    rows.innerHTML = '<tr><td colspan="8" class="empty">no sessions match</td></tr>';
   } else {
     rows.innerHTML = items.map(s => `
       <tr data-id="${escapeHtml(s.id)}" class="${s.id === selectedId ? 'selected' : ''}">
@@ -607,6 +647,8 @@ async function loadSessions() {
         <td data-label="harness">${escapeHtml(providerLabel(s.harness))}</td>
         <td data-label="model">${escapeHtml(s.model || '-')}</td>
         <td data-label="account" class="muted acct">${escapeHtml(s.account || '-')}</td>
+        <td data-label="max context">${formatTokens(s.context_window_size)}</td>
+        <td data-label="recent context">${formatTokens(s.last_known_token_count)}</td>
         <td data-label="last seen">${fmtDate(s.last_seen)}</td>
         <td data-label="status">${pillFor(s)}${s.keepalive ? ' <span class="pill keepalive">keepalive</span>' : ''}</td>
       </tr>`).join('');
@@ -638,7 +680,7 @@ async function selectSession(id) {
   const compactCancellable = (d.compaction_log || []).some(r => statusName(r.status) === 'pending');
   detail.innerHTML = `
     ${d.title ? `<h3 class="detail-title">${escapeHtml(d.title)}</h3>` : ''}
-    ${d.errors.length ? `<div class="errorbox"><h3>Errors</h3><ul>${d.errors.map(error => `<li>${escapeHtml(error)}</li>`).join('')}</ul></div>` : ''}
+    ${d.errors.length ? `<details class="errorbox"><summary>Errors (${d.errors.length})</summary><ul>${d.errors.map(error => `<li>${escapeHtml(error)}</li>`).join('')}</ul></details>` : ''}
     <div class="kv">
       <div class="k">id</div><div class="v">${escapeHtml(s.id)} ${copySessionButton(s.id)}</div>
       <div class="k">harness</div><div class="v">${escapeHtml(providerLabel(s.harness))}</div>
@@ -648,8 +690,8 @@ async function selectSession(id) {
       <div class="k">state path</div><div class="v">${escapeHtml(s.state_path)}</div>
       <div class="k">first seen</div><div class="v">${fmtDate(s.first_seen)}</div>
       <div class="k">last seen</div><div class="v">${fmtDate(s.last_seen)}</div>
-      <div class="k">context window</div><div class="v">${escapeHtml(s.context_window_size)}</div>
-      <div class="k">last token count</div><div class="v">${escapeHtml(s.last_known_token_count)}</div>
+      <div class="k">context window</div><div class="v">${formatTokens(s.context_window_size)}</div>
+      <div class="k">last token count</div><div class="v">${formatTokens(s.last_known_token_count)}</div>
       <div class="k">pid</div><div class="v">${escapeHtml(s.pid)}</div>
       <div class="k">stopped reason</div><div class="v">${escapeHtml(s.stopped_reason)}</div>
       <div class="k">keepalive</div><div class="v">${keptAlive ? '<span class="pill keepalive">on</span>' : '<span class="muted">off</span>'}</div>

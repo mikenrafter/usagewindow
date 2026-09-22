@@ -645,6 +645,8 @@ impl DirectReader for StoreReader {
                     harness: s.harness,
                     model: s.model,
                     account: s.account,
+                    context_window_size: s.context_window_size,
+                    last_known_token_count: s.last_known_token_count,
                     last_seen: s.last_seen,
                     stopped_reason: s.stopped_reason,
                     resume_status,

@@ -695,6 +695,8 @@ async fn sessions(
                     harness: s.harness,
                     model: s.model,
                     account: s.account,
+                    context_window_size: s.context_window_size,
+                    last_known_token_count: s.last_known_token_count,
                     last_seen: s.last_seen,
                     stopped_reason: s.stopped_reason,
                     resume_status,
@@ -1183,6 +1185,7 @@ async fn actions_recent(
             let cutoff = Utc::now() - Duration::hours(24);
             let mut actions = Vec::new();
             for session in store.list_sessions()? {
+                let session_title = store.resolve_session_title(&session.id)?;
                 for request in store.compaction_requests_for_session(&session.id)? {
                     let (status, error) = compact_action_status(&request.status);
                     if request.created_at < cutoff {
@@ -1190,6 +1193,7 @@ async fn actions_recent(
                     }
                     actions.push(RecentAction {
                         session_id: session.id.clone(),
+                        session_title: session_title.clone(),
                         kind: "compaction".into(),
                         status,
                         at: request.created_at,
@@ -1203,6 +1207,7 @@ async fn actions_recent(
                     }
                     actions.push(RecentAction {
                         session_id: session.id.clone(),
+                        session_title: session_title.clone(),
                         kind: "compaction".into(),
                         status: if event.completed_at.is_some() {
                             "successful".into()
@@ -1221,6 +1226,7 @@ async fn actions_recent(
                     }
                     actions.push(RecentAction {
                         session_id: session.id.clone(),
+                        session_title: session_title.clone(),
                         kind: "resume".into(),
                         status,
                         at: marker.created_at,
@@ -1236,6 +1242,7 @@ async fn actions_recent(
                     }
                     actions.push(RecentAction {
                         session_id: session.id.clone(),
+                        session_title,
                         kind: "keepalive".into(),
                         status: "active".into(),
                         at: keepalive.last_ping_at.unwrap_or(session.last_seen),
@@ -1661,6 +1668,11 @@ mod tests {
             "expected versioned title in html"
         );
         assert!(!html.contains("__UW_VERSION__"));
+        assert!(html.contains("latest 20 over 24h"));
+        assert!(html.contains("copy ID"));
+        assert!(html.contains("max context"));
+        assert!(html.contains("recent context"));
+        assert!(html.contains("repeated errors"));
     }
 
     #[tokio::test]
@@ -2282,7 +2294,9 @@ mod tests {
     #[tokio::test]
     async fn sessions_default_to_active_and_report_cache_state() {
         let store = Store::open_memory().unwrap();
-        let active = session();
+        let mut active = session();
+        active.context_window_size = Some(1_200);
+        active.last_known_token_count = Some(600);
         let mut inactive = session();
         inactive.id = SessionId("inactive".into());
         inactive.last_seen = Utc::now() - chrono::Duration::minutes(31);
@@ -2316,6 +2330,8 @@ mod tests {
         let page: SessionsPage = serde_json::from_slice(&body).unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].id, active.id);
+        assert_eq!(page.items[0].context_window_size, Some(1_200));
+        assert_eq!(page.items[0].last_known_token_count, Some(600));
         assert!(page.items[0].active);
         assert!(page.items[0].cached);
 
@@ -2427,6 +2443,9 @@ mod tests {
         let store = Store::open_memory().unwrap();
         store.insert_session(&session()).unwrap();
         store
+            .set_session_title(&SessionId("session-1".into()), "Named session")
+            .unwrap();
+        store
             .insert_compaction_request(&CompactionRequest {
                 id: uuid::Uuid::new_v4(),
                 session_id: SessionId("session-1".into()),
@@ -2454,6 +2473,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].kind, "compaction");
         assert_eq!(actions[0].status, "in progress");
+        assert_eq!(actions[0].session_title.as_deref(), Some("Named session"));
     }
 
     #[tokio::test]
