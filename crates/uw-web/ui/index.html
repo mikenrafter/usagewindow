@@ -103,9 +103,11 @@
   .actionrow .meta { color: var(--muted); font-size: 0.78rem; display: flex; gap: 0.9rem; flex-wrap: wrap; }
   .actionrow { cursor: pointer; }
   .actionrow:hover { background: rgba(91,140,255,0.08); }
-  .actions-panel .actionrow { display: grid; grid-template-columns: 7rem minmax(0, 1fr) auto; align-items: start; column-gap: 0.8rem; }
+  .actions-panel .actionrow { display: grid; grid-template-columns: minmax(0, 1fr) min-content 7rem; align-items: start; column-gap: 0.8rem; }
   .actions-panel .action-details { min-width: 0; }
-  .actions-panel .action-status { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; justify-content: flex-end; }
+  .actions-panel .action-status { display: flex; align-items: center; gap: 0.4rem; flex-wrap: nowrap; justify-content: flex-end; width: max-content; }
+  .actions-panel .pill { white-space: nowrap; }
+  .actions-panel .action-kind { justify-self: start; }
   .action-error { color: var(--danger); margin-top: 0.35rem; font-size: 0.78rem; white-space: pre-wrap; overflow-wrap: anywhere; }
   .error-group { color: var(--danger); margin-top: 0.35rem; font-size: 0.78rem; }
   .error-group summary { color: var(--danger); margin: 0; }
@@ -607,7 +609,6 @@ function renderRecentActionGroup(group) {
     : `<div class="action-error">${escapeHtml(first.error)}</div>`;
   return `
     <div class="actionrow" data-id="${escapeHtml(first.session_id)}">
-      <span class="pill action-kind">${escapeHtml(first.kind)}</span>
       <div class="action-details">
         <div class="top"><span class="sid">${session}</span></div>
         <div class="meta">
@@ -620,6 +621,7 @@ function renderRecentActionGroup(group) {
         <span class="pill ${statusClass}">${escapeHtml(status)}</span>
         ${errors.length > 1 ? `<span class="pill stopped">${errors.length} errors</span>` : ''}
       </div>
+      <span class="pill action-kind">${escapeHtml(first.kind)}</span>
     </div>`;
 }
 
