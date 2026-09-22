@@ -4,6 +4,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -789,6 +790,35 @@ pub async fn run_observation_tick(
     Ok(report)
 }
 
+async fn bounded_observation<T, F>(operation: F, timeout: StdDuration) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    tokio::time::timeout(timeout, operation)
+        .await
+        .map_err(|_| anyhow::anyhow!("observation tick timed out after {timeout:?}"))?
+}
+
+#[cfg(test)]
+mod observation_timeout_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bounded_observation_returns_when_provider_poll_hangs() {
+        let error = bounded_observation(
+            async {
+                tokio::time::sleep(StdDuration::from_secs(60)).await;
+                Ok::<_, anyhow::Error>(())
+            },
+            StdDuration::from_millis(10),
+        )
+        .await
+        .expect_err("a hung provider poll must not hold the scheduler forever");
+
+        assert!(error.to_string().contains("observation tick timed out"));
+    }
+}
+
 pub async fn run_reseed(
     session: &SessionSummary,
     cheap_model: ModelId,
@@ -986,9 +1016,13 @@ fn t3_external_status(
         "icon": icon,
         "color": color,
         "notifyUser": notify_user,
-        "expiresAt": expires_at,
-        "updatedAt": now,
+        "expiresAt": expires_at.map(t3_timestamp),
+        "updatedAt": t3_timestamp(now),
     })
+}
+
+fn t3_timestamp(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 fn resolve_t3_external_status(
@@ -1978,6 +2012,7 @@ pub async fn run_production_ticks(
     let mut policy_state = PolicyRuntimeState::default();
     let auto_reseed = auto_reseed_runtime_from_env();
     let observation_interval = env_duration_or("UW_OBSERVATION_INTERVAL_SECS", interval);
+    let observation_timeout = env_duration_secs("UW_OBSERVATION_TIMEOUT_SECS", 30);
     let policy_interval = env_duration_secs("UW_POLICY_INTERVAL_SECS", 30);
     let maintenance_interval = env_duration_secs("UW_MAINTENANCE_INTERVAL_SECS", 3600);
     let idle_compact_tiers = std::env::var("UW_IDLE_COMPACT_TIERS")
@@ -2007,7 +2042,12 @@ pub async fn run_production_ticks(
         }
         let now = Instant::now();
         if now.duration_since(last_observation) >= observation_interval {
-            if let Err(error) = run_observation_tick(store.as_ref(), adapters).await {
+            if let Err(error) = bounded_observation(
+                run_observation_tick(store.as_ref(), adapters),
+                observation_timeout,
+            )
+            .await
+            {
                 tracing::error!(%error, "observation tick failed");
             }
             last_observation = now;
@@ -2490,7 +2530,7 @@ mod tests {
         assert_eq!(scheduled["key"], "scheduled");
         assert_eq!(
             scheduled["expiresAt"],
-            at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+            at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
         );
         let paused = resolve_t3_external_status(
             &[],
@@ -2505,6 +2545,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(paused["key"], "paused");
+    }
+
+    #[test]
+    fn external_status_uses_t3_compatible_millisecond_timestamps() {
+        let now = DateTime::parse_from_rfc3339("2026-09-22T11:23:40.037576770Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let at = DateTime::parse_from_rfc3339("2026-09-22T12:23:40.123456789Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let marker = ResumeMarker {
+            id: uuid::Uuid::new_v4(),
+            session_id: SessionId("s".into()),
+            reason: ResumeReason::AutoDetectedLimit,
+            resume_at: Some(at),
+            requested_at: None,
+            created_at: now,
+            status: ResumeStatus::Scheduled,
+            message: None,
+        };
+
+        let status = resolve_t3_external_status(&[], Some(&marker), None, now).unwrap();
+
+        assert_eq!(status["updatedAt"], "2026-09-22T11:23:40.037Z");
+        assert_eq!(status["expiresAt"], "2026-09-22T12:23:40.123Z");
     }
     fn session() -> SessionSummary {
         SessionSummary {
