@@ -18,13 +18,13 @@ designed on). This file is the in-repo copy subagents and contributors should wo
 - `uw-store` — SQLite (`rusqlite`, WAL) persistence. One writer owns the connection;
   readers (CLI status, web UI) read concurrently.
 - `uw-daemon` — systemd-managed long-running process: polling loop, compaction-queue
-  flush tick, resume scheduler, hook listeners. CLI writes require the daemon running
-  (thin client over local socket/HTTP); CLI reads fall back to direct DB access when the
-  daemon is down.
+  flush tick, resume scheduler, hook listeners, and the sole SQLite owner. CLI writes
+  require the daemon running (thin client over local socket/HTTP); CLI reads use a
+  read-only database fallback when the daemon is down.
 - `uw-cli` (`uw` binary) — thin consumer of the same `/api/*` surface the web UI uses.
 - `uw-web` — axum server + embedded static UI assets.
-- `uw-mcp` — thin MCP server exposing read-only `get_usage`/`get_resume_state` and
-  `request_compaction` tools, built from `uw-core`.
+- `uw-mcp` — thin MCP client exposing read-only `get_usage`/`get_resume_state` and
+  `request_compaction` tools through the daemon API, built from `uw-core`.
 
 ## Domain model (Phase 2 target)
 
@@ -454,11 +454,11 @@ index on `resume_markers` and the compound-unique index on `threshold_overrides`
 above. Retention: prune `usage_samples` past a configurable age (default 30 days), keep
 `sessions`/latest-per-window derived state.
 
-`uw-store`'s public API is synchronous (`rusqlite::Connection` is not `Sync`) — a
-dedicated writer thread owns the connection; `uw-daemon` wraps calls in
-`tokio::task::spawn_blocking` rather than trying to share the connection across async
-tasks directly. Readers (CLI direct-DB-read fallback, web UI queries) open their own
-short-lived read connections under WAL, no shared state with the writer thread needed.
+`uw-store`'s public API is synchronous (`rusqlite::Connection` is not `Sync`). The
+daemon owns one connection behind a mutex and wraps calls in
+`tokio::task::spawn_blocking`. The web API, hooks, liveness checks, and MCP bridge all
+use that owner. The CLI may open a short-lived read-only connection only when the
+daemon API is unavailable.
 
 ## CLI / API / Web UI (Phases 6-7 targets)
 

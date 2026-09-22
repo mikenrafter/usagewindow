@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::collections::BTreeMap;
 use thiserror::Error;
 use uw_core::adapter::TokenUsageRecord;
@@ -34,6 +34,14 @@ impl Store {
         let mut s = Self { connection: c };
         s.create_schema()?;
         Ok(s)
+    }
+
+    /// Opens a query-only connection. It never runs schema creation or
+    /// reconciliation, so read fallbacks cannot become competing writers.
+    pub fn open_read_only(path: &str) -> StoreResult<Self> {
+        let c = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        c.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Self { connection: c })
     }
     pub fn connection(&self) -> &Connection {
         &self.connection
@@ -1955,6 +1963,18 @@ mod tests {
             1
         );
         assert!(s.all_usage_samples().unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_only_open_does_not_run_schema_or_allow_writes() {
+        let path = std::env::temp_dir().join(format!("usagewindow-read-only-{}.sqlite", uuid::Uuid::new_v4()));
+        let writable = Store::open(path.to_str().unwrap()).unwrap();
+        drop(writable);
+
+        let read_only = Store::open_read_only(path.to_str().unwrap()).unwrap();
+        assert!(read_only.insert_session(&session(&SessionId("read-only".into()))).is_err());
+        drop(read_only);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -543,7 +543,7 @@ pub struct StoreReader {
 impl StoreReader {
     pub fn open(path: &str) -> Result<Self> {
         Ok(Self {
-            store: Store::open(path)?,
+            store: Store::open_read_only(path)?,
         })
     }
 }

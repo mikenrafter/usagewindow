@@ -52,7 +52,8 @@ their command-hook documents, while Cursor uses native `.cursor/hooks.json` even
 names. All three pass their events to the same `uw-hook` binary with the provider
 environment variable above.
 
-Run `result/bin/uw-mcp` beside the daemon with the same `UW_DB_PATH`. Its MCP endpoint
+Run `result/bin/uw-mcp` beside the daemon with `UW_DAEMON_URL` set to the daemon API
+(default `http://127.0.0.1:7878`). MCP never opens the SQLite database. Its MCP endpoint
 is `http://127.0.0.1:7880/mcp`; change the listener with `UW_MCP_LISTEN_ADDR`. The
 endpoint implements MCP `2026-07-28`: each JSON-RPC request is an independent HTTP
 POST with modern request metadata and the required `MCP-Protocol-Version`,

@@ -29,6 +29,8 @@ pub struct AppState {
     auth: Arc<WebAuth>,
 }
 
+pub type SharedStore = Arc<Mutex<Store>>;
+
 const SESSION_COOKIE: &str = "uw_session";
 const MAX_FAILED_LOGINS: u8 = 4;
 
@@ -130,15 +132,15 @@ pub fn app(store: Store) -> Router {
     app_with_adapters(store, HashMap::new())
 }
 
-pub fn app_with_adapters(
-    store: Store,
+pub fn app_with_shared_store(
+    store: SharedStore,
     adapters: HashMap<Provider, Arc<dyn HarnessAdapter>>,
 ) -> Router {
-    app_with_adapters_and_auth(store, adapters, None).expect("disabled web auth is valid")
+    app_with_shared_store_and_auth(store, adapters, None).expect("disabled web auth is valid")
 }
 
-pub fn app_with_adapters_and_auth(
-    store: Store,
+pub fn app_with_shared_store_and_auth(
+    store: SharedStore,
     adapters: HashMap<Provider, Arc<dyn HarnessAdapter>>,
     password_hash: Option<String>,
 ) -> anyhow::Result<Router> {
@@ -174,13 +176,36 @@ pub fn app_with_adapters_and_auth(
         .route("/api/auth/status", get(auth_status))
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/logout", post(auth_logout))
+        // These routes are for the loopback-only MCP bridge. The daemon owns
+        // the database, so MCP must use the daemon even when web auth is on.
+        .route("/api/internal/status", get(status))
+        .route("/api/internal/sessions/{id}", get(session))
+        .route(
+            "/api/internal/sessions/{id}/compact/ask",
+            post(compact_ask),
+        )
         .merge(protected)
         .fallback(static_asset)
         .with_state(AppState {
-            store: Arc::new(Mutex::new(store)),
+            store,
             adapters: Arc::new(adapters),
             auth,
         }))
+}
+
+pub fn app_with_adapters(
+    store: Store,
+    adapters: HashMap<Provider, Arc<dyn HarnessAdapter>>,
+) -> Router {
+    app_with_adapters_and_auth(store, adapters, None).expect("disabled web auth is valid")
+}
+
+pub fn app_with_adapters_and_auth(
+    store: Store,
+    adapters: HashMap<Provider, Arc<dyn HarnessAdapter>>,
+    password_hash: Option<String>,
+) -> anyhow::Result<Router> {
+    app_with_shared_store_and_auth(Arc::new(Mutex::new(store)), adapters, password_hash)
 }
 
 async fn authorize(
@@ -1416,6 +1441,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_store_router_reads_changes_from_owner_connection() {
+        let shared = Arc::new(Mutex::new(Store::open_memory().unwrap()));
+        let router = app_with_shared_store(shared.clone(), HashMap::new());
+        shared.lock().unwrap().insert_session(&session()).unwrap();
+
+        let response = router
+            .oneshot(
+                Request::get("/api/sessions/session-1")
+                    .header("accept", "application/json")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("session-1"));
+    }
+
+    #[tokio::test]
     async fn configured_auth_protects_api_until_password_login() {
         let hash = Argon2::default()
             .hash_password(
@@ -1434,6 +1481,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/api/internal/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
         let response = router
             .clone()

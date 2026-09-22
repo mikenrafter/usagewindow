@@ -9,14 +9,24 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+#[cfg(test)]
 use chrono::Utc;
 use serde_json::{Value, json};
+#[cfg(test)]
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
+#[cfg(test)]
 use uw_core::adapter::HarnessAdapter;
-use uw_core::api::{ProviderUsageSummary, StatusResponse, UsageWindowSummary};
+use uw_core::api::StatusResponse;
+#[cfg(test)]
+use uw_core::api::{ProviderUsageSummary, UsageWindowSummary};
+#[cfg(not(test))]
+use uw_core::api::{CompactAskRequest, CompactStatusResponse, SessionDetail};
 use uw_core::model::*;
+#[cfg(test)]
 use uw_store::Store;
 
 const PROTOCOL_VERSION: &str = "2026-07-28";
@@ -26,9 +36,16 @@ const CLIENT_INFO_KEY: &str = "io.modelcontextprotocol/clientInfo";
 const CLIENT_CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
 const CALLER_SESSION_ID_KEY: &str = "com.usagewindow/sessionId";
 
+#[cfg(test)]
 pub struct Deps {
     pub store: Arc<Mutex<Store>>,
     pub adapters: HashMap<Provider, Arc<dyn HarnessAdapter>>,
+}
+
+#[cfg(not(test))]
+pub struct Deps {
+    client: reqwest::blocking::Client,
+    daemon_url: String,
 }
 
 fn error(id: Value, code: i64, message: impl Into<String>) -> Value {
@@ -65,6 +82,7 @@ fn session_id_argument(
     }
 }
 
+#[cfg(test)]
 fn get_usage(args: &Value, deps: &Deps) -> Result<Value, String> {
     let provider = args
         .get("provider")
@@ -124,6 +142,7 @@ fn get_usage(args: &Value, deps: &Deps) -> Result<Value, String> {
     .map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
 fn call_tool(
     name: &str,
     args: &Value,
@@ -186,6 +205,92 @@ fn call_tool(
             Ok(tool_result(
                 json!({"supported":true,"queued":true,"request":request}),
             ))
+        }
+        _ => Err(format!("unknown tool: {name}")),
+    }
+}
+
+#[cfg(not(test))]
+fn daemon_request<T: serde::de::DeserializeOwned>(
+    response: reqwest::blocking::Response,
+) -> Result<T, String> {
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        return Err(format!("daemon returned {status}: {body}"));
+    }
+    response.json().map_err(|error| error.to_string())
+}
+
+#[cfg(not(test))]
+fn get_usage(args: &Value, deps: &Deps) -> Result<Value, String> {
+    let provider = args.get("provider").and_then(Value::as_str);
+    let account = args.get("account").and_then(Value::as_str);
+    let mut request = deps
+        .client
+        .get(format!("{}/api/internal/status", deps.daemon_url));
+    if let Some(provider) = provider {
+        request = request.query(&[("provider", provider)]);
+    }
+    if let Some(account) = account {
+        request = request.query(&[("account", account)]);
+    }
+    let status: StatusResponse = daemon_request(request.send().map_err(|error| error.to_string())?)?;
+    serde_json::to_value(status).map_err(|error| error.to_string())
+}
+
+#[cfg(not(test))]
+fn call_tool(
+    name: &str,
+    args: &Value,
+    deps: &Deps,
+    caller_session_id: Option<&SessionId>,
+) -> Result<Value, String> {
+    match name {
+        "get_usage" => Ok(tool_result(get_usage(args, deps)?)),
+        "get_resume_state" => {
+            let session_id = session_id_argument(args, caller_session_id)?;
+            let detail: SessionDetail = daemon_request(
+                deps.client
+                    .get(format!(
+                        "{}/api/internal/sessions/{}",
+                        deps.daemon_url, session_id.0
+                    ))
+                    .send()
+                    .map_err(|error| error.to_string())?,
+            )?;
+            Ok(tool_result(json!({
+                "session_id": session_id.0,
+                "markers": detail.resume_controls.marker.into_iter().collect::<Vec<_>>()
+            })))
+        }
+        "request_compaction" => {
+            let session_id = session_id_argument(args, caller_session_id)?;
+            let reason = args
+                .get("reason")
+                .and_then(Value::as_str)
+                .or_else(|| args.get("prompt").and_then(Value::as_str))
+                .unwrap_or("requested through MCP")
+                .to_owned();
+            let request = CompactAskRequest {
+                session_id: session_id.clone(),
+                reason: Some(reason),
+            };
+            let status: CompactStatusResponse = daemon_request(
+                deps.client
+                    .post(format!(
+                        "{}/api/internal/sessions/{}/compact/ask",
+                        deps.daemon_url, session_id.0
+                    ))
+                    .json(&request)
+                    .send()
+                    .map_err(|error| error.to_string())?,
+            )?;
+            Ok(tool_result(json!({
+                "supported": true,
+                "queued": true,
+                "requests": status.requests
+            })))
         }
         _ => Err(format!("unknown tool: {name}")),
     }
@@ -483,45 +588,23 @@ pub fn http_app(deps: Arc<Deps>) -> Router {
     Router::new().route("/mcp", post(mcp_http)).with_state(deps)
 }
 
-fn build_deps(path: &str) -> anyhow::Result<Deps> {
-    let cache_path = std::env::var("UW_CLAUDE_CACHE_PATH")
-        .unwrap_or_else(|_| format!("{path}.claude-usage-cache.json"));
-    let adapters: HashMap<Provider, Arc<dyn HarnessAdapter>> = HashMap::from([
-        (
-            Provider::ClaudeCode,
-            Arc::new(uw_adapters::claude_code::ClaudeCodeAdapter::real(
-                cache_path,
-                std::env::var("UW_CLAUDE_VERSION").unwrap_or_else(|_| "unknown".into()),
-            )) as Arc<dyn HarnessAdapter>,
-        ),
-        (
-            Provider::Codex,
-            Arc::new(uw_adapters::codex::CodexAdapter::real()) as Arc<dyn HarnessAdapter>,
-        ),
-    ]);
-    let mut adapters = adapters;
-    if let Ok(token) = std::env::var("UW_CURSOR_ACCESS_TOKEN") {
-        if !token.is_empty() && std::env::var("UW_CURSOR_SESSION_COOKIE").is_err() {
-            adapters.insert(
-                Provider::Cursor,
-                Arc::new(uw_adapters::cursor::CursorAdapter::real(vec![
-                    uw_adapters::cursor::CursorAuth::Bearer(token),
-                ])) as Arc<dyn HarnessAdapter>,
-            );
-        }
-    } else if let Ok(cookie) = std::env::var("UW_CURSOR_SESSION_COOKIE")
-        && !cookie.is_empty()
-    {
-        adapters.insert(
-            Provider::Cursor,
-            Arc::new(uw_adapters::cursor::CursorAdapter::real(vec![
-                uw_adapters::cursor::CursorAuth::Cookie(cookie),
-            ])) as Arc<dyn HarnessAdapter>,
-        );
-    }
+#[cfg(not(test))]
+fn build_deps() -> anyhow::Result<Deps> {
+    let daemon_url = std::env::var("UW_DAEMON_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:7878".into())
+        .trim_end_matches('/')
+        .to_owned();
     Ok(Deps {
-        store: Arc::new(Mutex::new(Store::open(path)?)),
-        adapters,
+        client: reqwest::blocking::Client::new(),
+        daemon_url,
+    })
+}
+
+#[cfg(test)]
+fn build_deps() -> anyhow::Result<Deps> {
+    Ok(Deps {
+        store: Arc::new(Mutex::new(Store::open_memory()?)),
+        adapters: HashMap::new(),
     })
 }
 
@@ -542,11 +625,7 @@ fn run_stdio(deps: &Deps) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let path = std::env::var("UW_DB_PATH").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_default();
-        format!("{home}/.usagewindow/usagewindow.db")
-    });
-    let deps = build_deps(&path)?;
+    let deps = build_deps()?;
     if std::env::args().any(|arg| arg == "--stdio")
         || std::env::var("UW_MCP_TRANSPORT").is_ok_and(|value| value == "stdio")
     {

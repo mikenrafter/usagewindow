@@ -1781,12 +1781,12 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
  "tower",
  "uuid",
- "uw-adapters",
  "uw-core",
  "uw-store",
 ]

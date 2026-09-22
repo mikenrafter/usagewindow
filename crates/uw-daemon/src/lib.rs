@@ -19,7 +19,7 @@ use uw_policy::{AdviseChannel, CacheCostObservation, WindowBlock};
 use uw_store::Store;
 
 struct StoreHookChannel {
-    db_path: String,
+    store: Arc<Mutex<Store>>,
 }
 
 #[cfg(test)]
@@ -170,12 +170,16 @@ impl uw_adapters::claude_code::HookChannel for StoreHookChannel {
         session_id: &SessionId,
         text: &str,
     ) -> uw_core::adapter::AdapterResult<DeliveryOutcome> {
-        let path = self.db_path.clone();
+        let store = Arc::clone(&self.store);
         let session_id = session_id.clone();
         let text = text.to_owned();
         tokio::task::spawn_blocking(move || {
-            Store::open(&path)
-                .and_then(|store| store.enqueue_hook_message(&session_id, "Stop", &text))
+            let store = store
+                .lock()
+                .map_err(|_| anyhow::anyhow!("store lock poisoned"))?;
+            store
+                .enqueue_hook_message(&session_id, "Stop", &text)
+                .map_err(|error| anyhow::anyhow!(error))
         })
         .await
         .map_err(|error| uw_core::adapter::AdapterError::Other(error.to_string()))?
@@ -188,12 +192,16 @@ impl uw_adapters::claude_code::HookChannel for StoreHookChannel {
         session_id: &SessionId,
         text: &str,
     ) -> uw_core::adapter::AdapterResult<DeliveryOutcome> {
-        let path = self.db_path.clone();
+        let store = Arc::clone(&self.store);
         let session_id = session_id.clone();
         let text = text.to_owned();
         tokio::task::spawn_blocking(move || {
-            Store::open(&path)
-                .and_then(|store| store.enqueue_hook_message(&session_id, "SessionStart", &text))
+            let store = store
+                .lock()
+                .map_err(|_| anyhow::anyhow!("store lock poisoned"))?;
+            store
+                .enqueue_hook_message(&session_id, "SessionStart", &text)
+                .map_err(|error| anyhow::anyhow!(error))
         })
         .await
         .map_err(|error| uw_core::adapter::AdapterError::Other(error.to_string()))?
@@ -375,6 +383,10 @@ impl SqliteDaemonStore {
         Self {
             inner: Arc::new(Mutex::new(store)),
         }
+    }
+
+    pub fn shared_store(&self) -> Arc<Mutex<Store>> {
+        Arc::clone(&self.inner)
     }
     async fn blocking<T, F>(&self, operation: F) -> anyhow::Result<T>
     where
@@ -2229,8 +2241,9 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
     let daemon_store = Arc::new(SqliteDaemonStore::new(store));
     let cache_path = std::env::var("UW_CLAUDE_CACHE_PATH")
         .unwrap_or_else(|_| format!("{path}.claude-usage-cache.json"));
+    let shared_store = daemon_store.shared_store();
     let hook_channel = Arc::new(StoreHookChannel {
-        db_path: path.clone(),
+        store: Arc::clone(&shared_store),
     });
     let paseo_messenger = Arc::new(PaseoSessionMessenger::from_environment());
     let claude = uw_adapters::claude_code::ClaudeCodeAdapter::real(
@@ -2312,7 +2325,7 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
     ));
     adapters.insert(Provider::Codex, codex);
     let liveness = SystemSessionLivenessChecker {
-        db_path: path.clone(),
+        store: Arc::clone(&shared_store),
     };
     let web_password_hash = match std::env::var("UW_WEB_PASSWORD_HASH_FILE") {
         Ok(path) => {
@@ -2323,8 +2336,8 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
         Err(std::env::VarError::NotPresent) => None,
         Err(error) => return Err(error.into()),
     };
-    let app = uw_web::app_with_adapters_and_auth(
-        Store::open(&path)?,
+    let app = uw_web::app_with_shared_store_and_auth(
+        shared_store,
         adapters.clone(),
         web_password_hash,
     )?;
@@ -2348,16 +2361,18 @@ fn cursor_auth_from_environment() -> Vec<uw_adapters::cursor::CursorAuth> {
 }
 
 struct SystemSessionLivenessChecker {
-    db_path: String,
+    store: Arc<Mutex<Store>>,
 }
 #[async_trait]
 impl SessionLivenessChecker for SystemSessionLivenessChecker {
     async fn is_idle(&self, session: &SessionSummary) -> bool {
-        let path = self.db_path.clone();
+        let store = Arc::clone(&self.store);
         let id = session.id.clone();
         tokio::task::spawn_blocking(move || {
-            Store::open(&path)
-                .and_then(|store| store.latest_hook_event(&id))
+            store
+                .lock()
+                .map_err(|_| anyhow::anyhow!("store lock poisoned"))
+                .and_then(|store| Ok(store.latest_hook_event(&id)?))
                 .ok()
                 .flatten()
                 .as_deref()
