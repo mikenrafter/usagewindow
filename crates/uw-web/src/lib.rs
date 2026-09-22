@@ -527,10 +527,12 @@ async fn status(
                     && records.iter().any(|record| {
                         record.at >= activity_cutoff && record.total_tokens > 0
                     });
-                let recent = records.iter().any(|record| {
-                    record.at >= now - Duration::hours(24) && record.total_tokens > 0
-                });
-                Ok((session.id.clone(), active, recent))
+                let activity = records
+                    .into_iter()
+                    .filter(|record| record.total_tokens > 0)
+                    .map(|record| record.at)
+                    .collect::<Vec<_>>();
+                Ok((session.id.clone(), active, activity))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         let usage = latest.into_values().map(|sample| {
@@ -546,12 +548,25 @@ async fn status(
                     WindowKind::WeeklyModel(_) | WindowKind::WeeklySurface(_) => true,
                     WindowKind::Custom(_) => false,
                 };
+                let purview = match &key.kind {
+                    WindowKind::Rolling { minutes } => Some(Duration::minutes(*minutes as i64)),
+                    WindowKind::WeeklyModel(_) | WindowKind::WeeklySurface(_) => {
+                        Some(Duration::days(7))
+                    }
+                    WindowKind::Custom(_) => None,
+                };
                 let active_sessions = sessions
                     .iter()
                     .filter(|s| s.harness == provider && s.account == account)
                     .filter(|s| {
-                        session_activity.iter().any(|(id, active, recent)| {
-                            id == &s.id && if long_window { *recent } else { *active }
+                        session_activity.iter().any(|(id, active, activity)| {
+                            id == &s.id
+                                && if long_window {
+                                    let cutoff = now - purview.expect("long windows have a purview");
+                                    activity.iter().any(|at| *at >= cutoff)
+                                } else {
+                                    *active
+                                }
                         })
                     })
                     .count() as u32;
@@ -1361,8 +1376,11 @@ mod tests {
         let active = session();
         let mut idle = session();
         idle.id = SessionId("session-2".into());
+        let mut outside = session();
+        outside.id = SessionId("session-3".into());
         store.insert_session(&active).unwrap();
         store.insert_session(&idle).unwrap();
+        store.insert_session(&outside).unwrap();
         store
             .insert_token_usage_records(
                 &active.id,
@@ -1384,6 +1402,21 @@ mod tests {
                 &[TokenUsageRecord {
                     at: Utc::now() - Duration::hours(1),
                     model: idle.model.clone(),
+                    input_tokens: 80,
+                    cached_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 20,
+                    reasoning_output_tokens: 0,
+                    total_tokens: 100,
+                }],
+            )
+            .unwrap();
+        store
+            .insert_token_usage_records(
+                &outside.id,
+                &[TokenUsageRecord {
+                    at: Utc::now() - Duration::hours(6),
+                    model: outside.model.clone(),
                     input_tokens: 80,
                     cached_input_tokens: 0,
                     cache_write_input_tokens: 0,
