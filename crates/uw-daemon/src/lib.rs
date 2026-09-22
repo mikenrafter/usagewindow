@@ -956,6 +956,92 @@ where
 
 pub const KEEPALIVE_MARKER: &str = "[[uw-keepalive]] no action needed, acknowledge briefly";
 
+fn t3_external_status(
+    key: &str,
+    text: &str,
+    icon: &str,
+    color: &str,
+    notify_user: bool,
+    expires_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "source": "usagewindow",
+        "key": key,
+        "text": text,
+        "icon": icon,
+        "color": color,
+        "notifyUser": notify_user,
+        "expiresAt": expires_at,
+        "updatedAt": now,
+    })
+}
+
+fn resolve_t3_external_status(
+    compactions: &[CompactionRequest],
+    resume: Option<&ResumeMarker>,
+    stopped_reason: Option<&StopReason>,
+    now: DateTime<Utc>,
+) -> Option<serde_json::Value> {
+    if compactions.iter().any(|request| {
+        matches!(
+            request.status,
+            CompactionStatus::Pending | CompactionStatus::Sending
+        )
+    }) {
+        return Some(t3_external_status(
+            "compacting",
+            "Compacting",
+            "shrink",
+            "amber",
+            false,
+            None,
+            now,
+        ));
+    }
+    if let Some(marker) = resume.filter(|marker| {
+        matches!(marker.status, ResumeStatus::Pending | ResumeStatus::Scheduled)
+    }) {
+        return Some(t3_external_status(
+            "scheduled",
+            "Scheduled",
+            "clock",
+            "indigo",
+            true,
+            marker.resume_at,
+            now,
+        ));
+    }
+    if matches!(stopped_reason, Some(StopReason::UsageLimit { .. })) {
+        return Some(t3_external_status(
+            "paused",
+            "Paused",
+            "pause",
+            "slate",
+            true,
+            None,
+            now,
+        ));
+    }
+    None
+}
+
+async fn sync_t3_external_status(
+    adapters: &HashMap<Provider, Arc<dyn HarnessAdapter>>,
+    session: &SessionSummary,
+    compactions: &[CompactionRequest],
+    resume: Option<&ResumeMarker>,
+    now: DateTime<Utc>,
+) {
+    let Some(t3code) = adapters.get(&Provider::Other("t3code".into())) else {
+        return;
+    };
+    let status = resolve_t3_external_status(compactions, resume, session.stopped_reason.as_ref(), now);
+    if let Err(error) = t3code.set_external_status(session, status).await {
+        tracing::debug!(session = %session.id.0, %error, "could not publish T3Code external status");
+    }
+}
+
 pub fn should_fire_keepalive(
     now: DateTime<Utc>,
     session: &SessionSummary,
@@ -1376,6 +1462,9 @@ pub async fn run_policy_tick(
                 .set_keepalive_enabled(&session.id, false)
                 .await?;
         }
+        let compactions = store.compaction_requests_for_session(&session.id).await?;
+        let resume = store.active_resume_marker(&session.id).await?;
+        sync_t3_external_status(adapters, session, &compactions, resume.as_ref(), now).await;
     }
     run_keepalive_tick(keepalive_store, adapters, now, profiles, &token_records).await?;
     Ok(())
@@ -2336,6 +2425,69 @@ mod tests {
             headless_resume: true,
             seed_modes: vec![],
         }
+    }
+
+    #[test]
+    fn external_status_prioritizes_compacting_over_scheduled_and_paused() {
+        let mut compact = request();
+        compact.status = CompactionStatus::Sending;
+        let marker = ResumeMarker {
+            id: uuid::Uuid::new_v4(),
+            session_id: SessionId("s".into()),
+            reason: ResumeReason::AutoDetectedLimit,
+            resume_at: Some(Utc::now() + Duration::hours(1)),
+            requested_at: None,
+            created_at: Utc::now(),
+            status: ResumeStatus::Scheduled,
+            message: None,
+        };
+        let status = resolve_t3_external_status(
+            &[compact],
+            Some(&marker),
+            Some(&StopReason::UsageLimit {
+                window: WindowKey {
+                    provider: Provider::Codex,
+                    kind: WindowKind::Custom("quota".into()),
+                },
+            }),
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(status["key"], "compacting");
+    }
+
+    #[test]
+    fn external_status_reports_scheduled_resume_and_paused_limit() {
+        let at = Utc::now() + Duration::hours(1);
+        let marker = ResumeMarker {
+            id: uuid::Uuid::new_v4(),
+            session_id: SessionId("s".into()),
+            reason: ResumeReason::AutoDetectedLimit,
+            resume_at: Some(at),
+            requested_at: None,
+            created_at: Utc::now(),
+            status: ResumeStatus::Scheduled,
+            message: None,
+        };
+        let scheduled = resolve_t3_external_status(&[], Some(&marker), None, Utc::now()).unwrap();
+        assert_eq!(scheduled["key"], "scheduled");
+        assert_eq!(
+            scheduled["expiresAt"],
+            at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+        );
+        let paused = resolve_t3_external_status(
+            &[],
+            None,
+            Some(&StopReason::UsageLimit {
+                window: WindowKey {
+                    provider: Provider::Codex,
+                    kind: WindowKind::Custom("quota".into()),
+                },
+            }),
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(paused["key"], "paused");
     }
     fn session() -> SessionSummary {
         SessionSummary {

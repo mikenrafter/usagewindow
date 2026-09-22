@@ -215,20 +215,6 @@ impl T3CodeAdapter {
         }
     }
 
-    /// Set or clear the producer-owned T3Code status overlay for this session.
-    /// Native session lifecycle state remains T3Code's responsibility.
-    pub async fn set_external_status(
-        &self,
-        session: &SessionSummary,
-        status: Option<Value>,
-    ) -> AdapterResult<()> {
-        let thread_id = self.owned_thread(session).await?;
-        self.transport
-            .post_thread_status(&thread_id.0, status)
-            .await
-            .map(|_| ())
-    }
-
     pub fn capabilities_static() -> Capabilities {
         Capabilities {
             can_trigger_compaction: true,
@@ -292,6 +278,18 @@ impl HarnessAdapter for T3CodeAdapter {
 
     async fn fetch_usage(&self, _: Option<&AccountId>) -> AdapterResult<UsageSample> {
         Err(AdapterError::Unsupported)
+    }
+
+    async fn set_external_status(
+        &self,
+        session: &SessionSummary,
+        status: Option<Value>,
+    ) -> AdapterResult<()> {
+        let thread_id = self.owned_thread(session).await?;
+        self.transport
+            .post_thread_status(&thread_id.0, status)
+            .await
+            .map(|_| ())
     }
 
     /// Verified against a live T3Code thread that actually hit a provider

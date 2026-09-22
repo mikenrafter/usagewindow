@@ -2,6 +2,7 @@ use crate::model::*;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -151,6 +152,15 @@ pub trait HarnessAdapter: Send + Sync {
         session: &SessionSummary,
         message: Option<&str>,
     ) -> AdapterResult<()>;
+    /// Set or clear a producer-owned UI status overlay. Harnesses that do not
+    /// expose such a metadata surface keep the default unsupported behavior.
+    async fn set_external_status(
+        &self,
+        _session: &SessionSummary,
+        _status: Option<Value>,
+    ) -> AdapterResult<()> {
+        Err(AdapterError::Unsupported)
+    }
     /// Export a read-only transcript. Implementations may support this even when the
     /// harness session is stopped; adapters must omit usagewindow keepalive turns.
     async fn export_transcript(&self, _session: &SessionSummary) -> AdapterResult<String> {
