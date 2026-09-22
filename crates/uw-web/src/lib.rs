@@ -588,30 +588,36 @@ async fn status(
                 let burn_rate_pct_per_hour = blocks.last().and_then(|block| uw_policy::burn_rate_pct_per_hour_available(block, burn_lookback));
                 let purview = uw_policy::burn_rate_display_lookback_for_provider(&provider, &key.kind);
                 let long_window = purview > Duration::hours(2);
-                let active_sessions = sessions
+                let cutoff = now - purview;
+                let mut inactive_sessions = 0;
+                let mut active_sessions = 0;
+                let mut keptalive_sessions = 0;
+                for session in sessions
                     .iter()
                     .filter(|s| s.harness == provider && s.account == account)
-                    .filter(|s| {
-                        session_activity.iter().any(|(id, active, _, _, activity)| {
-                            id == &s.id
-                                && if long_window {
-                                    let cutoff = now - purview;
-                                    activity.iter().any(|at| *at >= cutoff)
-                                } else {
-                                    *active
-                                }
-                        })
-                    })
-                    .count() as u32;
-                let keptalive_sessions = sessions
-                    .iter()
-                    .filter(|s| s.harness == provider && s.account == account)
-                    .filter(|s| {
-                        session_activity
-                            .iter()
-                            .any(|(id, _, keptalive, _, _)| id == &s.id && *keptalive)
-                    })
-                    .count() as u32;
+                {
+                    let Some((_, active, keptalive, _, activity)) = session_activity
+                        .iter()
+                        .find(|(id, _, _, _, _)| id == &session.id)
+                    else {
+                        continue;
+                    };
+                    let in_burn_window = if long_window {
+                        activity.iter().any(|at| *at >= cutoff)
+                    } else {
+                        *active
+                    };
+                    if !in_burn_window {
+                        continue;
+                    }
+                    if *active {
+                        active_sessions += 1;
+                    } else if *keptalive {
+                        keptalive_sessions += 1;
+                    } else {
+                        inactive_sessions += 1;
+                    }
+                }
                 let scheduled_sessions = sessions
                     .iter()
                     .filter(|s| s.harness == provider && s.account == account)
@@ -631,6 +637,7 @@ async fn status(
                     resets_at: window.resets_at,
                     exceeded: window.exceeded,
                     burn_rate_pct_per_hour,
+                    inactive_sessions,
                     active_sessions,
                     keptalive_sessions,
                     scheduled_sessions,
@@ -1672,7 +1679,8 @@ mod tests {
             .unwrap();
         let value: StatusResponse = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(value.usage[0].windows[0].active_sessions, 2);
+        assert_eq!(value.usage[0].windows[0].inactive_sessions, 1);
+        assert_eq!(value.usage[0].windows[0].active_sessions, 1);
     }
 
     #[tokio::test]
