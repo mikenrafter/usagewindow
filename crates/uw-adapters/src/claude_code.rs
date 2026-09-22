@@ -161,6 +161,63 @@ impl CredentialsReader for FileCredentialsReader {
         .map_err(|e| AdapterError::Other(e.to_string()))
     }
 }
+
+/// Account identity and plan, as reported by the `claude` CLI itself.
+/// `.claude/.credentials.json`'s OAuth blob carries only tokens and
+/// `subscriptionType`/`rateLimitTier` on real installs — no email, despite
+/// the pointers `account_from_credentials` still checks as a fallback — so
+/// `claude auth status` is the only source that reliably has the
+/// human-readable account name. Verified 2026-09-22 against a live `claude
+/// auth status`: `{"loggedIn":true,...,"email":"...","subscriptionType":"pro",...}`.
+#[async_trait]
+pub trait AuthStatusReader: Send + Sync {
+    async fn read(&self) -> AdapterResult<Value>;
+}
+pub struct ClaudeCliAuthStatusReader;
+#[async_trait]
+impl AuthStatusReader for ClaudeCliAuthStatusReader {
+    async fn read(&self) -> AdapterResult<Value> {
+        let output = tokio::process::Command::new("claude")
+            .args(["auth", "status"])
+            .output()
+            .await
+            .map_err(|e| AdapterError::Transient(e.to_string()))?;
+        if !output.status.success() {
+            return Err(AdapterError::Other(
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ));
+        }
+        serde_json::from_slice(&output.stdout).map_err(|e| AdapterError::Other(e.to_string()))
+    }
+}
+
+/// `claude auth status`'s `subscriptionType` is lowercase/machine-shaped
+/// (`"pro"`, `"max"`, `"free"`); the card should show the same casing Claude's
+/// own UI uses.
+fn display_plan_name(subscription_type: &str) -> String {
+    match subscription_type {
+        "free" => "Free".into(),
+        "pro" => "Pro".into(),
+        "max" => "Max".into(),
+        "team" => "Team".into(),
+        "enterprise" => "Enterprise".into(),
+        other => other.into(),
+    }
+}
+
+fn account_and_plan_from_auth_status(value: &Value) -> (Option<AccountId>, Option<String>) {
+    let account = value
+        .get("email")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(|value| AccountId(value.to_owned()));
+    let plan = value
+        .get("subscriptionType")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(display_plan_name);
+    (account, plan)
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HttpRequest {
     pub url: String,
@@ -281,6 +338,7 @@ pub struct ClaudeCodeAdapter {
     spawner: Arc<dyn ProcessSpawner>,
     transcript_fs: Arc<dyn TranscriptFileSystem>,
     discovery_cache: Mutex<HashMap<String, CachedTranscript>>,
+    auth_status: Arc<dyn AuthStatusReader>,
 }
 
 struct CachedTranscript {
@@ -315,6 +373,7 @@ impl ClaudeCodeAdapter {
             spawner: Arc::new(crate::process::TokioProcessSpawner),
             transcript_fs: Arc::new(ClaudeTranscriptFileSystem),
             discovery_cache: Mutex::new(HashMap::new()),
+            auth_status: Arc::new(ClaudeCliAuthStatusReader),
         }
     }
     pub fn capabilities_static() -> Capabilities {
@@ -347,10 +406,28 @@ impl ClaudeCodeAdapter {
         self.transcript_fs = fs;
         self
     }
+    pub fn with_auth_status(mut self, auth_status: Arc<dyn AuthStatusReader>) -> Self {
+        self.auth_status = auth_status;
+        self
+    }
     async fn fetch_live(&self) -> AdapterResult<UsageSample> {
         let value: Value = serde_json::from_str(&self.credentials.read().await?)
             .map_err(|e| AdapterError::Other(e.to_string()))?;
-        let account = account_from_credentials(&value);
+        // `claude auth status` is the only reliable source of the account
+        // email and plan (see `AuthStatusReader`'s doc comment); the OAuth
+        // blob's own pointers are kept as a fallback for older CLI versions
+        // that predate the `auth status` subcommand, or when it's briefly
+        // unreachable (e.g. spawn failure) — never fatal to the usage fetch.
+        let (account, plan) = match self.auth_status.read().await {
+            Ok(status) => account_and_plan_from_auth_status(&status),
+            Err(_) => (
+                account_from_credentials(&value),
+                value
+                    .pointer("/claudeAiOauth/subscriptionType")
+                    .and_then(Value::as_str)
+                    .map(display_plan_name),
+            ),
+        };
         let token = value
             .pointer("/claudeAiOauth/accessToken")
             .and_then(Value::as_str)
@@ -401,6 +478,7 @@ impl ClaudeCodeAdapter {
             source: UsageSource::ProviderReported,
             provider: Provider::ClaudeCode,
             account,
+            plan,
             windows,
             credits: None,
         })
@@ -963,6 +1041,7 @@ mod tests {
                 source: UsageSource::ProviderReported,
                 provider: Provider::ClaudeCode,
                 account: None,
+                plan: None,
                 windows: HashMap::new(),
                 credits: None,
             },
@@ -1056,6 +1135,17 @@ mod tests {
     fn body() -> String {
         r#"{"five_hour":{"utilization":120,"resets_at":"2026-09-17T12:00:00Z"},"seven_day":{"utilization":-4,"resets_at":null}}"#.into()
     }
+    /// Always fails, so tests exercise the credentials.json fallback in
+    /// `fetch_live` deterministically instead of spawning a real `claude`
+    /// CLI process (which may not be installed, and would report whatever
+    /// account is actually logged in on the test machine).
+    struct FailingAuthStatus;
+    #[async_trait::async_trait]
+    impl AuthStatusReader for FailingAuthStatus {
+        async fn read(&self) -> AdapterResult<Value> {
+            Err(AdapterError::Other("no claude CLI in tests".into()))
+        }
+    }
     fn adapter(status: u16, cache: Arc<Cache>, calls: Arc<Mutex<usize>>) -> ClaudeCodeAdapter {
         ClaudeCodeAdapter::with_dependencies(
             Arc::new(Credentials),
@@ -1069,6 +1159,7 @@ mod tests {
             "1.2.3".into(),
             Arc::new(|| Utc.timestamp_opt(1_800_000_000, 0).unwrap()),
         )
+        .with_auth_status(Arc::new(FailingAuthStatus))
     }
     #[tokio::test]
     async fn fetch_usage_parses_and_clamps() {
@@ -1113,6 +1204,7 @@ mod tests {
                     source: UsageSource::ProviderReported,
                     provider: Provider::ClaudeCode,
                     account: None,
+                    plan: None,
                     windows: Default::default(),
                     credits: None,
                 },
@@ -1133,6 +1225,7 @@ mod tests {
             source: UsageSource::ProviderReported,
             provider: Provider::ClaudeCode,
             account: None,
+            plan: None,
             windows: Default::default(),
             credits: None,
         };
@@ -1156,6 +1249,7 @@ mod tests {
             source: UsageSource::ProviderReported,
             provider: Provider::ClaudeCode,
             account: None,
+            plan: None,
             windows: Default::default(),
             credits: None,
         };
@@ -1344,6 +1438,7 @@ mod tests {
             source: UsageSource::ProviderReported,
             provider: Provider::ClaudeCode,
             account: None,
+            plan: None,
             windows: HashMap::from([(
                 WindowKey {
                     provider: Provider::ClaudeCode,

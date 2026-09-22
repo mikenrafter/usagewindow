@@ -145,6 +145,10 @@ pub struct UsageSample {
     pub source: UsageSource,
     pub provider: Provider,
     pub account: Option<AccountId>,
+    /// Human-readable subscription tier as the provider names it (e.g. "Pro",
+    /// "Plus"), read from the same account/auth lookup as `account`. `None`
+    /// when the harness exposes no plan concept or the lookup failed.
+    pub plan: Option<String>,
     #[serde(with = "window_map")]
     pub windows: HashMap<WindowKey, UsageWindowState>,
     pub credits: Option<CreditBalance>,
@@ -453,6 +457,7 @@ mod tests {
             source: UsageSource::ProviderReported,
             provider: Provider::ClaudeCode,
             account: Some(AccountId("a".into())),
+            plan: None,
             windows: HashMap::from([(
                 key,
                 UsageWindowState {

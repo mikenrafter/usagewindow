@@ -540,6 +540,7 @@ mod tests {
             source: UsageSource::ProviderReported,
             provider: Provider::ClaudeCode,
             account: Some(AccountId("a".into())),
+            plan: None,
             windows: HashMap::from([(key(), UsageWindowState::new(pct, false, true, reset, None))]),
             credits: None,
         }

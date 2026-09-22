@@ -89,6 +89,7 @@ fn parse_sample(stdout: &str) -> AdapterResult<UsageSample> {
         source: UsageSource::ProviderReported,
         provider: Provider::Other("generic".into()),
         account: None,
+        plan: None,
         windows,
         credits: None,
     })

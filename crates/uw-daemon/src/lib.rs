@@ -2483,6 +2483,7 @@ mod tests {
                     source: UsageSource::ProviderReported,
                     provider: Provider::ClaudeCode,
                     account: None,
+                    plan: None,
                     windows: HashMap::from([(
                         key.clone(),
                         UsageWindowState::new(0.0, false, true, None, None),
@@ -2495,6 +2496,7 @@ mod tests {
                     source: UsageSource::ProviderReported,
                     provider: Provider::ClaudeCode,
                     account: None,
+                    plan: None,
                     windows: HashMap::from([(
                         key,
                         UsageWindowState::new(51.0, false, true, None, None),
@@ -2890,6 +2892,7 @@ mod tests {
             source: UsageSource::ProviderReported,
             provider: Provider::Codex,
             account: None,
+            plan: None,
             windows: HashMap::from([(
                 key.clone(),
                 UsageWindowState::new(100.0, true, true, None, None),
@@ -2960,6 +2963,7 @@ mod tests {
                 source: UsageSource::ProviderReported,
                 provider: Provider::Codex,
                 account: None,
+                plan: None,
                 windows: HashMap::from([(
                     key.clone(),
                     UsageWindowState::new(100.0, true, true, None, None),
@@ -3015,6 +3019,7 @@ mod tests {
                 source: UsageSource::ProviderReported,
                 provider: Provider::Codex,
                 account: None,
+                plan: None,
                 windows: HashMap::from([(
                     key.clone(),
                     UsageWindowState::new(100.0, true, true, None, None),
@@ -3067,6 +3072,7 @@ mod tests {
                 source: UsageSource::ProviderReported,
                 provider: Provider::Codex,
                 account: None,
+                plan: None,
                 windows: HashMap::from([(
                     key.clone(),
                     UsageWindowState::new(100.0, true, true, None, None),
@@ -3121,6 +3127,7 @@ mod tests {
                 source: UsageSource::ProviderReported,
                 provider: Provider::Codex,
                 account: None,
+                plan: None,
                 windows: HashMap::from([(
                     key.clone(),
                     UsageWindowState::new(100.0, true, true, None, None),
@@ -3165,6 +3172,7 @@ mod tests {
                 source: UsageSource::ProviderReported,
                 provider: Provider::Codex,
                 account: None,
+                plan: None,
                 windows: HashMap::from([(
                     key,
                     UsageWindowState::new(100.0, true, true, None, None),
@@ -3405,6 +3413,7 @@ mod tests {
                 source: UsageSource::ProviderReported,
                 provider: provider.clone(),
                 account: None,
+                plan: None,
                 windows: HashMap::from([(
                     window.clone(),
                     UsageWindowState::new(5.0, false, true, None, None),
@@ -3440,6 +3449,7 @@ mod tests {
             source: UsageSource::ProviderReported,
             provider,
             account: None,
+            plan: None,
             windows: HashMap::from([(window, UsageWindowState::new(1.0, false, true, None, None))]),
             credits: None,
         };
@@ -3487,6 +3497,7 @@ mod tests {
             source: UsageSource::ProviderReported,
             provider: Provider::Codex,
             account: None,
+            plan: None,
             windows: HashMap::from([(
                 key.clone(),
                 UsageWindowState::new(pct, false, true, None, None),
@@ -4426,6 +4437,7 @@ mod tests {
                 source: UsageSource::ProviderReported,
                 provider: Provider::ClaudeCode,
                 account: None,
+                plan: None,
                 windows: HashMap::from([(
                     key.clone(),
                     UsageWindowState::new(pct, false, true, Some(now + Duration::hours(1)), None),

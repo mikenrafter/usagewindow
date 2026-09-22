@@ -63,6 +63,13 @@ impl Store {
         {
             return Err(err.into());
         }
+        if let Err(err) = self
+            .connection
+            .execute("ALTER TABLE usage_samples ADD COLUMN plan TEXT", [])
+            && !err.to_string().contains("duplicate column name")
+        {
+            return Err(err.into());
+        }
         Ok(())
     }
     pub fn insert_usage_sample(&self, s: &UsageSample) -> StoreResult<i64> {
@@ -70,7 +77,7 @@ impl Store {
         let mut id = 0;
         for (k, w) in &s.windows {
             let (kind, val) = encode_kind(&k.kind);
-            tx.execute("INSERT INTO usage_samples(provider,account,window_kind,window_scope_value,pct,resets_at,exceeded,active,source,at,fetched_at,credits_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![json(&s.provider)?,opt_json(&s.account)?,kind,val,w.pct,w.resets_at,boolean(w.exceeded),boolean(w.active),json(&s.source)?,s.at,s.fetched_at,opt_json(&s.credits)?])?;
+            tx.execute("INSERT INTO usage_samples(provider,account,window_kind,window_scope_value,pct,resets_at,exceeded,active,source,at,fetched_at,credits_json,plan) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",params![json(&s.provider)?,opt_json(&s.account)?,kind,val,w.pct,w.resets_at,boolean(w.exceeded),boolean(w.active),json(&s.source)?,s.at,s.fetched_at,opt_json(&s.credits)?,s.plan.as_deref()])?;
             id = tx.last_insert_rowid();
         }
         tx.commit()?;
@@ -79,7 +86,7 @@ impl Store {
     pub fn read_usage_sample(&self, id: i64) -> StoreResult<UsageSample> {
         self.connection
             .query_row(
-                "SELECT provider,account,window_kind,window_scope_value,pct,resets_at,exceeded,active,source,at,fetched_at,credits_json FROM usage_samples WHERE id=?",
+                "SELECT provider,account,window_kind,window_scope_value,pct,resets_at,exceeded,active,source,at,fetched_at,credits_json,plan FROM usage_samples WHERE id=?",
                 [id],
                 decode_usage_sample_row,
             )
@@ -89,7 +96,7 @@ impl Store {
     /// Single query, decoded row-by-row — replaces the old id-then-refetch (N+1) path.
     pub fn all_usage_samples(&self) -> StoreResult<Vec<UsageSample>> {
         let mut stmt = self.connection.prepare(
-            "SELECT provider,account,window_kind,window_scope_value,pct,resets_at,exceeded,active,source,at,fetched_at,credits_json FROM usage_samples ORDER BY at,id",
+            "SELECT provider,account,window_kind,window_scope_value,pct,resets_at,exceeded,active,source,at,fetched_at,credits_json,plan FROM usage_samples ORDER BY at,id",
         )?;
         let rows = stmt.query_map([], decode_usage_sample_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -103,7 +110,7 @@ impl Store {
         account: Option<&AccountId>,
     ) -> StoreResult<Vec<UsageSample>> {
         let mut stmt = self.connection.prepare(
-            "SELECT provider,account,window_kind,window_scope_value,pct,resets_at,exceeded,active,source,at,fetched_at,credits_json FROM usage_samples WHERE provider=?1 AND account IS ?2 ORDER BY at,id",
+            "SELECT provider,account,window_kind,window_scope_value,pct,resets_at,exceeded,active,source,at,fetched_at,credits_json,plan FROM usage_samples WHERE provider=?1 AND account IS ?2 ORDER BY at,id",
         )?;
         let rows = stmt.query_map(
             params![json(provider)?, account.map(json).transpose()?],
@@ -119,7 +126,7 @@ impl Store {
         provider: Option<&Provider>,
         account: Option<&AccountId>,
     ) -> StoreResult<Vec<UsageSample>> {
-        let sql = "SELECT provider,account,window_kind,window_scope_value,pct,resets_at,exceeded,active,source,at,fetched_at,credits_json FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY provider,account,window_kind,window_scope_value ORDER BY at DESC,id DESC) AS rank FROM usage_samples WHERE (?1 IS NULL OR provider=?1) AND (?2 IS NULL OR account IS ?2)) WHERE rank=1 ORDER BY provider,account,window_kind,window_scope_value";
+        let sql = "SELECT provider,account,window_kind,window_scope_value,pct,resets_at,exceeded,active,source,at,fetched_at,credits_json,plan FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY provider,account,window_kind,window_scope_value ORDER BY at DESC,id DESC) AS rank FROM usage_samples WHERE (?1 IS NULL OR provider=?1) AND (?2 IS NULL OR account IS ?2)) WHERE rank=1 ORDER BY provider,account,window_kind,window_scope_value";
         let mut stmt = self.connection.prepare(sql)?;
         let rows = stmt.query_map(
             params![
@@ -924,6 +931,7 @@ fn decode_usage_sample_row(row: &rusqlite::Row) -> rusqlite::Result<UsageSample>
     let at: DateTime<Utc> = row.get(9)?;
     let fetched_at: Option<DateTime<Utc>> = row.get(10)?;
     let credits_json: Option<String> = row.get(11)?;
+    let plan: Option<String> = row.get(12)?;
     let provider: Provider = serde_json::from_str(&provider).map_err(json_err)?;
     let account: Option<AccountId> = account
         .map(|x| serde_json::from_str(&x))
@@ -935,6 +943,7 @@ fn decode_usage_sample_row(row: &rusqlite::Row) -> rusqlite::Result<UsageSample>
         source: serde_json::from_str(&source).map_err(json_err)?,
         provider: provider.clone(),
         account,
+        plan,
         windows: std::collections::HashMap::from([(
             WindowKey {
                 provider,
@@ -1032,7 +1041,7 @@ fn decode_compaction_event_row(row: &rusqlite::Row) -> rusqlite::Result<Compacti
         completed_at: row.get(9)?,
     })
 }
-const SCHEMA: &str = r#"PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS usage_samples(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,account TEXT,window_kind TEXT NOT NULL,window_scope_value TEXT NOT NULL,pct REAL NOT NULL,resets_at TEXT,exceeded INTEGER NOT NULL,active INTEGER NOT NULL,source TEXT NOT NULL,at TEXT NOT NULL,fetched_at TEXT,credits_json TEXT);CREATE INDEX IF NOT EXISTS usage_samples_window_at ON usage_samples(provider,window_kind,window_scope_value,at);CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,harness TEXT NOT NULL,model TEXT,account TEXT,cwd TEXT NOT NULL,state_path TEXT,context_window_size INTEGER,last_known_token_count INTEGER,launch_mode TEXT NOT NULL,pid INTEGER,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,stopped_reason TEXT,stopped_window_kind TEXT,superseded_by TEXT,reseeded_from TEXT,title TEXT);CREATE TABLE IF NOT EXISTS session_token_usage(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),at TEXT NOT NULL,model TEXT,input_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_write_input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,UNIQUE(session_id,at,total_tokens,input_tokens,output_tokens));CREATE INDEX IF NOT EXISTS session_token_usage_session_at ON session_token_usage(session_id,at);CREATE TABLE IF NOT EXISTS resume_markers(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),reason TEXT NOT NULL,resume_at TEXT,requested_at TEXT,created_at TEXT NOT NULL,status TEXT NOT NULL,status_detail TEXT,message TEXT);CREATE INDEX IF NOT EXISTS resume_markers_session_status ON resume_markers(session_id,status);CREATE UNIQUE INDEX IF NOT EXISTS resume_markers_active ON resume_markers(session_id) WHERE status IN ('pending','scheduled');CREATE TABLE IF NOT EXISTS compaction_requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL,prompt TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS compaction_requests_session_status ON compaction_requests(session_id,status);CREATE TABLE IF NOT EXISTS threshold_overrides(id TEXT PRIMARY KEY,scope_kind TEXT NOT NULL,provider TEXT NOT NULL,model_value TEXT,session_value TEXT,field TEXT NOT NULL,value_json TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS threshold_overrides_key ON threshold_overrides(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field);CREATE TABLE IF NOT EXISTS idle_reseed_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,source_model TEXT NOT NULL,summary_text TEXT NOT NULL,token_count_before INTEGER NOT NULL,token_count_after INTEGER NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS keepalive_config(session_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL,last_ping_at TEXT,ping_day TEXT,ping_count INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS hook_messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,text TEXT NOT NULL,created_at TEXT NOT NULL,delivered_at TEXT);CREATE INDEX IF NOT EXISTS hook_messages_delivery ON hook_messages(session_id,event,delivered_at,created_at);CREATE TABLE IF NOT EXISTS hook_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,created_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS hook_events_session_created ON hook_events(session_id,created_at);CREATE TABLE IF NOT EXISTS provider_fetch_status(provider TEXT NOT NULL,account TEXT,last_attempt_at TEXT NOT NULL,last_success_at TEXT,last_error TEXT,consecutive_failures INTEGER NOT NULL DEFAULT 0);CREATE UNIQUE INDEX IF NOT EXISTS provider_fetch_status_key ON provider_fetch_status(provider,COALESCE(account,''));CREATE TABLE IF NOT EXISTS compaction_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),source TEXT NOT NULL,trigger TEXT,context_pct_before REAL,usage_window_pct_before REAL,tokens_before INTEGER,tokens_after INTEGER,started_at TEXT NOT NULL,completed_at TEXT);CREATE INDEX IF NOT EXISTS compaction_events_session_started ON compaction_events(session_id,started_at);CREATE INDEX IF NOT EXISTS compaction_events_started ON compaction_events(started_at);"#;
+const SCHEMA: &str = r#"PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS usage_samples(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,account TEXT,window_kind TEXT NOT NULL,window_scope_value TEXT NOT NULL,pct REAL NOT NULL,resets_at TEXT,exceeded INTEGER NOT NULL,active INTEGER NOT NULL,source TEXT NOT NULL,at TEXT NOT NULL,fetched_at TEXT,credits_json TEXT,plan TEXT);CREATE INDEX IF NOT EXISTS usage_samples_window_at ON usage_samples(provider,window_kind,window_scope_value,at);CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,harness TEXT NOT NULL,model TEXT,account TEXT,cwd TEXT NOT NULL,state_path TEXT,context_window_size INTEGER,last_known_token_count INTEGER,launch_mode TEXT NOT NULL,pid INTEGER,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,stopped_reason TEXT,stopped_window_kind TEXT,superseded_by TEXT,reseeded_from TEXT,title TEXT);CREATE TABLE IF NOT EXISTS session_token_usage(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),at TEXT NOT NULL,model TEXT,input_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_write_input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,UNIQUE(session_id,at,total_tokens,input_tokens,output_tokens));CREATE INDEX IF NOT EXISTS session_token_usage_session_at ON session_token_usage(session_id,at);CREATE TABLE IF NOT EXISTS resume_markers(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),reason TEXT NOT NULL,resume_at TEXT,requested_at TEXT,created_at TEXT NOT NULL,status TEXT NOT NULL,status_detail TEXT,message TEXT);CREATE INDEX IF NOT EXISTS resume_markers_session_status ON resume_markers(session_id,status);CREATE UNIQUE INDEX IF NOT EXISTS resume_markers_active ON resume_markers(session_id) WHERE status IN ('pending','scheduled');CREATE TABLE IF NOT EXISTS compaction_requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL,prompt TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS compaction_requests_session_status ON compaction_requests(session_id,status);CREATE TABLE IF NOT EXISTS threshold_overrides(id TEXT PRIMARY KEY,scope_kind TEXT NOT NULL,provider TEXT NOT NULL,model_value TEXT,session_value TEXT,field TEXT NOT NULL,value_json TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS threshold_overrides_key ON threshold_overrides(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field);CREATE TABLE IF NOT EXISTS idle_reseed_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,source_model TEXT NOT NULL,summary_text TEXT NOT NULL,token_count_before INTEGER NOT NULL,token_count_after INTEGER NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS keepalive_config(session_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL,last_ping_at TEXT,ping_day TEXT,ping_count INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS hook_messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,text TEXT NOT NULL,created_at TEXT NOT NULL,delivered_at TEXT);CREATE INDEX IF NOT EXISTS hook_messages_delivery ON hook_messages(session_id,event,delivered_at,created_at);CREATE TABLE IF NOT EXISTS hook_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,created_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS hook_events_session_created ON hook_events(session_id,created_at);CREATE TABLE IF NOT EXISTS provider_fetch_status(provider TEXT NOT NULL,account TEXT,last_attempt_at TEXT NOT NULL,last_success_at TEXT,last_error TEXT,consecutive_failures INTEGER NOT NULL DEFAULT 0);CREATE UNIQUE INDEX IF NOT EXISTS provider_fetch_status_key ON provider_fetch_status(provider,COALESCE(account,''));CREATE TABLE IF NOT EXISTS compaction_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),source TEXT NOT NULL,trigger TEXT,context_pct_before REAL,usage_window_pct_before REAL,tokens_before INTEGER,tokens_after INTEGER,started_at TEXT NOT NULL,completed_at TEXT);CREATE INDEX IF NOT EXISTS compaction_events_session_started ON compaction_events(session_id,started_at);CREATE INDEX IF NOT EXISTS compaction_events_started ON compaction_events(started_at);"#;
 
 #[cfg(test)]
 mod tests {
@@ -1142,6 +1151,7 @@ mod tests {
             source: UsageSource::LocalEstimate,
             provider: Provider::Codex,
             account: None,
+            plan: Some("Plus".into()),
             windows: HashMap::from([(
                 WindowKey {
                     provider: Provider::Codex,
@@ -1574,6 +1584,7 @@ mod tests {
             source: UsageSource::ProviderReported,
             provider: Provider::Codex,
             account: None,
+            plan: None,
             windows: HashMap::from([(
                 WindowKey {
                     provider: Provider::Codex,

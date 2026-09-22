@@ -1,16 +1,184 @@
+use crate::claude_code::TranscriptFileSystem;
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use uw_core::adapter::{
-    AdapterError, AdapterResult, Capabilities, DeliveryOutcome, HarnessAdapter, StatusEvent,
+    AdapterError, AdapterResult, Capabilities, DeliveryOutcome, DiscoveredSession, HarnessAdapter,
+    StatusEvent,
 };
 use uw_core::model::*;
+
+/// Cursor's own on-disk transcript store for CLI/background-agent sessions
+/// (`cursor-agent`, not the IDE chat panel, which keeps its state in a
+/// separate sqlite store under `~/.cursor/chats/`). Layout verified
+/// 2026-09-22: `<root>/<encoded-cwd>/agent-transcripts/<session-uuid>/<session-uuid>.jsonl`,
+/// one `{"role":...,"message":...}` object per line with no per-line
+/// timestamp, session id, or cwd field — unlike Claude Code/Codex transcripts.
+pub struct CursorTranscriptFileSystem;
+
+#[async_trait]
+impl TranscriptFileSystem for CursorTranscriptFileSystem {
+    async fn jsonl_files(&self) -> AdapterResult<Vec<String>> {
+        let root = std::env::var("CURSOR_PROJECTS_DIR")
+            .unwrap_or_else(|_| std::env::var("HOME").unwrap_or_default() + "/.cursor/projects");
+        let mut out = Vec::new();
+        let mut dirs = vec![root];
+        while let Some(dir) = dirs.pop() {
+            let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+                continue;
+            };
+            while let Some(entry) = entries
+                .next_entry()
+                .await
+                .map_err(|e| AdapterError::Other(e.to_string()))?
+            {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path.to_string_lossy().into_owned());
+                } else if path.extension().is_some_and(|x| x == "jsonl") {
+                    out.push(path.to_string_lossy().into_owned());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn read_to_string(&self, path: &str) -> AdapterResult<String> {
+        tokio::fs::read_to_string(path)
+            .await
+            .map_err(|e| AdapterError::Other(e.to_string()))
+    }
+}
+
+struct CachedCursorTranscript {
+    fingerprint: (u64, Option<std::time::SystemTime>),
+    session: DiscoveredSession,
+}
+
+/// Best-effort decode of Cursor's dash-joined project directory name back
+/// into an absolute cwd (`home-v0id-Documents-repos-dozens-game` ->
+/// `/home/v0id/Documents/repos/dozens-game`). This is lossy whenever a path
+/// segment itself contains a literal `-` (Cursor's transcripts carry no
+/// structured cwd field to disambiguate, unlike Claude Code/Codex), so it is
+/// only used as a fallback label, never for anything that requires an exact
+/// filesystem path.
+fn decode_project_dir_name(name: &str) -> String {
+    format!("/{}", name.replace('-', "/"))
+}
+
+/// Extracts the project directory name from a transcript path shaped like
+/// `<root>/<project>/agent-transcripts/<session>/<session>.jsonl`.
+fn project_dir_name(path: &str) -> Option<&str> {
+    let path = std::path::Path::new(path);
+    let mut components: Vec<&str> = path
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    let index = components.iter().rposition(|c| *c == "agent-transcripts")?;
+    components.truncate(index);
+    components.pop()
+}
+
+fn first_user_text(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let record: Value = serde_json::from_str(line).ok()?;
+        if record.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let parts = record.pointer("/message/content")?.as_array()?;
+        for part in parts {
+            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.chars().take(120).collect());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Cursor transcripts carry no per-line timestamp, so `modified` (the
+/// transcript file's own mtime) is the only activity signal available and is
+/// used for both `first_seen` and `last_seen` — an approximation, but a
+/// closer one than leaving the daemon to default both to "now" on every poll.
+fn scan_cursor_transcript(
+    path: &str,
+    content: &str,
+    modified: Option<std::time::SystemTime>,
+) -> Option<DiscoveredSession> {
+    let id = std::path::Path::new(path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| uuid::Uuid::parse_str(stem).is_ok())?
+        .to_owned();
+    let cwd = project_dir_name(path)
+        .map(decode_project_dir_name)
+        .unwrap_or_else(|| ".".into());
+    let title = first_user_text(content);
+    let seen = modified.map(DateTime::<Utc>::from);
+    Some(DiscoveredSession {
+        id: SessionId(id),
+        cwd,
+        model: None,
+        context_window_size: None,
+        last_known_token_count: None,
+        first_seen: seen,
+        last_seen: seen,
+        state_path: Some(path.to_owned()),
+        token_usage: Vec::new(),
+        title,
+    })
+}
 
 #[async_trait]
 pub trait CursorUsageTransport: Send + Sync {
     async fn current_period_usage(&self) -> AdapterResult<Value>;
+}
+
+/// The dashboard usage response has no plan-name field (only the two
+/// percentage bars), so plan comes from a separate source: `cursor-agent
+/// about`, verified 2026-09-22 against a live run:
+/// ```text
+/// About Cursor CLI
+///
+/// CLI Version         2026.09.18-9a7762b
+/// ...
+/// Subscription Tier   Pro
+/// ...
+/// ```
+#[async_trait]
+pub trait CursorPlanReader: Send + Sync {
+    async fn read(&self) -> AdapterResult<String>;
+}
+pub struct CursorCliPlanReader;
+#[async_trait]
+impl CursorPlanReader for CursorCliPlanReader {
+    async fn read(&self) -> AdapterResult<String> {
+        let output = tokio::process::Command::new("cursor-agent")
+            .arg("about")
+            .output()
+            .await
+            .map_err(|e| AdapterError::Transient(e.to_string()))?;
+        if !output.status.success() {
+            return Err(AdapterError::Other(
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+}
+
+/// `about`'s output is plain `Label<spaces>Value` lines, not structured data.
+fn plan_from_about_output(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        line.strip_prefix("Subscription Tier")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -232,6 +400,9 @@ pub struct CursorAdapter {
     transport: Arc<dyn CursorUsageTransport>,
     now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
     account: Option<AccountId>,
+    transcript_fs: Arc<dyn TranscriptFileSystem>,
+    discovery_cache: Mutex<HashMap<String, CachedCursorTranscript>>,
+    plan_reader: Arc<dyn CursorPlanReader>,
 }
 
 impl CursorAdapter {
@@ -240,6 +411,9 @@ impl CursorAdapter {
             transport,
             now: Arc::new(Utc::now),
             account: None,
+            transcript_fs: Arc::new(CursorTranscriptFileSystem),
+            discovery_cache: Mutex::new(HashMap::new()),
+            plan_reader: Arc::new(CursorCliPlanReader),
         }
     }
 
@@ -257,6 +431,16 @@ impl CursorAdapter {
         self
     }
 
+    pub fn with_transcript_fs(mut self, fs: Arc<dyn TranscriptFileSystem>) -> Self {
+        self.transcript_fs = fs;
+        self
+    }
+
+    pub fn with_plan_reader(mut self, plan_reader: Arc<dyn CursorPlanReader>) -> Self {
+        self.plan_reader = plan_reader;
+        self
+    }
+
     pub fn capabilities_static() -> Capabilities {
         Capabilities {
             can_trigger_compaction: false,
@@ -269,7 +453,7 @@ impl CursorAdapter {
         }
     }
 
-    fn parse_sample(&self, value: &Value) -> AdapterResult<UsageSample> {
+    fn parse_sample(&self, value: &Value, plan: Option<String>) -> AdapterResult<UsageSample> {
         let plan_usage = value
             .get("planUsage")
             .ok_or_else(|| AdapterError::Other("missing Cursor planUsage".into()))?;
@@ -294,6 +478,7 @@ impl CursorAdapter {
             source: UsageSource::ProviderReported,
             provider: Provider::Cursor,
             account,
+            plan,
             windows,
             credits: None,
         })
@@ -374,11 +559,59 @@ impl HarnessAdapter for CursorAdapter {
 
     async fn fetch_usage(&self, _: Option<&AccountId>) -> AdapterResult<UsageSample> {
         let value = self.transport.current_period_usage().await?;
-        self.parse_sample(&value)
+        // Best-effort: `cursor-agent` missing or `about`'s output shape
+        // changing must not fail the usage fetch, just leave `plan` unset.
+        let plan = self
+            .plan_reader
+            .read()
+            .await
+            .ok()
+            .and_then(|output| plan_from_about_output(&output));
+        self.parse_sample(&value, plan)
     }
 
     async fn detect_stop(&self, _: &SessionId) -> AdapterResult<Option<StopReason>> {
         Err(AdapterError::Unsupported)
+    }
+
+    async fn discover_sessions(&self) -> AdapterResult<Vec<DiscoveredSession>> {
+        let mut discovered = Vec::new();
+        for path in self.transcript_fs.jsonl_files().await? {
+            let fingerprint = tokio::fs::metadata(&path)
+                .await
+                .ok()
+                .map(|metadata| (metadata.len(), metadata.modified().ok()));
+            if let Some(fingerprint) = fingerprint {
+                let cached = self
+                    .discovery_cache
+                    .lock()
+                    .map_err(|_| AdapterError::Other("discovery cache poisoned".into()))?;
+                if let Some(entry) = cached.get(&path)
+                    && entry.fingerprint == fingerprint
+                {
+                    discovered.push(entry.session.clone());
+                    continue;
+                }
+            }
+            let content = self.transcript_fs.read_to_string(&path).await?;
+            let modified = fingerprint.and_then(|(_, modified)| modified);
+            if let Some(session) = scan_cursor_transcript(&path, &content, modified) {
+                if let Some(fingerprint) = fingerprint {
+                    self.discovery_cache
+                        .lock()
+                        .map_err(|_| AdapterError::Other("discovery cache poisoned".into()))?
+                        .insert(
+                            path,
+                            CachedCursorTranscript {
+                                fingerprint,
+                                session: session.clone(),
+                            },
+                        );
+                }
+                discovered.push(session);
+            }
+        }
+        Ok(discovered)
     }
 
     async fn emit_status(&self, _: &SessionId, _: StatusEvent) -> AdapterResult<DeliveryOutcome> {
@@ -417,6 +650,26 @@ mod tests {
         }
     }
 
+    /// Always fails, so tests exercise `fetch_usage`'s plan-lookup fallback
+    /// deterministically instead of spawning a real `cursor-agent` process
+    /// (which may not be installed, and would report whatever plan is
+    /// actually signed in on the test machine).
+    struct FailingPlanReader;
+    #[async_trait]
+    impl CursorPlanReader for FailingPlanReader {
+        async fn read(&self) -> AdapterResult<String> {
+            Err(AdapterError::Other("no cursor-agent CLI in tests".into()))
+        }
+    }
+
+    struct FakePlanReader(&'static str);
+    #[async_trait]
+    impl CursorPlanReader for FakePlanReader {
+        async fn read(&self) -> AdapterResult<String> {
+            Ok(self.0.into())
+        }
+    }
+
     #[tokio::test]
     async fn parses_cursor_two_bar_monthly_usage() {
         let adapter = CursorAdapter::new(Arc::new(FakeTransport(json!({
@@ -426,11 +679,15 @@ mod tests {
                 "autoPercentUsed": 12.5,
                 "apiPercentUsed": 87.25
             }
-        }))));
+        }))))
+        .with_plan_reader(Arc::new(FakePlanReader(
+            "About Cursor CLI\n\nSubscription Tier   Pro\n",
+        )));
         let sample = adapter.fetch_usage(None).await.unwrap();
         let reset = Utc.timestamp_millis_opt(1771077734000).single();
         assert_eq!(sample.provider, Provider::Cursor);
         assert_eq!(sample.account, Some(AccountId("cursor@example.com".into())));
+        assert_eq!(sample.plan, Some("Pro".into()));
         assert_eq!(sample.windows.len(), 2);
         assert_eq!(
             sample.windows[&WindowKey {
@@ -462,7 +719,8 @@ mod tests {
     async fn clamps_percentages_and_marks_each_exhausted_bar() {
         let adapter = CursorAdapter::new(Arc::new(FakeTransport(json!({
             "planUsage": { "autoPercentUsed": 120, "apiPercentUsed": -5 }
-        }))));
+        }))))
+        .with_plan_reader(Arc::new(FailingPlanReader));
         let sample = adapter.fetch_usage(None).await.unwrap();
         let auto = &sample.windows[&WindowKey {
             provider: Provider::Cursor,
@@ -476,6 +734,17 @@ mod tests {
         assert!(auto.exceeded);
         assert_eq!(api.pct, 0.0);
         assert!(!api.exceeded);
+    }
+
+    #[test]
+    fn extracts_plan_from_about_output() {
+        let output = "About Cursor CLI\n\nCLI Version         2026.09.18-9a7762b\nLatest              2026.09.18-9a7762b (up to date)\nModel               Composer 2.5\nSubscription Tier   Pro\nOS                  linux (x64)\nTerminal            unknown\nShell               bash\nUser Email          customer@example.com\n";
+        assert_eq!(plan_from_about_output(output), Some("Pro".into()));
+    }
+
+    #[test]
+    fn about_output_missing_the_tier_line_yields_no_plan() {
+        assert_eq!(plan_from_about_output("About Cursor CLI\n"), None);
     }
 
     #[test]
@@ -599,5 +868,96 @@ mod tests {
 
         let _ = std::fs::remove_file(state_db);
         let _ = std::fs::remove_file(cli_auth);
+    }
+
+    struct FixtureTranscriptFs(Vec<(String, String)>);
+
+    #[async_trait]
+    impl TranscriptFileSystem for FixtureTranscriptFs {
+        async fn jsonl_files(&self) -> AdapterResult<Vec<String>> {
+            Ok(self.0.iter().map(|(path, _)| path.clone()).collect())
+        }
+
+        async fn read_to_string(&self, path: &str) -> AdapterResult<String> {
+            self.0
+                .iter()
+                .find(|(candidate, _)| candidate == path)
+                .map(|(_, content)| content.clone())
+                .ok_or_else(|| AdapterError::Other("fixture path not found".into()))
+        }
+    }
+
+    fn cursor_transcript_line(role: &str, text: &str) -> String {
+        json!({"role": role, "message": {"content": [{"type": "text", "text": text}]}}).to_string()
+    }
+
+    #[test]
+    fn decodes_project_dir_name_into_a_cwd() {
+        assert_eq!(
+            decode_project_dir_name("home-v0id-Documents-repos-usagewindow"),
+            "/home/v0id/Documents/repos/usagewindow"
+        );
+    }
+
+    #[test]
+    fn decode_is_lossy_when_a_path_segment_contains_a_literal_dash() {
+        // Cursor's transcripts carry no structured cwd field, so a real
+        // repo name containing a dash (`dozens-game`) cannot be
+        // distinguished from a path separator — documented in
+        // `decode_project_dir_name`'s doc comment.
+        assert_eq!(
+            decode_project_dir_name("home-v0id-Documents-repos-dozens-game"),
+            "/home/v0id/Documents/repos/dozens/game"
+        );
+    }
+
+    #[test]
+    fn extracts_project_dir_name_from_a_transcript_path() {
+        let path = "/home/v0id/.cursor/projects/home-v0id-Documents-repos-usagewindow/agent-transcripts/b283a138-1a72-4d11-8d02-2ac1a333619a/b283a138-1a72-4d11-8d02-2ac1a333619a.jsonl";
+        assert_eq!(
+            project_dir_name(path),
+            Some("home-v0id-Documents-repos-usagewindow")
+        );
+    }
+
+    #[test]
+    fn scans_a_cursor_transcript_into_a_discovered_session() {
+        let id = "b283a138-1a72-4d11-8d02-2ac1a333619a";
+        let path = format!(
+            "/home/v0id/.cursor/projects/home-v0id-Documents-repos-usagewindow/agent-transcripts/{id}/{id}.jsonl"
+        );
+        let content = format!(
+            "{}\n{}",
+            cursor_transcript_line("user", "add a retry loop"),
+            cursor_transcript_line("assistant", "done")
+        );
+        let session = scan_cursor_transcript(&path, &content, None).unwrap();
+        assert_eq!(session.id, SessionId(id.into()));
+        assert_eq!(session.cwd, "/home/v0id/Documents/repos/usagewindow");
+        assert_eq!(session.title, Some("add a retry loop".into()));
+        assert_eq!(session.state_path, Some(path));
+    }
+
+    #[test]
+    fn rejects_a_transcript_whose_filename_is_not_a_session_uuid() {
+        let path = "/home/v0id/.cursor/projects/foo/agent-transcripts/worker.log";
+        assert!(scan_cursor_transcript(path, "", None).is_none());
+    }
+
+    #[tokio::test]
+    async fn discovers_cursor_sessions_from_transcript_fixtures() {
+        let id = "b283a138-1a72-4d11-8d02-2ac1a333619a";
+        let path = format!(
+            "/home/v0id/.cursor/projects/home-v0id-Documents-repos-usagewindow/agent-transcripts/{id}/{id}.jsonl"
+        );
+        let content = cursor_transcript_line("user", "hello");
+        let adapter = CursorAdapter::new(Arc::new(FakeTransport(json!({}))))
+            .with_transcript_fs(Arc::new(FixtureTranscriptFs(vec![(path.clone(), content)])));
+
+        let discovered = adapter.discover_sessions().await.unwrap();
+
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].id, SessionId(id.into()));
+        assert_eq!(discovered[0].cwd, "/home/v0id/Documents/repos/usagewindow");
     }
 }

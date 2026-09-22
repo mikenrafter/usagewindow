@@ -13,6 +13,7 @@ pub struct StatusResponse {
 pub struct ProviderUsageSummary {
     pub provider: Provider,
     pub account: Option<AccountId>,
+    pub plan: Option<String>,
     pub windows: Vec<UsageWindowSummary>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -157,6 +158,7 @@ mod tests {
             usage: vec![ProviderUsageSummary {
                 provider: Provider::Codex,
                 account: Some(AccountId("a".into())),
+                plan: Some("Plus".into()),
                 windows: vec![UsageWindowSummary {
                     window: WindowKind::Rolling { minutes: 300 },
                     pct: 42.0,

@@ -538,6 +538,7 @@ async fn status(
         let usage = latest.into_values().map(|sample| {
             let provider = sample.provider.clone();
             let account = sample.account.clone();
+            let plan = sample.plan.clone();
             let windows = sample.windows.into_iter().map(|(key, window)| {
                 let window_key = WindowKey { provider: provider.clone(), kind: key.kind.clone() };
                 let blocks = uw_policy::segment_blocks(&all_samples, &window_key, account.as_ref());
@@ -566,7 +567,7 @@ async fn status(
                 });
                 UsageWindowSummary { window: key.kind, pct: window.pct, resets_at: window.resets_at, exceeded: window.exceeded, burn_rate_pct_per_hour, active_sessions, depletes_at }
             }).collect();
-            ProviderUsageSummary { provider, account, windows }
+            ProviderUsageSummary { provider, account, plan, windows }
         }).collect();
         Ok(StatusResponse {
             usage,
@@ -1275,6 +1276,7 @@ mod tests {
                 source: UsageSource::ProviderReported,
                 provider: Provider::Codex,
                 account: None,
+                plan: None,
                 windows: HashMap::from([(
                     WindowKey {
                         provider: Provider::Codex,
@@ -1426,6 +1428,7 @@ mod tests {
                 source: UsageSource::ProviderReported,
                 provider: Provider::Cursor,
                 account: None,
+                plan: None,
                 windows: HashMap::from([(
                     WindowKey {
                         provider: Provider::Cursor,
@@ -1462,6 +1465,7 @@ mod tests {
                     source: UsageSource::ProviderReported,
                     provider: Provider::Codex,
                     account: None,
+                    plan: None,
                     windows: HashMap::from([(
                         WindowKey {
                             provider: Provider::Codex,

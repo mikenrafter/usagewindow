@@ -515,6 +515,7 @@ impl DirectReader for StoreReader {
             .map(|s| {
                 let provider = s.provider;
                 let account = s.account;
+                let plan = s.plan;
                 let windows = s
                     .windows
                     .into_iter()
@@ -533,6 +534,7 @@ impl DirectReader for StoreReader {
                 ProviderUsageSummary {
                     provider,
                     account,
+                    plan,
                     windows,
                 }
             })

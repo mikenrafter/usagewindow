@@ -280,6 +280,7 @@ impl HarnessAdapter for CodexAdapter {
     async fn fetch_usage(&self, _: Option<&AccountId>) -> AdapterResult<UsageSample> {
         let (account_response, result) = self.limits().await?;
         let account = account_from_response(&account_response);
+        let plan = plan_from_response(&account_response);
         let limits = Self::rate_limits(&result)?;
         let limited = limits
             .get("rateLimitReachedType")
@@ -321,6 +322,7 @@ impl HarnessAdapter for CodexAdapter {
             source: UsageSource::ProviderReported,
             provider: Provider::Codex,
             account,
+            plan,
             windows,
             credits: None,
         })
@@ -570,12 +572,36 @@ impl HarnessAdapter for CodexAdapter {
     }
 }
 
+/// Account fields live at `/result/account/*`, not `/result/*` — verified
+/// 2026-09-22 against a live `account/read` app-server response:
+/// `{"result":{"account":{"type":"chatgpt","email":"...","planType":"plus"},
+/// "requiresOpenaiAuth":true}}`. `id`/`accountId` are kept as fallbacks for
+/// API-key auth mode, which has no email.
 fn account_from_response(value: &Value) -> Option<AccountId> {
     ["email", "id", "accountId"]
         .into_iter()
-        .filter_map(|field| value.pointer(&format!("/result/{field}"))?.as_str())
+        .filter_map(|field| value.pointer(&format!("/result/account/{field}"))?.as_str())
         .find(|value| !value.is_empty())
         .map(|value| AccountId(value.to_owned()))
+}
+
+/// ChatGPT plan names as `account/read` reports them (`"free"`, `"plus"`,
+/// `"pro"`, `"team"`, `"business"`, `"enterprise"`) are lowercase; display
+/// them the way ChatGPT's own UI capitalizes them.
+fn plan_from_response(value: &Value) -> Option<String> {
+    let plan_type = value
+        .pointer("/result/account/planType")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())?;
+    Some(match plan_type {
+        "free" => "Free".into(),
+        "plus" => "Plus".into(),
+        "pro" => "Pro".into(),
+        "team" => "Team".into(),
+        "business" => "Business".into(),
+        "enterprise" => "Enterprise".into(),
+        other => other.into(),
+    })
 }
 
 /// Every `*.jsonl` file under `root`, recursively (rollout files live under
@@ -1007,7 +1033,9 @@ done
             _params: serde_json::Value,
         ) -> AdapterResult<serde_json::Value> {
             Ok(match method {
-                "account/read" => json!({"result":{"id":"acct","email":"codex@example.com"}}),
+                "account/read" => {
+                    json!({"result":{"account":{"type":"chatgpt","email":"codex@example.com","planType":"plus"}}})
+                }
                 "account/rateLimits/read" => {
                     json!({"result":{"ordinaryUsageAllowed":true,"rateLimits":{"primary":{"usedPercent":1,"windowDurationMins":10080,"resetsAt":1800000000},"secondary":{"usedPercent":2,"windowDurationMins":300,"resetsAt":1800000100}}}})
                 }
@@ -1022,6 +1050,7 @@ done
             .await
             .unwrap();
         assert_eq!(sample.account, Some(AccountId("codex@example.com".into())));
+        assert_eq!(sample.plan, Some("Plus".into()));
         assert_eq!(
             sample.windows[&WindowKey {
                 provider: Provider::Codex,
@@ -1071,6 +1100,7 @@ done
             source: UsageSource::ProviderReported,
             provider: Provider::Codex,
             account: None,
+            plan: None,
             windows: HashMap::from([(
                 WindowKey {
                     provider: Provider::Codex,

@@ -1,5 +1,45 @@
 # Cursor integration research
 
+## Session discovery
+
+`CursorAdapter::discover_sessions` (crates/uw-adapters/src/cursor.rs) reads
+`cursor-agent`'s own on-disk transcript store, independent of any hook, the
+same way the Claude Code and Codex adapters read their transcript/rollout
+files. Layout verified 2026-09-22 on a live `~/.cursor/projects`:
+
+```
+~/.cursor/projects/<encoded-cwd>/agent-transcripts/<session-uuid>/<session-uuid>.jsonl
+```
+
+overridable via `CURSOR_PROJECTS_DIR` (matching the env var name
+`modules/agentsview.nix` already uses for the same directory in phoe-nix).
+Each line is a bare `{"role": "...", "message": {"content": [...]}}` object
+with **no per-line timestamp, session id, or cwd field** — unlike Claude
+Code's and Codex's transcripts, which carry `cwd`/`sessionId` directly. This
+is the Cursor CLI/background-agent transcript store; the Cursor IDE's chat
+panel keeps a separate sqlite-backed store under `~/.cursor/chats/<workspace
+hash>/<session-uuid>/store.db`, which this adapter does not read.
+
+Consequences of the missing structured fields:
+
+- **Session id** comes from the transcript filename (validated as a UUID),
+  not file content.
+- **cwd** is recovered by decoding the project directory name, which Cursor
+  builds by joining the absolute path with `-` (e.g.
+  `home-v0id-Documents-repos-usagewindow` ->
+  `/home/v0id/Documents/repos/usagewindow`). This is lossy whenever a path
+  segment itself contains a literal `-` (a repo named `dozens-game` decodes
+  to `dozens/game`), because there is no structured field to disambiguate.
+  `repo.json` next to each project directory carries only an opaque
+  workspace id, not the real path, and `worker.log` only sometimes logs a
+  `workspacePath=` line (42/56 sampled project directories had a
+  `worker.log` at all, and not all of those logged that line), so neither is
+  reliable enough to use as the primary source. Treat `DiscoveredSession.cwd`
+  for Cursor as a best-effort label, not a verified filesystem path.
+- **first_seen/last_seen** fall back to the transcript file's own mtime,
+  since there is no in-content timestamp to read.
+- **title** is the first user message's text, truncated to 120 characters.
+
 ## Compaction TODO
 
 Status: usage polling is implemented. Compaction delivery remains disabled until a

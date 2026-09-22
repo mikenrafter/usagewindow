@@ -95,6 +95,7 @@ fn get_usage(args: &Value, deps: &Deps) -> Result<Value, String> {
         .map(|sample| ProviderUsageSummary {
             provider: sample.provider,
             account: sample.account,
+            plan: sample.plan,
             windows: sample
                 .windows
                 .into_iter()
@@ -688,6 +689,7 @@ mod tests {
             source: UsageSource::ProviderReported,
             provider: Provider::Codex,
             account: None,
+            plan: None,
             windows: HashMap::from([(
                 WindowKey {
                     provider: Provider::Codex,
@@ -725,6 +727,7 @@ mod tests {
             source: UsageSource::ProviderReported,
             provider: Provider::Codex,
             account: None,
+            plan: None,
             windows: HashMap::from([(
                 window.clone(),
                 UsageWindowState::new(10.0, false, true, None, None),
@@ -737,6 +740,7 @@ mod tests {
             source: UsageSource::ProviderReported,
             provider: Provider::Codex,
             account: None,
+            plan: None,
             windows: HashMap::from([(
                 window,
                 UsageWindowState::new(84.0, false, true, None, None),

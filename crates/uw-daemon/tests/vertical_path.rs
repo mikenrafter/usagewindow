@@ -108,6 +108,7 @@ async fn observation_and_claimed_resume_cross_the_sqlite_boundary() {
             source: UsageSource::ProviderReported,
             provider: Provider::Codex,
             account: None,
+            plan: None,
             windows: HashMap::from([(
                 key.clone(),
                 UsageWindowState::new(100.0, true, true, None, None),

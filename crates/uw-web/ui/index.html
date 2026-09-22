@@ -480,6 +480,7 @@ function renderUsage(status) {
         <div class="head">
           <span class="prov">${escapeHtml(providerLabel(u.provider))}</span>
           <span class="acct" title="click to reveal">${escapeHtml(u.account || 'default account')}</span>
+          ${u.plan ? `<span class="pill">${escapeHtml(u.plan)}</span>` : ''}
           ${staleBadge}
         </div>
         ${bars}
