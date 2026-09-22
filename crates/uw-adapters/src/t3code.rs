@@ -20,6 +20,7 @@ pub enum T3CodeAuth {
 #[async_trait]
 pub trait T3CodeTransport: Send + Sync {
     async fn post_dispatch(&self, payload: Value) -> AdapterResult<Value>;
+    async fn post_interrupt(&self, payload: Value) -> AdapterResult<Value>;
     /// `GET /api/orchestration/threads/:thread_id`. Returns the raw response
     /// body; callers read `thread.session.status`/`lastError` out of it.
     async fn get_thread(&self, thread_id: &str) -> AdapterResult<Value>;
@@ -81,6 +82,15 @@ impl T3CodeTransport for T3CodeHttpTransport {
                 .json(&payload),
         );
         self.send(request, "dispatch").await
+    }
+
+    async fn post_interrupt(&self, payload: Value) -> AdapterResult<Value> {
+        let request = self.authed(
+            self.client
+                .post(format!("{}/api/orchestration/dispatch", self.base_url))
+                .json(&payload),
+        );
+        self.send(request, "interrupt").await
     }
 
     async fn get_thread(&self, thread_id: &str) -> AdapterResult<Value> {
@@ -197,6 +207,35 @@ impl T3CodeAdapter {
             seed_modes: vec![],
         }
     }
+
+    fn compaction_instructions(prompt: &str) -> String {
+        let mut instructions = prompt.trim();
+        while let Some(rest) = instructions.strip_prefix("/compact") {
+            if rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace) {
+                instructions = rest.trim_start();
+            } else {
+                break;
+            }
+        }
+        instructions.trim().to_owned()
+    }
+
+    fn turn_start_payload(thread_id: &str, text: &str) -> Value {
+        json!({
+            "type": "thread.turn.start",
+            "commandId": uuid::Uuid::new_v4(),
+            "threadId": thread_id,
+            "message": {
+                "messageId": uuid::Uuid::new_v4(),
+                "role": "user",
+                "text": text,
+                "attachments": []
+            },
+            "runtimeMode": "full-access",
+            "interactionMode": "default",
+            "createdAt": chrono::Utc::now(),
+        })
+    }
 }
 
 #[async_trait]
@@ -262,22 +301,21 @@ impl HarnessAdapter for T3CodeAdapter {
         session: &SessionSummary,
         request: &CompactionRequest,
     ) -> AdapterResult<DeliveryOutcome> {
-        let payload = json!({
-            "type": "thread.turn.start",
-            "commandId": uuid::Uuid::new_v4(),
-            "threadId": session.id.0,
-            "message": {
-                "messageId": uuid::Uuid::new_v4(),
-                "role": "user",
-                "text": uw_core::compaction::message("/compact", &request.prompt),
-                "attachments": []
-            },
-            "runtimeMode": "full-access",
-            "interactionMode": "default",
-            "createdAt": chrono::Utc::now(),
-        });
+        let thread_id = session.id.0.as_str();
+        let instructions = Self::compaction_instructions(&request.prompt);
         self.transport
-            .post_dispatch(payload)
+            .post_dispatch(Self::turn_start_payload(thread_id, &instructions))
+            .await?;
+        self.transport
+            .post_interrupt(json!({
+                "type": "thread.turn.interrupt",
+                "commandId": uuid::Uuid::new_v4(),
+                "threadId": thread_id,
+                "createdAt": chrono::Utc::now(),
+            }))
+            .await?;
+        self.transport
+            .post_dispatch(Self::turn_start_payload(thread_id, "/compact"))
             .await
             .map(|_| DeliveryOutcome::Delivered)
     }
@@ -349,6 +387,14 @@ mod tests {
                 .unwrap()
                 .push(("dispatch".into(), payload));
             Ok(serde_json::json!({"sequence": 108562}))
+        }
+
+        async fn post_interrupt(&self, payload: Value) -> AdapterResult<Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("interrupt".into(), payload));
+            Ok(serde_json::json!({"sequence": 108563}))
         }
 
         async fn get_thread(&self, thread_id: &str) -> AdapterResult<Value> {
@@ -486,7 +532,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sends_compact_as_a_meta_harness_message() {
+    async fn sends_instructions_interrupts_and_uses_t3code_native_compaction() {
         let transport = std::sync::Arc::new(FakeTransport::new());
         let adapter = T3CodeAdapter::new(transport.clone());
         let request = CompactionRequest {
@@ -504,12 +550,18 @@ mod tests {
             DeliveryOutcome::Delivered
         );
         let calls = transport.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
         assert_eq!(calls[0].1["type"], "thread.turn.start");
         assert_eq!(calls[0].1["threadId"], session().id.0);
-        assert_eq!(
-            calls[0].1["message"]["text"],
-            "/compact Preserve the active goal."
-        );
+        assert_eq!(calls[0].1["message"]["text"], "Preserve the active goal.");
+        assert_eq!(calls[1].0, "interrupt");
+        assert_eq!(calls[1].1["type"], "thread.turn.interrupt");
+        assert_eq!(calls[1].1["threadId"], session().id.0);
+        assert!(calls[1].1.get("turnId").is_none());
+        assert_eq!(calls[2].0, "dispatch");
+        assert_eq!(calls[2].1["type"], "thread.turn.start");
+        assert_eq!(calls[2].1["threadId"], session().id.0);
+        assert_eq!(calls[2].1["message"]["text"], "/compact");
     }
 
     #[test]

@@ -135,6 +135,29 @@ silently under-report it as "not stopped" rather than false-positive, which
 is the safe failure direction but worth tightening if a Claude-backed example
 ever turns up.
 
+## Native compaction and interruption (verified 2026-09-22)
+
+The Context Window meter's **Compact context** action is delivered through the
+same orchestration dispatch endpoint as a user turn:
+
+```json
+{
+  "type": "thread.turn.start",
+  "threadId": "<thread-id>",
+  "message": {"role": "user", "text": "/compact", "attachments": []},
+  "runtimeMode": "full-access",
+  "interactionMode": "default"
+}
+```
+
+For usagewindow's queued compaction, T3Code first receives a separate short
+instruction turn, then usagewindow sends `thread.turn.interrupt` for that
+thread, and only then dispatches the standalone `/compact` turn. This prevents
+the agent from continuing the instruction turn before T3Code's native
+compaction operation runs. The interrupt command uses the same dispatch
+endpoint and includes `type`, `commandId`, `threadId`, and `createdAt`; no
+`turnId` is required because T3Code resolves the active turn for the thread.
+
 ## Native-provider ownership mapping (verified 2026-09-21)
 
 The HTTP thread snapshots above do not include the provider resume cursor. The
