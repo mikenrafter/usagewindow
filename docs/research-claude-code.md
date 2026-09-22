@@ -123,7 +123,13 @@ DankMaterialShell status-bar plugin (bash+QML). This is ground truth for the Cla
   context size; the 1m suffix is the session-specific signal when the transcript does not
   include the explicit field. `CLAUDE_CODE_MAX_CONTEXT_TOKENS` remains a process-level
   override that should be added only when usagewindow can associate it with a specific
-  session rather than guessing from the daemon environment.
+  session rather than guessing from the daemon environment. T3Code can request the 200k
+  model variant while Anthropic silently serves the same model with a 1m effective window;
+  in that path neither transcript signal is guaranteed. The adapter therefore treats an
+  observed context usage above 200,000 tokens as definitive evidence of the extended tier
+  and records a 1,000,000-token window. This is deliberately an upward-only inference:
+  usage cannot exceed the effective context window, while a later explicit metadata field
+  remains authoritative.
 - Claude Code has its own native "autocompact is thrashing" detection message when
   context refills to the limit within 3 turns of a previous compact, 3 times running —
   worth mirroring in this adapter's own thrash guard (don't re-ask/re-trigger

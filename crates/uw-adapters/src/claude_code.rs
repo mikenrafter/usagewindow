@@ -807,6 +807,14 @@ fn scan_transcript(path: &str, content: &str) -> Option<DiscoveredSession> {
             let total_input = value.saturating_add(cache_read).saturating_add(cache_write);
             let total = total_input.saturating_add(output);
             let Some(at) = timestamp else { continue };
+            // Claude/T3Code can silently promote a session selected as 200k to
+            // the 1M context tier. In that path the transcript may omit both
+            // the `[1m]` model suffix and `model_context_window`; a token
+            // observation above 200k is nevertheless definitive evidence that
+            // the effective window was promoted.
+            if total > 200_000 {
+                context_window_size = Some(context_window_size.unwrap_or(200_000).max(1_000_000));
+            }
             last_known_token_count = Some(total);
             token_usage.push(TokenUsageRecord {
                 at,
@@ -986,6 +994,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(session.context_window_size, Some(1_000_000));
+    }
+
+    #[test]
+    fn observed_usage_detects_silent_promotion_to_extended_context() {
+        let id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b44";
+        let session = scan_transcript(
+            &format!("/tmp/{id}.jsonl"),
+            &format!(
+                r#"{{"timestamp":"2026-09-17T23:32:32Z","sessionId":"{id}"}}
+{{"timestamp":"2026-09-17T23:32:34Z","type":"assistant","message":{{"model":"claude-sonnet-5","usage":{{"input_tokens":2,"cache_read_input_tokens":210307,"cache_creation_input_tokens":852,"output_tokens":264}}}}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(session.context_window_size, Some(1_000_000));
+        assert_eq!(session.last_known_token_count, Some(211_425));
     }
 
     #[tokio::test]
