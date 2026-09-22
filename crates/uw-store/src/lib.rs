@@ -83,6 +83,7 @@ impl Store {
             }
         }
         self.reconcile_obsolete_usage_windows()?;
+        self.reconcile_obsolete_provider_accounts()?;
         Ok(())
     }
 
@@ -97,8 +98,44 @@ impl Store {
             [provider_reported],
         )?)
     }
+
+    /// Removes provider-reported rows belonging to an account identity that is
+    /// older than the provider's current identity. Providers are polled as one
+    /// current account, so an account transition must not leave a stale card
+    /// beside the current one.
+    fn reconcile_obsolete_provider_accounts(&self) -> StoreResult<usize> {
+        let provider_reported = json(&UsageSource::ProviderReported)?;
+        Ok(self.connection.execute(
+            "DELETE FROM usage_samples AS old
+             WHERE old.source=?1
+               AND NOT (old.account IS (
+                   SELECT latest.account
+                   FROM usage_samples AS latest
+                   WHERE latest.provider=old.provider
+                     AND latest.source=?1
+                   ORDER BY latest.at DESC, latest.id DESC
+                   LIMIT 1
+               ))",
+            [provider_reported],
+        )?)
+    }
     pub fn insert_usage_sample(&self, s: &UsageSample) -> StoreResult<i64> {
         let tx = self.connection.unchecked_transaction()?;
+        let provider_reported = json(&UsageSource::ProviderReported)?;
+        let latest_provider_at: Option<DateTime<Utc>> = tx.query_row(
+            "SELECT MAX(at) FROM usage_samples WHERE provider=?1 AND source=?2",
+            params![json(&s.provider)?, &provider_reported],
+            |row| row.get(0),
+        )?;
+        let is_newer_provider_snapshot =
+            latest_provider_at.is_none_or(|latest| s.at > latest);
+        if is_newer_provider_snapshot && matches!(s.source, UsageSource::ProviderReported) {
+            tx.execute(
+                "DELETE FROM usage_samples
+                 WHERE provider=?1 AND source=?2 AND NOT (account IS ?3)",
+                params![json(&s.provider)?, &provider_reported, opt_json(&s.account)?],
+            )?;
+        }
         // A provider usage response is a complete snapshot of that provider's
         // windows. Remove window identities left behind by an older plan or
         // provider response before inserting the new snapshot. This is an
@@ -1316,6 +1353,39 @@ mod tests {
         let samples = s.all_usage_samples().unwrap();
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0], fresh);
+    }
+
+    #[test]
+    fn new_provider_account_replaces_stale_account_identity() {
+        let store = Store::open_memory().unwrap();
+        let at = Utc::now();
+        let old = UsageSample {
+            at,
+            fetched_at: None,
+            source: UsageSource::ProviderReported,
+            provider: Provider::ClaudeCode,
+            account: None,
+            plan: None,
+            windows: HashMap::from([(
+                WindowKey {
+                    provider: Provider::ClaudeCode,
+                    kind: WindowKind::Rolling { minutes: 300 },
+                },
+                UsageWindowState::new(90., false, true, None, None),
+            )]),
+            credits: None,
+        };
+        store.insert_usage_sample(&old).unwrap();
+
+        let fresh = UsageSample {
+            at: at + Duration::minutes(1),
+            account: Some(AccountId("current@example.com".into())),
+            plan: Some("Pro".into()),
+            ..old.clone()
+        };
+        store.insert_usage_sample(&fresh).unwrap();
+
+        assert_eq!(store.all_usage_samples().unwrap(), vec![fresh]);
     }
 
     #[test]
