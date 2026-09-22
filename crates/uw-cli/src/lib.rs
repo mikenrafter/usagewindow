@@ -46,6 +46,10 @@ pub enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommand,
+    },
 }
 #[derive(Debug, Args, Default, Clone)]
 pub struct StatusArgs {
@@ -66,6 +70,29 @@ pub enum SessionsCommand {
     },
     Show {
         session_id: SessionId,
+    },
+    /// Clears a session's `stopped_reason` (e.g. a stale/incorrect crash
+    /// detection), keeping the overridden reason for audit.
+    SupersedeStop {
+        session_id: SessionId,
+        #[arg(long)]
+        note: Option<String>,
+    },
+}
+#[derive(Debug, Subcommand)]
+pub enum ProviderCommand {
+    /// Marks a provider/account connection's fetch failures as known not to
+    /// indicate a real problem (e.g. an adapter that doesn't support usage
+    /// fetching at all) — the UI stops surfacing them as an alert.
+    MarkNonBlocking {
+        provider: Provider,
+        #[arg(long)]
+        account: Option<AccountId>,
+    },
+    MarkBlocking {
+        provider: Provider,
+        #[arg(long)]
+        account: Option<AccountId>,
     },
 }
 #[derive(Debug, Subcommand)]
@@ -137,6 +164,11 @@ pub trait ApiClient {
         dry_run: bool,
     ) -> Result<serde_json::Value>;
     fn keepalive(&mut self, id: &SessionId, enabled: bool) -> Result<serde_json::Value>;
+    fn supersede_stop(&mut self, id: &SessionId, note: Option<String>) -> Result<SessionDetail>;
+    fn set_provider_non_blocking(
+        &mut self,
+        request: SetFetchNonBlockingRequest,
+    ) -> Result<serde_json::Value>;
     fn thresholds_get(&mut self, request: ThresholdGetRequest) -> Result<ThresholdResponse>;
     fn thresholds_set(&mut self, request: ThresholdSetRequest) -> Result<ThresholdResponse>;
     fn daemon_status(&mut self) -> Result<serde_json::Value>;
@@ -202,6 +234,23 @@ pub fn execute<A: ApiClient, D: DirectReader>(
         Command::Sessions {
             command: SessionsCommand::Show { session_id },
         } => serde_json::to_value(client.sessions_show(&session_id)?)?,
+        Command::Sessions {
+            command: SessionsCommand::SupersedeStop { session_id, note },
+        } => serde_json::to_value(client.api.supersede_stop(&session_id, note)?)?,
+        Command::Provider {
+            command: ProviderCommand::MarkNonBlocking { provider, account },
+        } => client.api.set_provider_non_blocking(SetFetchNonBlockingRequest {
+            provider,
+            account,
+            non_blocking: true,
+        })?,
+        Command::Provider {
+            command: ProviderCommand::MarkBlocking { provider, account },
+        } => client.api.set_provider_non_blocking(SetFetchNonBlockingRequest {
+            provider,
+            account,
+            non_blocking: false,
+        })?,
         Command::Resume {
             session_id: Some(session_id),
             at,
@@ -448,6 +497,18 @@ impl ApiClient for HttpApiClient {
             &serde_json::json!({"enabled": enabled}),
         )
     }
+    fn supersede_stop(&mut self, id: &SessionId, note: Option<String>) -> Result<SessionDetail> {
+        self.post(
+            &format!("/api/sessions/{}/supersede-stop", id.0),
+            &SupersedeStopRequest { note },
+        )
+    }
+    fn set_provider_non_blocking(
+        &mut self,
+        request: SetFetchNonBlockingRequest,
+    ) -> Result<serde_json::Value> {
+        self.post("/api/provider-status/non-blocking", &request)
+    }
     fn thresholds_get(&mut self, request: ThresholdGetRequest) -> Result<ThresholdResponse> {
         let scope = request.scope.map(|s| {
             format!(
@@ -693,6 +754,16 @@ mod tests {
             Ok(serde_json::json!({}))
         }
         fn keepalive(&mut self, _: &SessionId, _: bool) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+        fn supersede_stop(&mut self, id: &SessionId, _: Option<String>) -> Result<SessionDetail> {
+            self.calls.push(format!("supersede-stop:{}", id.0));
+            Err(anyhow!("down"))
+        }
+        fn set_provider_non_blocking(
+            &mut self,
+            _: SetFetchNonBlockingRequest,
+        ) -> Result<serde_json::Value> {
             Ok(serde_json::json!({}))
         }
         fn thresholds_get(&mut self, _: ThresholdGetRequest) -> Result<ThresholdResponse> {

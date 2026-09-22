@@ -195,6 +195,14 @@ pub struct SessionSummary {
     pub launch_mode: LaunchMode,
     pub pid: Option<u32>,
     pub stopped_reason: Option<StopReason>,
+    /// The stop reason this session had before it was manually superseded
+    /// (e.g. a stale/incorrect crash detection). Superseding clears
+    /// `stopped_reason` back to `None` — so the session is eligible to be
+    /// treated as active again — while keeping the overridden reason here
+    /// for audit.
+    pub superseded_stop_reason: Option<StopReason>,
+    pub superseded_stop_reason_at: Option<DateTime<Utc>>,
+    pub superseded_stop_reason_note: Option<String>,
     pub resume_marker: Option<ResumeMarker>,
     pub superseded_by: Option<SessionId>,
     pub reseeded_from: Option<SessionId>,
@@ -404,6 +412,11 @@ pub struct ProviderFetchStatus {
     pub last_success_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
     pub consecutive_failures: u32,
+    /// Set when these failures are known not to indicate a real problem
+    /// (e.g. an adapter that doesn't support usage fetching at all).
+    /// Failures still accumulate normally; this only tells consumers to
+    /// stop surfacing them as an alert.
+    pub non_blocking: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompactionSource {
@@ -490,6 +503,9 @@ mod tests {
             launch_mode: LaunchMode::Headless,
             pid: None,
             stopped_reason: None,
+            superseded_stop_reason: None,
+            superseded_stop_reason_at: None,
+            superseded_stop_reason_note: None,
             resume_marker: None,
             superseded_by: Some(SessionId("s2".into())),
             reseeded_from: None,
@@ -514,6 +530,7 @@ mod tests {
             last_success_at: Some(Utc::now()),
             last_error: Some("timeout".into()),
             consecutive_failures: 2,
+            non_blocking: false,
         };
         assert_eq!(
             status,
@@ -555,6 +572,9 @@ mod tests {
             launch_mode: LaunchMode::Interactive,
             pid: None,
             stopped_reason: None,
+            superseded_stop_reason: None,
+            superseded_stop_reason_at: None,
+            superseded_stop_reason_note: None,
             resume_marker: None,
             superseded_by: None,
             reseeded_from: None,

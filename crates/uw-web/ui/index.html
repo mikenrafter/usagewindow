@@ -471,7 +471,7 @@ function renderUsage(status) {
   box.innerHTML = status.usage.map(u => {
     const key = providerLabel(u.provider) + '|' + (u.account || '');
     const fs = statusByKey.get(key);
-    const staleBadge = fs && fs.last_error
+    const staleBadge = fs && fs.last_error && !fs.non_blocking
       ? `<span class="pill stopped stale" title="${escapeHtml(fs.last_error)}">refresh failing (${fs.consecutive_failures}×) · last ok ${fs.last_success_at ? fmtDate(fs.last_success_at) : 'never'}</span>`
       : '';
     const bars = sortWindows(u.windows).map(w => renderUsageBar(providerLabel(u.provider), w)).join('');

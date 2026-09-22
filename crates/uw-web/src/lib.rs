@@ -157,6 +157,14 @@ pub fn app_with_adapters_and_auth(
         .route("/api/sessions/{id}/compact/cancel", post(cancel_compact))
         .route("/api/sessions/{id}/compact/status", get(compact_status))
         .route("/api/sessions/{id}/keepalive", post(keepalive))
+        .route(
+            "/api/sessions/{id}/supersede-stop",
+            post(supersede_stop),
+        )
+        .route(
+            "/api/provider-status/non-blocking",
+            post(set_provider_non_blocking),
+        )
         .route("/api/hooks", post(hook_ingress))
         .route("/api/thresholds", get(thresholds_get).post(thresholds_set))
         .route("/api/compactions/recent", get(compactions_recent))
@@ -336,6 +344,9 @@ async fn hook_ingress(
             launch_mode: LaunchMode::Interactive,
             pid,
             stopped_reason: None,
+            superseded_stop_reason: None,
+            superseded_stop_reason_at: None,
+            superseded_stop_reason_note: None,
             resume_marker: None,
             superseded_by: None,
             reseeded_from: None,
@@ -759,6 +770,9 @@ async fn create_session(
             launch_mode: LaunchMode::Interactive,
             pid: None,
             stopped_reason: None,
+            superseded_stop_reason: None,
+            superseded_stop_reason_at: None,
+            superseded_stop_reason_note: None,
             resume_marker: None,
             superseded_by: None,
             reseeded_from: None,
@@ -978,6 +992,37 @@ async fn keepalive(
     Ok(Json(
         serde_json::json!({"ok": true, "enabled": request.enabled}),
     ))
+}
+
+async fn supersede_stop(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<SupersedeStopRequest>,
+) -> Result<Json<SessionDetail>, (StatusCode, String)> {
+    let id = session_id(id);
+    read(state.clone(), {
+        let id = id.clone();
+        move |store| {
+            Ok(store.supersede_stop_reason(&id, request.note.as_deref(), Utc::now())?)
+        }
+    })
+    .await?;
+    Ok(Json(read(state, move |store| detail(store, &id)).await?))
+}
+
+async fn set_provider_non_blocking(
+    State(state): State<AppState>,
+    Json(request): Json<SetFetchNonBlockingRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    read(state, move |store| {
+        Ok(store.set_fetch_non_blocking(
+            &request.provider,
+            request.account.as_ref(),
+            request.non_blocking,
+        )?)
+    })
+    .await?;
+    Ok(Json(serde_json::json!({"ok": true})))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1280,6 +1325,9 @@ mod tests {
             launch_mode: LaunchMode::Headless,
             pid: None,
             stopped_reason: None,
+            superseded_stop_reason: None,
+            superseded_stop_reason_at: None,
+            superseded_stop_reason_note: None,
             resume_marker: None,
             superseded_by: None,
             reseeded_from: None,
@@ -2035,6 +2083,73 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&serde_json::json!({"enabled": false})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn supersede_stop_clears_the_reason_and_records_it_for_audit() {
+        let store = Store::open_memory().unwrap();
+        store.insert_session(&session()).unwrap();
+        store
+            .update_session_stop(&SessionId("session-1".into()), Some(&StopReason::Crashed))
+            .unwrap();
+        let response = app(store)
+            .oneshot(
+                Request::post("/api/sessions/session-1/supersede-stop")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({"note": "stale detection"}))
+                            .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: SessionDetail = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body.summary.stopped_reason, None);
+        assert_eq!(
+            body.summary.superseded_stop_reason,
+            Some(StopReason::Crashed)
+        );
+        assert_eq!(
+            body.summary.superseded_stop_reason_note.as_deref(),
+            Some("stale detection")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_provider_non_blocking_persists_the_flag() {
+        let store = Store::open_memory().unwrap();
+        store
+            .record_fetch_failure(
+                &Provider::Other("t3code".into()),
+                None,
+                Utc::now(),
+                "unsupported",
+            )
+            .unwrap();
+        let response = app(store)
+            .oneshot(
+                Request::post("/api/provider-status/non-blocking")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "provider": {"Other": "t3code"},
+                            "account": null,
+                            "non_blocking": true
+                        }))
+                        .unwrap(),
                     ))
                     .unwrap(),
             )

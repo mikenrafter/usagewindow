@@ -70,6 +70,18 @@ impl Store {
         {
             return Err(err.into());
         }
+        for stmt in [
+            "ALTER TABLE sessions ADD COLUMN superseded_stop_reason TEXT",
+            "ALTER TABLE sessions ADD COLUMN superseded_stop_reason_at TEXT",
+            "ALTER TABLE sessions ADD COLUMN superseded_stop_reason_note TEXT",
+            "ALTER TABLE provider_fetch_status ADD COLUMN non_blocking INTEGER NOT NULL DEFAULT 0",
+        ] {
+            if let Err(err) = self.connection.execute(stmt, [])
+                && !err.to_string().contains("duplicate column name")
+            {
+                return Err(err.into());
+            }
+        }
         Ok(())
     }
     pub fn insert_usage_sample(&self, s: &UsageSample) -> StoreResult<i64> {
@@ -144,9 +156,9 @@ impl Store {
     }
     pub fn read_session(&self, id: &SessionId) -> StoreResult<SessionSummary> {
         let r = self.connection.query_row(
-            "SELECT id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,superseded_by,reseeded_from FROM sessions WHERE id=?",
+            "SELECT id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,superseded_by,reseeded_from,superseded_stop_reason,superseded_stop_reason_at,superseded_stop_reason_note FROM sessions WHERE id=?",
             [id.0.as_str()],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?, row.get(4)?, row.get(5)?, row.get::<_, Option<i64>>(6)?, row.get::<_, Option<i64>>(7)?, row.get::<_, String>(8)?, row.get::<_, Option<i64>>(9)?, row.get(10)?, row.get(11)?, row.get::<_, Option<String>>(12)?, row.get::<_, Option<String>>(13)?, row.get::<_, Option<String>>(14)?)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?, row.get(4)?, row.get(5)?, row.get::<_, Option<i64>>(6)?, row.get::<_, Option<i64>>(7)?, row.get::<_, String>(8)?, row.get::<_, Option<i64>>(9)?, row.get(10)?, row.get(11)?, row.get::<_, Option<String>>(12)?, row.get::<_, Option<String>>(13)?, row.get::<_, Option<String>>(14)?, row.get::<_, Option<String>>(15)?, row.get::<_, Option<DateTime<Utc>>>(16)?, row.get::<_, Option<String>>(17)?)),
         ).optional()?.ok_or(StoreError::NotFound)?;
         Ok(SessionSummary {
             id: SessionId(r.0),
@@ -165,6 +177,9 @@ impl Store {
             resume_marker: None,
             superseded_by: r.13.map(SessionId),
             reseeded_from: r.14.map(SessionId),
+            superseded_stop_reason: r.15.map(|x| serde_json::from_str(&x)).transpose()?,
+            superseded_stop_reason_at: r.16,
+            superseded_stop_reason_note: r.17,
         })
     }
     /// Sessions whose id, cwd, or model contain `query` (case-insensitive substring),
@@ -439,6 +454,26 @@ impl Store {
         )?;
         Ok(())
     }
+    /// Overrides a session's current `stopped_reason` (e.g. a stale/incorrect
+    /// crash detection) back to `None`, keeping the overridden reason and an
+    /// optional note for audit. A no-op when the session isn't currently
+    /// marked stopped — there's nothing to supersede.
+    pub fn supersede_stop_reason(
+        &self,
+        id: &SessionId,
+        note: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> StoreResult<()> {
+        let session = self.read_session(id)?;
+        let Some(reason) = session.stopped_reason else {
+            return Ok(());
+        };
+        self.connection.execute(
+            "UPDATE sessions SET stopped_reason=NULL,superseded_stop_reason=?,superseded_stop_reason_at=?,superseded_stop_reason_note=? WHERE id=?",
+            params![json(&reason)?, at, note, id.0],
+        )?;
+        Ok(())
+    }
     pub fn insert_reseed_summary(&self, summary: &ReseedSummary) -> StoreResult<()> {
         self.connection.execute("INSERT INTO idle_reseed_summaries(id,session_id,source_model,summary_text,token_count_before,token_count_after,created_at) VALUES(?,?,?,?,?,?,?)", params![summary.id.to_string(), summary.session_id.0, summary.source_model.0, summary.summary_text, summary.token_count_before as i64, summary.token_count_after as i64, summary.created_at])?;
         Ok(())
@@ -710,9 +745,28 @@ impl Store {
         )?;
         Ok(())
     }
+    /// Marks (or clears) failures for a provider/account connection as known
+    /// not to indicate a real problem, without touching the failure history
+    /// itself. Row must already exist (created by a prior fetch attempt);
+    /// there is nothing to mark non-blocking before that.
+    pub fn set_fetch_non_blocking(
+        &self,
+        provider: &Provider,
+        account: Option<&AccountId>,
+        non_blocking: bool,
+    ) -> StoreResult<()> {
+        let updated = self.connection.execute(
+            "UPDATE provider_fetch_status SET non_blocking=? WHERE provider=? AND COALESCE(account,'')=COALESCE(?,'')",
+            params![boolean(non_blocking), json(provider)?, opt_json(&account)?],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
     pub fn fetch_statuses(&self) -> StoreResult<Vec<ProviderFetchStatus>> {
         let mut statement = self.connection.prepare(
-            "SELECT provider,account,last_attempt_at,last_success_at,last_error,consecutive_failures FROM provider_fetch_status ORDER BY provider,account",
+            "SELECT provider,account,last_attempt_at,last_success_at,last_error,consecutive_failures,non_blocking FROM provider_fetch_status ORDER BY provider,account",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -722,10 +776,11 @@ impl Store {
                 row.get(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })?;
         rows.map(|row| {
-            let (provider, account, last_attempt_at, last_success_at, last_error, failures) = row?;
+            let (provider, account, last_attempt_at, last_success_at, last_error, failures, non_blocking) = row?;
             Ok(ProviderFetchStatus {
                 provider: serde_json::from_str(&provider)?,
                 account: account.map(|x| serde_json::from_str(&x)).transpose()?,
@@ -733,6 +788,7 @@ impl Store {
                 last_success_at,
                 last_error,
                 consecutive_failures: failures as u32,
+                non_blocking: non_blocking != 0,
             })
         })
         .collect()
@@ -1041,7 +1097,7 @@ fn decode_compaction_event_row(row: &rusqlite::Row) -> rusqlite::Result<Compacti
         completed_at: row.get(9)?,
     })
 }
-const SCHEMA: &str = r#"PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS usage_samples(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,account TEXT,window_kind TEXT NOT NULL,window_scope_value TEXT NOT NULL,pct REAL NOT NULL,resets_at TEXT,exceeded INTEGER NOT NULL,active INTEGER NOT NULL,source TEXT NOT NULL,at TEXT NOT NULL,fetched_at TEXT,credits_json TEXT,plan TEXT);CREATE INDEX IF NOT EXISTS usage_samples_window_at ON usage_samples(provider,window_kind,window_scope_value,at);CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,harness TEXT NOT NULL,model TEXT,account TEXT,cwd TEXT NOT NULL,state_path TEXT,context_window_size INTEGER,last_known_token_count INTEGER,launch_mode TEXT NOT NULL,pid INTEGER,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,stopped_reason TEXT,stopped_window_kind TEXT,superseded_by TEXT,reseeded_from TEXT,title TEXT);CREATE TABLE IF NOT EXISTS session_token_usage(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),at TEXT NOT NULL,model TEXT,input_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_write_input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,UNIQUE(session_id,at,total_tokens,input_tokens,output_tokens));CREATE INDEX IF NOT EXISTS session_token_usage_session_at ON session_token_usage(session_id,at);CREATE TABLE IF NOT EXISTS resume_markers(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),reason TEXT NOT NULL,resume_at TEXT,requested_at TEXT,created_at TEXT NOT NULL,status TEXT NOT NULL,status_detail TEXT,message TEXT);CREATE INDEX IF NOT EXISTS resume_markers_session_status ON resume_markers(session_id,status);CREATE UNIQUE INDEX IF NOT EXISTS resume_markers_active ON resume_markers(session_id) WHERE status IN ('pending','scheduled');CREATE TABLE IF NOT EXISTS compaction_requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL,prompt TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS compaction_requests_session_status ON compaction_requests(session_id,status);CREATE TABLE IF NOT EXISTS threshold_overrides(id TEXT PRIMARY KEY,scope_kind TEXT NOT NULL,provider TEXT NOT NULL,model_value TEXT,session_value TEXT,field TEXT NOT NULL,value_json TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS threshold_overrides_key ON threshold_overrides(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field);CREATE TABLE IF NOT EXISTS idle_reseed_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,source_model TEXT NOT NULL,summary_text TEXT NOT NULL,token_count_before INTEGER NOT NULL,token_count_after INTEGER NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS keepalive_config(session_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL,last_ping_at TEXT,ping_day TEXT,ping_count INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS hook_messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,text TEXT NOT NULL,created_at TEXT NOT NULL,delivered_at TEXT);CREATE INDEX IF NOT EXISTS hook_messages_delivery ON hook_messages(session_id,event,delivered_at,created_at);CREATE TABLE IF NOT EXISTS hook_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,created_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS hook_events_session_created ON hook_events(session_id,created_at);CREATE TABLE IF NOT EXISTS provider_fetch_status(provider TEXT NOT NULL,account TEXT,last_attempt_at TEXT NOT NULL,last_success_at TEXT,last_error TEXT,consecutive_failures INTEGER NOT NULL DEFAULT 0);CREATE UNIQUE INDEX IF NOT EXISTS provider_fetch_status_key ON provider_fetch_status(provider,COALESCE(account,''));CREATE TABLE IF NOT EXISTS compaction_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),source TEXT NOT NULL,trigger TEXT,context_pct_before REAL,usage_window_pct_before REAL,tokens_before INTEGER,tokens_after INTEGER,started_at TEXT NOT NULL,completed_at TEXT);CREATE INDEX IF NOT EXISTS compaction_events_session_started ON compaction_events(session_id,started_at);CREATE INDEX IF NOT EXISTS compaction_events_started ON compaction_events(started_at);"#;
+const SCHEMA: &str = r#"PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS usage_samples(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,account TEXT,window_kind TEXT NOT NULL,window_scope_value TEXT NOT NULL,pct REAL NOT NULL,resets_at TEXT,exceeded INTEGER NOT NULL,active INTEGER NOT NULL,source TEXT NOT NULL,at TEXT NOT NULL,fetched_at TEXT,credits_json TEXT,plan TEXT);CREATE INDEX IF NOT EXISTS usage_samples_window_at ON usage_samples(provider,window_kind,window_scope_value,at);CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,harness TEXT NOT NULL,model TEXT,account TEXT,cwd TEXT NOT NULL,state_path TEXT,context_window_size INTEGER,last_known_token_count INTEGER,launch_mode TEXT NOT NULL,pid INTEGER,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,stopped_reason TEXT,stopped_window_kind TEXT,superseded_by TEXT,reseeded_from TEXT,title TEXT,superseded_stop_reason TEXT,superseded_stop_reason_at TEXT,superseded_stop_reason_note TEXT);CREATE TABLE IF NOT EXISTS session_token_usage(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),at TEXT NOT NULL,model TEXT,input_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_write_input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,UNIQUE(session_id,at,total_tokens,input_tokens,output_tokens));CREATE INDEX IF NOT EXISTS session_token_usage_session_at ON session_token_usage(session_id,at);CREATE TABLE IF NOT EXISTS resume_markers(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),reason TEXT NOT NULL,resume_at TEXT,requested_at TEXT,created_at TEXT NOT NULL,status TEXT NOT NULL,status_detail TEXT,message TEXT);CREATE INDEX IF NOT EXISTS resume_markers_session_status ON resume_markers(session_id,status);CREATE UNIQUE INDEX IF NOT EXISTS resume_markers_active ON resume_markers(session_id) WHERE status IN ('pending','scheduled');CREATE TABLE IF NOT EXISTS compaction_requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL,prompt TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS compaction_requests_session_status ON compaction_requests(session_id,status);CREATE TABLE IF NOT EXISTS threshold_overrides(id TEXT PRIMARY KEY,scope_kind TEXT NOT NULL,provider TEXT NOT NULL,model_value TEXT,session_value TEXT,field TEXT NOT NULL,value_json TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS threshold_overrides_key ON threshold_overrides(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field);CREATE TABLE IF NOT EXISTS idle_reseed_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,source_model TEXT NOT NULL,summary_text TEXT NOT NULL,token_count_before INTEGER NOT NULL,token_count_after INTEGER NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS keepalive_config(session_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL,last_ping_at TEXT,ping_day TEXT,ping_count INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS hook_messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,text TEXT NOT NULL,created_at TEXT NOT NULL,delivered_at TEXT);CREATE INDEX IF NOT EXISTS hook_messages_delivery ON hook_messages(session_id,event,delivered_at,created_at);CREATE TABLE IF NOT EXISTS hook_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,created_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS hook_events_session_created ON hook_events(session_id,created_at);CREATE TABLE IF NOT EXISTS provider_fetch_status(provider TEXT NOT NULL,account TEXT,last_attempt_at TEXT NOT NULL,last_success_at TEXT,last_error TEXT,consecutive_failures INTEGER NOT NULL DEFAULT 0,non_blocking INTEGER NOT NULL DEFAULT 0);CREATE UNIQUE INDEX IF NOT EXISTS provider_fetch_status_key ON provider_fetch_status(provider,COALESCE(account,''));CREATE TABLE IF NOT EXISTS compaction_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),source TEXT NOT NULL,trigger TEXT,context_pct_before REAL,usage_window_pct_before REAL,tokens_before INTEGER,tokens_after INTEGER,started_at TEXT NOT NULL,completed_at TEXT);CREATE INDEX IF NOT EXISTS compaction_events_session_started ON compaction_events(session_id,started_at);CREATE INDEX IF NOT EXISTS compaction_events_started ON compaction_events(started_at);"#;
 
 #[cfg(test)]
 mod tests {
@@ -1063,6 +1119,9 @@ mod tests {
             launch_mode: LaunchMode::Headless,
             pid: None,
             stopped_reason: None,
+            superseded_stop_reason: None,
+            superseded_stop_reason_at: None,
+            superseded_stop_reason_note: None,
             resume_marker: None,
             superseded_by: None,
             reseeded_from: None,
@@ -1645,6 +1704,81 @@ mod tests {
         assert_eq!(statuses[0].consecutive_failures, 0);
         assert_eq!(statuses[0].last_error, None);
         assert_eq!(statuses[0].last_success_at, Some(t1));
+    }
+
+    #[test]
+    fn fetch_non_blocking_survives_subsequent_failures_until_cleared() {
+        let s = Store::open_memory().unwrap();
+        let t0 = Utc::now();
+        s.record_fetch_failure(&Provider::Other("t3code".into()), None, t0, "unsupported")
+            .unwrap();
+
+        s.set_fetch_non_blocking(&Provider::Other("t3code".into()), None, true)
+            .unwrap();
+        let statuses = s.fetch_statuses().unwrap();
+        assert!(statuses[0].non_blocking);
+
+        s.record_fetch_failure(
+            &Provider::Other("t3code".into()),
+            None,
+            t0 + Duration::minutes(1),
+            "unsupported",
+        )
+        .unwrap();
+        let statuses = s.fetch_statuses().unwrap();
+        assert_eq!(statuses[0].consecutive_failures, 2);
+        assert!(
+            statuses[0].non_blocking,
+            "a fresh failure must not clear an existing non_blocking mark"
+        );
+
+        s.set_fetch_non_blocking(&Provider::Other("t3code".into()), None, false)
+            .unwrap();
+        assert!(!s.fetch_statuses().unwrap()[0].non_blocking);
+    }
+
+    #[test]
+    fn set_fetch_non_blocking_errors_when_no_status_row_exists() {
+        let s = Store::open_memory().unwrap();
+        assert!(matches!(
+            s.set_fetch_non_blocking(&Provider::Codex, None, true),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn supersede_stop_reason_clears_stop_and_preserves_it_for_audit() {
+        let s = Store::open_memory().unwrap();
+        let id = SessionId("de50f3dc-713e-44ff-baaa-ea46fd0e4e1a".into());
+        s.insert_session(&session(&id)).unwrap();
+        s.update_session_stop(&id, Some(&StopReason::Crashed))
+            .unwrap();
+
+        let at = Utc::now();
+        s.supersede_stop_reason(&id, Some("t3code errors are non-blocking"), at)
+            .unwrap();
+
+        let session = s.read_session(&id).unwrap();
+        assert_eq!(session.stopped_reason, None);
+        assert_eq!(session.superseded_stop_reason, Some(StopReason::Crashed));
+        assert_eq!(session.superseded_stop_reason_at, Some(at));
+        assert_eq!(
+            session.superseded_stop_reason_note.as_deref(),
+            Some("t3code errors are non-blocking")
+        );
+    }
+
+    #[test]
+    fn supersede_stop_reason_is_a_noop_when_session_is_not_stopped() {
+        let s = Store::open_memory().unwrap();
+        let id = SessionId("running".into());
+        s.insert_session(&session(&id)).unwrap();
+
+        s.supersede_stop_reason(&id, None, Utc::now()).unwrap();
+
+        let session = s.read_session(&id).unwrap();
+        assert_eq!(session.stopped_reason, None);
+        assert_eq!(session.superseded_stop_reason, None);
     }
 
     #[test]

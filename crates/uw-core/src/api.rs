@@ -75,6 +75,16 @@ pub struct UpdateSessionRequest {
     pub model: Option<ModelId>,
     pub account: Option<AccountId>,
 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SupersedeStopRequest {
+    pub note: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetFetchNonBlockingRequest {
+    pub provider: Provider,
+    pub account: Option<AccountId>,
+    pub non_blocking: bool,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SparklinePoint {
     pub at: DateTime<Utc>,
@@ -177,6 +187,7 @@ mod tests {
                 last_success_at: None,
                 last_error: Some("timeout".into()),
                 consecutive_failures: 1,
+                non_blocking: false,
             }],
             keepalive_active_count: 3,
         });
@@ -220,6 +231,9 @@ mod tests {
                 launch_mode: LaunchMode::Headless,
                 pid: None,
                 stopped_reason: None,
+                superseded_stop_reason: None,
+                superseded_stop_reason_at: None,
+                superseded_stop_reason_note: None,
                 resume_marker: None,
                 superseded_by: None,
                 reseeded_from: None,
@@ -258,6 +272,14 @@ mod tests {
             session_id: SessionId("s".into()),
         });
         round_trip(CompactStatusResponse { requests: vec![] });
+        round_trip(SupersedeStopRequest {
+            note: Some("t3code errors are non-blocking".into()),
+        });
+        round_trip(SetFetchNonBlockingRequest {
+            provider: Provider::Other("t3code".into()),
+            account: None,
+            non_blocking: true,
+        });
         round_trip(ThresholdGetRequest { scope: None });
         round_trip(ThresholdSetRequest {
             scope: ThresholdScope {
