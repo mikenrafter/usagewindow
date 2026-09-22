@@ -348,16 +348,16 @@ impl HarnessAdapter for T3CodeAdapter {
         session: &SessionSummary,
         request: &CompactionRequest,
     ) -> AdapterResult<DeliveryOutcome> {
-        let thread_id = session.id.0.as_str();
+        let thread_id = self.owned_thread(session).await?;
         let instructions = Self::compaction_instructions(&request.prompt);
         self.transport
-            .post_dispatch(Self::turn_start_payload(thread_id, &instructions))
+            .post_dispatch(Self::turn_start_payload(&thread_id.0, &instructions))
             .await?;
         self.transport
-            .post_interrupt(Self::interrupt_payload(thread_id))
+            .post_interrupt(Self::interrupt_payload(&thread_id.0))
             .await?;
         self.transport
-            .post_dispatch(Self::turn_start_payload(thread_id, "/compact"))
+            .post_dispatch(Self::turn_start_payload(&thread_id.0, "/compact"))
             .await
             .map(|_| DeliveryOutcome::Delivered)
     }
@@ -497,6 +497,63 @@ mod tests {
         }
     }
 
+    fn native_codex_session() -> SessionSummary {
+        SessionSummary {
+            id: SessionId("01a0c8b8-27d5-79c1-b394-dd237acc56ec".into()),
+            harness: Provider::Codex,
+            ..session()
+        }
+    }
+
+    fn native_cursor_session() -> SessionSummary {
+        SessionSummary {
+            id: SessionId("cursor-native-session".into()),
+            harness: Provider::Cursor,
+            ..session()
+        }
+    }
+
+    fn compaction_request(session: &SessionSummary) -> CompactionRequest {
+        CompactionRequest {
+            id: uuid::Uuid::new_v4(),
+            session_id: session.id.clone(),
+            kind: CompactionKind::AgentRequested,
+            prompt: "/compact\nPreserve the active goal.".into(),
+            reason: "test".into(),
+            status: CompactionStatus::Sending,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn owner_db(rows: &[(&str, &str, &str)]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "usagewindow-t3-owner-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE provider_session_runtime (
+                    thread_id TEXT NOT NULL,
+                    provider_name TEXT NOT NULL,
+                    resume_cursor_json TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        for (thread_id, provider_name, cursor) in rows {
+            connection
+                .execute(
+                    "INSERT INTO provider_session_runtime
+                        (thread_id, provider_name, resume_cursor_json)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![thread_id, provider_name, cursor],
+                )
+                .unwrap();
+        }
+        drop(connection);
+        path
+    }
+
     #[tokio::test]
     async fn resume_resolves_native_claude_id_to_its_t3_thread_owner() {
         let path = std::env::temp_dir().join(format!("usagewindow-t3-owner-{}.db", uuid::Uuid::new_v4()));
@@ -621,35 +678,81 @@ mod tests {
 
     #[tokio::test]
     async fn sends_instructions_interrupts_and_uses_t3code_native_compaction() {
-        let transport = std::sync::Arc::new(FakeTransport::new());
+        let transport = std::sync::Arc::new(FakeTransport::with_thread(serde_json::json!({
+            "thread": {
+                "id": session().id.0,
+                "session": {"status": "stopped", "providerName": "claudeAgent"}
+            }
+        })));
         let adapter = T3CodeAdapter::new(transport.clone());
-        let request = CompactionRequest {
-            id: uuid::Uuid::new_v4(),
-            session_id: session().id.clone(),
-            kind: CompactionKind::AgentRequested,
-            prompt: "/compact\nPreserve the active goal.".into(),
-            reason: "test".into(),
-            status: CompactionStatus::Sending,
-            created_at: chrono::Utc::now(),
-        };
+        let request = compaction_request(&session());
 
         assert_eq!(
             adapter.compact(&session(), &request).await.unwrap(),
             DeliveryOutcome::Delivered
         );
         let calls = transport.calls.lock().unwrap();
-        assert_eq!(calls.len(), 3);
-        assert_eq!(calls[0].1["type"], "thread.turn.start");
-        assert_eq!(calls[0].1["threadId"], session().id.0);
-        assert_eq!(calls[0].1["message"]["text"], "Preserve the active goal.");
-        assert_eq!(calls[1].0, "interrupt");
-        assert_eq!(calls[1].1["type"], "thread.turn.interrupt");
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0].0, "get_thread");
+        assert_eq!(calls[1].1["type"], "thread.turn.start");
         assert_eq!(calls[1].1["threadId"], session().id.0);
-        assert!(calls[1].1.get("turnId").is_none());
-        assert_eq!(calls[2].0, "dispatch");
-        assert_eq!(calls[2].1["type"], "thread.turn.start");
+        assert_eq!(calls[1].1["message"]["text"], "Preserve the active goal.");
+        assert_eq!(calls[2].0, "interrupt");
+        assert_eq!(calls[2].1["type"], "thread.turn.interrupt");
         assert_eq!(calls[2].1["threadId"], session().id.0);
-        assert_eq!(calls[2].1["message"]["text"], "/compact");
+        assert!(calls[2].1.get("turnId").is_none());
+        assert_eq!(calls[3].0, "dispatch");
+        assert_eq!(calls[3].1["type"], "thread.turn.start");
+        assert_eq!(calls[3].1["threadId"], session().id.0);
+        assert_eq!(calls[3].1["message"]["text"], "/compact");
+    }
+
+    #[tokio::test]
+    async fn compaction_resolves_every_native_provider_to_its_owned_t3_thread() {
+        let cases = [
+            (
+                native_claude_session(),
+                "claudeAgent",
+                r#"{"resume":"de50f3dc-713e-44ff-baaa-ea46fd0e4e1a"}"#,
+                "t3-claude-thread",
+            ),
+            (
+                native_codex_session(),
+                "codex",
+                r#"{"threadId":"01a0c8b8-27d5-79c1-b394-dd237acc56ec"}"#,
+                "t3-codex-thread",
+            ),
+            (
+                native_cursor_session(),
+                "cursor",
+                r#"{"sessionId":"cursor-native-session"}"#,
+                "t3-cursor-thread",
+            ),
+        ];
+
+        for (native_session, provider_name, cursor, t3_thread_id) in cases {
+            let path = owner_db(&[(t3_thread_id, provider_name, cursor)]);
+            let transport = std::sync::Arc::new(FakeTransport::with_thread(serde_json::json!({
+                "thread": {
+                    "id": t3_thread_id,
+                    "session": {"status": "stopped", "providerName": provider_name}
+                }
+            })));
+            let adapter = T3CodeAdapter::with_state_db(transport.clone(), &path);
+
+            adapter
+                .compact(&native_session, &compaction_request(&native_session))
+                .await
+                .unwrap();
+
+            let calls = transport.calls.lock().unwrap();
+            assert_eq!(calls[0].0, "get_thread");
+            assert_eq!(calls[0].1, t3_thread_id);
+            assert_eq!(calls[1].1["threadId"], t3_thread_id);
+            assert_eq!(calls[2].1["threadId"], t3_thread_id);
+            assert_eq!(calls[3].1["threadId"], t3_thread_id);
+            fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
