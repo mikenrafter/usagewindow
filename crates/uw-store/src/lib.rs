@@ -74,6 +74,7 @@ impl Store {
             "ALTER TABLE sessions ADD COLUMN superseded_stop_reason TEXT",
             "ALTER TABLE sessions ADD COLUMN superseded_stop_reason_at TEXT",
             "ALTER TABLE sessions ADD COLUMN superseded_stop_reason_note TEXT",
+            "ALTER TABLE sessions ADD COLUMN last_seen_missing INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE provider_fetch_status ADD COLUMN non_blocking INTEGER NOT NULL DEFAULT 0",
         ] {
             if let Err(err) = self.connection.execute(stmt, [])
@@ -500,6 +501,24 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+    pub fn set_session_last_seen_missing(
+        &self,
+        id: &SessionId,
+        missing: bool,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            "UPDATE sessions SET last_seen_missing=? WHERE id=?",
+            params![missing, id.0],
+        )?;
+        Ok(())
+    }
+    pub fn session_last_seen_missing(&self, id: &SessionId) -> StoreResult<bool> {
+        Ok(self.connection.query_row(
+            "SELECT last_seen_missing FROM sessions WHERE id=?",
+            [id.0.as_str()],
+            |row| row.get::<_, bool>(0),
+        )?)
     }
     pub fn insert_token_usage_records(
         &self,
@@ -1847,6 +1866,19 @@ mod tests {
         assert_eq!(s.list_sessions().unwrap().len(), 1);
         assert!(s.resume_markers_for_session(&id).unwrap().is_empty());
         assert!(s.compaction_requests_for_session(&id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn missing_last_seen_is_stored_as_a_malformed_session_marker() {
+        let store = Store::open_memory().unwrap();
+        let session = session(&SessionId("malformed".into()));
+        store.insert_session(&session).unwrap();
+
+        assert!(!store.session_last_seen_missing(&session.id).unwrap());
+        store
+            .set_session_last_seen_missing(&session.id, true)
+            .unwrap();
+        assert!(store.session_last_seen_missing(&session.id).unwrap());
     }
 
     #[test]

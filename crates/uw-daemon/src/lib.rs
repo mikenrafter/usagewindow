@@ -619,6 +619,7 @@ impl ObservationStore for SqliteDaemonStore {
         now: DateTime<Utc>,
     ) -> anyhow::Result<()> {
         self.blocking(move |store| {
+            let last_seen_missing = found.last_seen.is_none();
             let session = SessionSummary {
                 id: found.id.clone(),
                 harness: provider,
@@ -641,6 +642,7 @@ impl ObservationStore for SqliteDaemonStore {
                 reseeded_from: None,
             };
             store.upsert_session(&session)?;
+            store.set_session_last_seen_missing(&session.id, last_seen_missing)?;
             store.insert_token_usage_records(&session.id, &found.token_usage)?;
             if let Some(title) = found.title {
                 store.set_session_title(&session.id, &title)?;

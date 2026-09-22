@@ -596,6 +596,7 @@ const MAX_SESSIONS_LIMIT: u32 = 200;
 #[derive(Debug, Deserialize, Default)]
 struct SessionsQuery {
     inactive: Option<bool>,
+    malformed: Option<bool>,
     stopped: Option<bool>,
     harness: Option<String>,
     q: Option<String>,
@@ -609,6 +610,7 @@ async fn sessions(
 ) -> Result<Json<SessionsPage>, (StatusCode, String)> {
     let harness: Option<Provider> = query.harness.and_then(|value| value.parse().ok());
     let include_inactive = query.inactive.or(query.stopped).unwrap_or(false);
+    let include_malformed = query.malformed.unwrap_or(false);
     let offset = query.offset.unwrap_or(0);
     let limit = query
         .limit
@@ -619,6 +621,9 @@ async fn sessions(
             let mut matching = Vec::new();
             let now = Utc::now();
             for s in store.search_sessions(query.q.as_deref())? {
+                if !include_malformed && store.session_last_seen_missing(&s.id)? {
+                    continue;
+                }
                 let active = s.stopped_reason.is_none()
                     && store
                         .token_usage_for_session(&s.id)?
@@ -2254,6 +2259,51 @@ mod tests {
             .unwrap();
         let page: SessionsPage = serde_json::from_slice(&body).unwrap();
         assert_eq!(page.total, 2);
+    }
+
+    #[tokio::test]
+    async fn malformed_sessions_require_explicit_opt_in() {
+        let store = Store::open_memory().unwrap();
+        let normal = session();
+        let mut malformed = session();
+        malformed.id = SessionId("malformed".into());
+        store.insert_session(&normal).unwrap();
+        store.insert_session(&malformed).unwrap();
+        store
+            .set_session_last_seen_missing(&malformed.id, true)
+            .unwrap();
+
+        let router = app(store);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/api/sessions?inactive=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: SessionsPage = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].id, normal.id);
+
+        let response = router
+            .oneshot(
+                Request::get("/api/sessions?inactive=true&malformed=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: SessionsPage = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page.total, 2);
+        assert!(page.items.iter().any(|item| item.id == malformed.id));
     }
 
     #[tokio::test]

@@ -223,6 +223,7 @@
         <option value="Cursor">Cursor</option>
       </select>
       <label class="chk"><input type="checkbox" id="inactive"> include inactive sessions</label>
+      <label class="chk"><input type="checkbox" id="malformed"> Include malformed sessions</label>
     </div>
     <div id="err" class="err"></div>
     <table>
@@ -558,6 +559,7 @@ async function loadSessions() {
   if (q) params.set('q', q);
   if (harness) params.set('harness', harness);
   if ($('#inactive').checked) params.set('inactive', 'true');
+  if ($('#malformed').checked) params.set('malformed', 'true');
   params.set('offset', String(page * PAGE_SIZE));
   params.set('limit', String(PAGE_SIZE));
   let result;
