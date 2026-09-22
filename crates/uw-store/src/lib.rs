@@ -84,7 +84,29 @@ impl Store {
         }
         self.reconcile_obsolete_usage_windows()?;
         self.reconcile_obsolete_provider_accounts()?;
+        self.reconcile_session_accounts()?;
         Ok(())
+    }
+
+    /// Discovery can predate the first usage poll, so repair accountless rows
+    /// from the newest provider identity whenever the database is opened.
+    pub fn reconcile_session_accounts(&self) -> StoreResult<usize> {
+        Ok(self.connection.execute(
+            "UPDATE sessions AS session
+             SET account = (
+                 SELECT sample.account FROM usage_samples AS sample
+                 WHERE sample.provider = session.harness
+                   AND sample.account IS NOT NULL
+                 ORDER BY sample.at DESC, sample.id DESC LIMIT 1
+             )
+             WHERE session.account IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM usage_samples AS sample
+                   WHERE sample.provider = session.harness
+                     AND sample.account IS NOT NULL
+               )",
+            [],
+        )?)
     }
 
     /// Removes window identities that no longer occur in the latest complete
@@ -348,7 +370,9 @@ impl Store {
     /// Returns the shared five-minute cache-warm approximation for a session.
     pub fn session_cache_warm(&self, id: &SessionId, now: DateTime<Utc>) -> StoreResult<bool> {
         let session = self.read_session(id)?;
-        Ok(is_cache_warm(session.last_seen, now))
+        let records = self.token_usage_for_session(id)?;
+        Ok(is_cache_warm(session.last_seen, now)
+            && session_has_recent_token_activity(&records, now))
     }
     pub fn resume_markers_for_session(&self, id: &SessionId) -> StoreResult<Vec<ResumeMarker>> {
         let mut stmt = self.connection.prepare("SELECT id,session_id,reason,resume_at,requested_at,created_at,status,status_detail,message FROM resume_markers WHERE session_id=? ORDER BY created_at,id")?;
@@ -1395,12 +1419,68 @@ mod tests {
         let mut warm = session(&SessionId("warm".into()));
         warm.last_seen = now - Duration::minutes(CACHE_WARM_APPROXIMATION_MINUTES);
         store.insert_session(&warm).unwrap();
+        store
+            .insert_token_usage_records(
+                &warm.id,
+                &[TokenUsageRecord {
+                    at: now,
+                    model: None,
+                    input_tokens: 10,
+                    cached_input_tokens: 10,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 0,
+                    reasoning_output_tokens: 0,
+                    total_tokens: 10,
+                }],
+            )
+            .unwrap();
         let mut cold = session(&SessionId("cold".into()));
         cold.last_seen = now - Duration::minutes(CACHE_WARM_APPROXIMATION_MINUTES + 1);
         store.insert_session(&cold).unwrap();
 
         assert!(store.session_cache_warm(&warm.id, now).unwrap());
         assert!(!store.session_cache_warm(&cold.id, now).unwrap());
+    }
+
+    #[test]
+    fn session_cache_is_cold_without_recent_token_activity() {
+        let store = Store::open_memory().unwrap();
+        let now = Utc::now();
+        let mut session = session(&SessionId("inactive-but-recent".into()));
+        session.last_seen = now;
+        store.insert_session(&session).unwrap();
+
+        assert!(!store.session_cache_warm(&session.id, now).unwrap());
+    }
+
+    #[test]
+    fn existing_sessions_inherit_the_current_provider_account() {
+        let store = Store::open_memory().unwrap();
+        let session_id = SessionId("accountless-session".into());
+        store.insert_session(&session(&session_id)).unwrap();
+        let sample = UsageSample {
+            at: Utc::now(),
+            fetched_at: None,
+            source: UsageSource::ProviderReported,
+            provider: Provider::Codex,
+            account: Some(AccountId("owner@example.com".into())),
+            plan: None,
+            windows: std::collections::HashMap::from([(
+                WindowKey {
+                    provider: Provider::Codex,
+                    kind: WindowKind::Rolling { minutes: 300 },
+                },
+                UsageWindowState::new(1.0, false, true, None, None),
+            )]),
+            credits: None,
+        };
+        store.insert_usage_sample(&sample).unwrap();
+        store.reconcile_session_accounts().unwrap();
+
+        assert_eq!(
+            store.read_session(&session_id).unwrap().account,
+            Some(AccountId("owner@example.com".into()))
+        );
     }
 
     #[test]

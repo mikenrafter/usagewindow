@@ -550,7 +550,20 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         if let Some(entry) = self.cache.load().await?
             && (self.now)() - entry.fetched_at < chrono::Duration::seconds(120)
         {
-            return Ok(entry.sample);
+            let mut sample = entry.sample;
+            if sample.account.is_none()
+                && let Ok(credentials) = self.credentials.read().await
+                && let Ok(value) = serde_json::from_str::<Value>(&credentials)
+            {
+                sample.account = account_from_credentials(&value);
+                sample.plan = sample.plan.or_else(|| {
+                    value
+                        .pointer("/claudeAiOauth/subscriptionType")
+                        .and_then(Value::as_str)
+                        .map(display_plan_name)
+                });
+            }
+            return Ok(sample);
         }
         match self.fetch_live().await {
             Ok(sample) => {
@@ -1271,7 +1284,7 @@ mod tests {
             fetched_at: None,
             source: UsageSource::ProviderReported,
             provider: Provider::ClaudeCode,
-            account: None,
+            account: Some(AccountId("claude@example.com".into())),
             plan: None,
             windows: Default::default(),
             credits: None,

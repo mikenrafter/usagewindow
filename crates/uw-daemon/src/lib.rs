@@ -343,6 +343,7 @@ pub trait ObservationStore: Send + Sync {
         &self,
         provider: Provider,
         found: DiscoveredSession,
+        account: Option<AccountId>,
         now: DateTime<Utc>,
     ) -> anyhow::Result<()>;
     /// Records the outcome of a provider usage poll without touching `usage_samples` —
@@ -594,6 +595,7 @@ impl ObservationStore for SqliteDaemonStore {
     async fn record_usage(&self, sample: UsageSample) -> anyhow::Result<()> {
         self.blocking(move |store| {
             store.insert_usage_sample(&sample)?;
+            store.reconcile_session_accounts()?;
             Ok(())
         })
         .await
@@ -613,6 +615,7 @@ impl ObservationStore for SqliteDaemonStore {
         &self,
         provider: Provider,
         found: DiscoveredSession,
+        account: Option<AccountId>,
         now: DateTime<Utc>,
     ) -> anyhow::Result<()> {
         self.blocking(move |store| {
@@ -620,7 +623,7 @@ impl ObservationStore for SqliteDaemonStore {
                 id: found.id.clone(),
                 harness: provider,
                 model: found.model,
-                account: None,
+                account,
                 first_seen: found.first_seen.unwrap_or(now),
                 last_seen: found.last_seen.unwrap_or(now),
                 cwd: found.cwd,
@@ -705,7 +708,14 @@ pub async fn run_observation_tick(
                         report.sessions_discovered += 1;
                     }
                     store
-                        .upsert_discovered_session(adapter.provider(), session, now)
+                        .upsert_discovered_session(
+                            adapter.provider(),
+                            session,
+                            fetched_samples
+                                .get(&adapter.provider())
+                                .and_then(|sample| sample.account.clone()),
+                            now,
+                        )
                         .await?;
                 }
             }
@@ -2791,6 +2801,7 @@ mod tests {
             &self,
             _: Provider,
             _: DiscoveredSession,
+            _: Option<AccountId>,
             _: DateTime<Utc>,
         ) -> anyhow::Result<()> {
             Ok(())
