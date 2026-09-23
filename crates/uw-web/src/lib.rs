@@ -568,13 +568,18 @@ async fn status(
                     .filter(|record| record.total_tokens > 0)
                     .map(|record| record.at)
                     .collect::<Vec<_>>();
+                let token_usage = records
+                    .iter()
+                    .filter(|record| record.total_tokens > 0)
+                    .map(|record| (record.at, record.total_tokens))
+                    .collect::<Vec<_>>();
                 let keptalive = store
                     .keepalive_config(&session.id)
                     .map(|config| config.enabled)
                     .unwrap_or(false)
                     && uw_core::model::is_keepalive_eligible(session, &records, now);
                 let scheduled = store.active_resume_marker(&session.id)?.is_some();
-                Ok((session.id.clone(), active, keptalive, scheduled, activity))
+                Ok((session.id.clone(), active, keptalive, scheduled, activity, token_usage))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         let usage = latest.into_values().map(|sample| {
@@ -592,13 +597,16 @@ async fn status(
                 let mut inactive_sessions = 0;
                 let mut active_sessions = 0;
                 let mut keptalive_sessions = 0;
+                let mut inactive_tokens = 0_u64;
+                let mut active_tokens = 0_u64;
+                let mut keptalive_tokens = 0_u64;
                 for session in sessions
                     .iter()
                     .filter(|s| s.harness == provider && s.account == account)
                 {
-                    let Some((_, active, keptalive, _, activity)) = session_activity
+                    let Some((_, active, keptalive, _, activity, token_usage)) = session_activity
                         .iter()
-                        .find(|(id, _, _, _, _)| id == &session.id)
+                        .find(|(id, _, _, _, _, _)| id == &session.id)
                     else {
                         continue;
                     };
@@ -612,19 +620,48 @@ async fn status(
                     }
                     if *active {
                         active_sessions += 1;
+                        active_tokens += token_usage
+                            .iter()
+                            .filter(|(at, _)| *at >= cutoff)
+                            .map(|(_, tokens)| *tokens)
+                            .sum::<u64>();
                     } else if *keptalive {
                         keptalive_sessions += 1;
+                        keptalive_tokens += token_usage
+                            .iter()
+                            .filter(|(at, _)| *at >= cutoff)
+                            .map(|(_, tokens)| *tokens)
+                            .sum::<u64>();
                     } else {
                         inactive_sessions += 1;
+                        inactive_tokens += token_usage
+                            .iter()
+                            .filter(|(at, _)| *at >= cutoff)
+                            .map(|(_, tokens)| *tokens)
+                            .sum::<u64>();
                     }
                 }
+                let total_tokens = active_tokens
+                    .saturating_add(keptalive_tokens)
+                    .saturating_add(inactive_tokens);
+                let burn_pct = burn_rate_pct_per_hour
+                    .filter(|rate| *rate > 0.0)
+                    .map(|rate| rate * purview.num_minutes() as f32 / 60.0)
+                    .unwrap_or(0.0);
+                let token_to_pct = |tokens: u64| {
+                    if total_tokens == 0 {
+                        0.0
+                    } else {
+                        burn_pct * tokens as f32 / total_tokens as f32
+                    }
+                };
                 let scheduled_sessions = sessions
                     .iter()
                     .filter(|s| s.harness == provider && s.account == account)
                     .filter(|s| {
                         session_activity
                             .iter()
-                            .any(|(id, _, _, scheduled, _)| id == &s.id && *scheduled)
+                            .any(|(id, _, _, scheduled, _, _)| id == &s.id && *scheduled)
                     })
                     .count() as u32;
                 let depletes_at = burn_rate_pct_per_hour.filter(|rate| *rate > 0.0).map(|rate| {
@@ -637,6 +674,9 @@ async fn status(
                     resets_at: window.resets_at,
                     exceeded: window.exceeded,
                     burn_rate_pct_per_hour,
+                    inactive_burn_pct: token_to_pct(inactive_tokens),
+                    active_burn_pct: token_to_pct(active_tokens),
+                    keptalive_burn_pct: token_to_pct(keptalive_tokens),
                     inactive_sessions,
                     active_sessions,
                     keptalive_sessions,
@@ -1651,24 +1691,30 @@ mod tests {
                 }],
             )
             .unwrap();
-        store
-            .insert_usage_sample(&UsageSample {
-                at: Utc::now(),
-                fetched_at: None,
-                source: UsageSource::ProviderReported,
-                provider: Provider::Cursor,
-                account: None,
-                plan: None,
-                windows: HashMap::from([(
-                    WindowKey {
-                        provider: Provider::Cursor,
-                        kind: WindowKind::Rolling { minutes: 300 },
-                    },
-                    UsageWindowState::new(42.0, false, true, None, None),
-                )]),
-                credits: None,
-            })
-            .unwrap();
+        let current_at = Utc::now();
+        for (at, pct, source) in [
+            (current_at - Duration::hours(1), 40.0, UsageSource::LocalEstimate),
+            (current_at, 42.0, UsageSource::ProviderReported),
+        ] {
+            store
+                .insert_usage_sample(&UsageSample {
+                    at,
+                    fetched_at: None,
+                    source,
+                    provider: Provider::Cursor,
+                    account: None,
+                    plan: None,
+                    windows: HashMap::from([(
+                        WindowKey {
+                            provider: Provider::Cursor,
+                            kind: WindowKind::Rolling { minutes: 300 },
+                        },
+                        UsageWindowState::new(pct, false, true, None, None),
+                    )]),
+                    credits: None,
+                })
+                .unwrap();
+        }
 
         let response = app(store)
             .oneshot(Request::get("/api/status").body(Body::empty()).unwrap())
@@ -1681,6 +1727,10 @@ mod tests {
 
         assert_eq!(value.usage[0].windows[0].inactive_sessions, 1);
         assert_eq!(value.usage[0].windows[0].active_sessions, 1);
+        let window = &value.usage[0].windows[0];
+        assert!((window.active_burn_pct - 26.1818).abs() < 0.01, "active={} inactive={} rate={:?}", window.active_burn_pct, window.inactive_burn_pct, window.burn_rate_pct_per_hour);
+        assert!((window.inactive_burn_pct - 21.8181).abs() < 0.01);
+        assert_eq!(window.keptalive_burn_pct, 0.0);
     }
 
     #[tokio::test]

@@ -494,14 +494,18 @@ function hslColor(hue, sat, light = 48) {
   return `hsl(${hue.toFixed(1)}, ${sat}%, ${light}%)`;
 }
 
-function stripedSection(hue, lightnessA, lightnessB) {
-  const colorA = hslColor(hue, 50, lightnessA);
-  const colorB = hslColor(hue, 30, lightnessB);
-  return `repeating-linear-gradient(135deg, ${colorA} 0 4px, ${colorB} 4px 8px)`;
-}
-
 function stripedOutsideSection(hue) {
   return `repeating-linear-gradient(135deg, ${hslColor(hue, 30, 42)} 0 4px, ${hslColor(hue, 10, 39)} 4px 8px)`;
+}
+
+function stripedSpendSection(kind) {
+  if (kind === 'active') {
+    return 'repeating-linear-gradient(135deg, hsl(120, 50%, 48%) 0 4px, hsl(120, 30%, 42%) 4px 8px)';
+  }
+  if (kind === 'keepalive') {
+    return 'repeating-linear-gradient(135deg, hsl(210, 50%, 48%) 0 4px, hsl(210, 30%, 42%) 4px 8px)';
+  }
+  return 'repeating-linear-gradient(135deg, hsl(0, 0%, 48%) 0 4px, hsl(0, 0%, 30%) 4px 8px)';
 }
 
 function burnDisplayWindow(provider, kind) {
@@ -522,8 +526,8 @@ function renderUsageBar(provider, w) {
   const burnConsumed = w.burn_rate_pct_per_hour != null
     ? w.burn_rate_pct_per_hour * burnWindowMinutes / 60
     : null;
-  const burnRounded = burnConsumed == null ? null : Math.abs(burnConsumed).toFixed(1);
-  const burnPct = burnRounded == null || burnRounded === '0.0'
+  const burnRounded = burnConsumed == null ? null : Math.round(Math.abs(burnConsumed));
+  const burnPct = burnRounded == null || burnRounded === 0
     ? '-'
     : (burnConsumed > 0 ? '-' : '+') + burnRounded + '%';
   const paceOutlastsReset = w.depletes_at && w.resets_at
@@ -531,17 +535,28 @@ function renderUsageBar(provider, w) {
   const hasTempo = burnConsumed != null;
   const showPaceDuration = hasTempo && !paceOutlastsReset;
   const tempo = hasTempo ? Math.min(remaining, Math.max(0, burnConsumed)) : 0;
-  const spentInBurnWindow = hasTempo ? Math.min(used, Math.max(0, burnConsumed)) : 0;
+  const activeBurn = Math.max(0, w.active_burn_pct || 0);
+  const keptaliveBurn = Math.max(0, w.keptalive_burn_pct || 0);
+  const inactiveBurn = Math.max(0, w.inactive_burn_pct || 0);
+  const categoryBurn = activeBurn + keptaliveBurn + inactiveBurn;
+  const categoryScale = categoryBurn > used && categoryBurn > 0 ? used / categoryBurn : 1;
+  const activeSpent = activeBurn * categoryScale;
+  const keptaliveSpent = keptaliveBurn * categoryScale;
+  const inactiveSpent = inactiveBurn * categoryScale;
+  const spentInBurnWindow = activeSpent + keptaliveSpent + inactiveSpent;
   const spentOutsideBurnWindow = Math.max(0, used - spentInBurnWindow);
   const remainingWithTempo = Math.max(0, remaining - tempo);
   const tempoStyle = `left:${remainingWithTempo}%;width:${tempo}%;background:${hslColor(hue, 70)}`;
   const remainingStyle = `width:${remainingWithTempo}%;background:${hslColor(hue, 100)}`;
-  const burnStyle = `left:${remainingWithTempo + tempo}%;width:${spentInBurnWindow}%;background:${stripedSection(hue, 48, 42)}`;
+  const burnStart = remainingWithTempo + tempo;
+  const activeStyle = `left:${burnStart}%;width:${activeSpent}%;background:${stripedSpendSection('active')}`;
+  const keptaliveStyle = `left:${burnStart + activeSpent}%;width:${keptaliveSpent}%;background:${stripedSpendSection('keepalive')}`;
+  const inactiveStyle = `left:${burnStart + activeSpent + keptaliveSpent}%;width:${inactiveSpent}%;background:${stripedSpendSection('inactive')}`;
   const outsideStyle = `width:${spentOutsideBurnWindow}%;background:${stripedOutsideSection(hue)}`;
   const exhaustedIn = showPaceDuration && w.depletes_at ? countdown(w.depletes_at) : null;
   const lastsLabel = exhaustedIn ? `lasts ${escapeHtml(exhaustedIn)}` : '';
   const resetsIn = w.resets_at ? countdown(w.resets_at) : '-';
-  const resetLabel = w.resets_at ? `+${used.toFixed(1)}% in ${resetsIn}` : '+ in -';
+  const resetLabel = w.resets_at ? `+${Math.round(used)}% in ${resetsIn}` : '+ in -';
   return `
     <div class="barrow">
       <div class="title">
@@ -553,10 +568,12 @@ function renderUsageBar(provider, w) {
       <div class="bar">
         <div class="seg remain" style="${remainingStyle}"></div>
         <div class="seg" style="${tempoStyle}"></div>
-        <div class="seg" style="${burnStyle}"></div>
+        <div class="seg" style="${activeStyle}"></div>
+        <div class="seg" style="${keptaliveStyle}"></div>
+        <div class="seg" style="${inactiveStyle}"></div>
         <div class="seg used" style="${outsideStyle}"></div>
         <div class="bar-copy">
-          <span class="bar-stat primary">${remaining.toFixed(1)}%${lastsLabel ? `, ${lastsLabel}` : ''}</span>
+          <span class="bar-stat primary">${Math.round(remaining)}%${lastsLabel ? `, ${lastsLabel}` : ''}</span>
           ${hasTempo ? `<span class="bar-stat">${paceOutlastsReset ? '-' : burnPct}/${burnLabel}</span>` : ''}
           <span class="reset-group"><span class="bar-stat reset">${escapeHtml(resetLabel)}</span><span class="reset-icon" title="${w.resets_at ? 'Reset window' : 'Reset time unavailable'}">${w.resets_at ? '↻' : '?'}</span></span>
         </div>
