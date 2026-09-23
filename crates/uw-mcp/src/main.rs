@@ -125,6 +125,9 @@ fn get_usage(args: &Value, deps: &Deps) -> Result<Value, String> {
                     // MCP surface stays lightweight: burn rate / exhaustion projection and
                     // per-window session counts are HTTP-API-only (see uw-web::status).
                     burn_rate_pct_per_hour: None,
+                    compact_advisory_pct: 85.0,
+                    keepalive_pct: 90.0,
+                    compact_schedule_pct: 95.0,
                     inactive_burn_pct: 0.0,
                     active_burn_pct: 0.0,
                     keptalive_burn_pct: 0.0,

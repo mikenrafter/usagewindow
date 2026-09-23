@@ -530,6 +530,30 @@ struct StatusQuery {
     account: Option<String>,
 }
 
+fn status_marker_thresholds(
+    store: &Store,
+    provider: &Provider,
+) -> anyhow::Result<(f32, f32, f32)> {
+    let mut profile = ThresholdProfile::default();
+    for (field, value) in store.threshold_values(None)?.into_iter().chain(
+        store
+            .threshold_values(Some(&ThresholdScope {
+                provider: provider.clone(),
+                model: None,
+                session: None,
+            }))?,
+    ) {
+        let value = value.trim_matches('"');
+        match field.as_str() {
+            "closing_pct" => profile.closing_pct = value.parse()?,
+            "compact_pct" => profile.compact_pct = value.parse()?,
+            "plan_pressure_pct" => profile.plan_pressure_pct = value.parse()?,
+            _ => {}
+        }
+    }
+    Ok((profile.closing_pct, profile.compact_pct, profile.plan_pressure_pct))
+}
+
 async fn status(
     State(state): State<AppState>,
     Query(query): Query<StatusQuery>,
@@ -555,6 +579,15 @@ async fn status(
         }
         let now = Utc::now();
         let activity_cutoff = now - Duration::minutes(30);
+        let mut marker_thresholds = HashMap::new();
+        for sample in latest.values() {
+            if !marker_thresholds.contains_key(&sample.provider) {
+                marker_thresholds.insert(
+                    sample.provider.clone(),
+                    status_marker_thresholds(store, &sample.provider)?,
+                );
+            }
+        }
         let session_activity = sessions
             .iter()
             .map(|session| {
@@ -586,6 +619,8 @@ async fn status(
             let provider = sample.provider.clone();
             let account = sample.account.clone();
             let plan = sample.plan.clone();
+            let (compact_advisory_pct, keepalive_pct, compact_schedule_pct) =
+                marker_thresholds.get(&provider).copied().unwrap_or((85.0, 90.0, 95.0));
             let windows = sample.windows.into_iter().map(|(key, window)| {
                 let window_key = WindowKey { provider: provider.clone(), kind: key.kind.clone() };
                 let blocks = uw_policy::segment_blocks(&all_samples, &window_key, account.as_ref());
@@ -674,6 +709,9 @@ async fn status(
                     resets_at: window.resets_at,
                     exceeded: window.exceeded,
                     burn_rate_pct_per_hour,
+                    compact_advisory_pct,
+                    keepalive_pct,
+                    compact_schedule_pct,
                     inactive_burn_pct: token_to_pct(inactive_tokens),
                     active_burn_pct: token_to_pct(active_tokens),
                     keptalive_burn_pct: token_to_pct(keptalive_tokens),
