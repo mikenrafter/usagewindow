@@ -528,16 +528,17 @@ function renderUsageBar(provider, w) {
     : (burnConsumed > 0 ? '-' : '+') + burnRounded + '%';
   const paceOutlastsReset = w.depletes_at && w.resets_at
     && new Date(w.depletes_at).getTime() > new Date(w.resets_at).getTime();
-  const showPace = burnConsumed != null && !paceOutlastsReset;
-  const tempo = showPace ? Math.min(remaining, Math.max(0, burnConsumed)) : 0;
-  const spentInBurnWindow = showPace ? Math.min(used, Math.max(0, burnConsumed)) : 0;
+  const hasTempo = burnConsumed != null;
+  const showPaceDuration = hasTempo && !paceOutlastsReset;
+  const tempo = hasTempo ? Math.min(remaining, Math.max(0, burnConsumed)) : 0;
+  const spentInBurnWindow = hasTempo ? Math.min(used, Math.max(0, burnConsumed)) : 0;
   const spentOutsideBurnWindow = Math.max(0, used - spentInBurnWindow);
   const remainingWithTempo = Math.max(0, remaining - tempo);
-  const tempoStyle = `width:${tempo}%;background:${hslColor(hue, 70)}`;
+  const tempoStyle = `left:${remainingWithTempo}%;width:${tempo}%;background:${hslColor(hue, 70)}`;
   const remainingStyle = `width:${remainingWithTempo}%;background:${hslColor(hue, 100)}`;
-  const burnStyle = `width:${spentInBurnWindow}%;background:${stripedSection(hue, 48, 42)}`;
+  const burnStyle = `left:${remainingWithTempo + tempo}%;width:${spentInBurnWindow}%;background:${stripedSection(hue, 48, 42)}`;
   const outsideStyle = `width:${spentOutsideBurnWindow}%;background:${stripedOutsideSection(hue)}`;
-  const exhaustedIn = showPace && w.depletes_at ? countdown(w.depletes_at) : null;
+  const exhaustedIn = showPaceDuration && w.depletes_at ? countdown(w.depletes_at) : null;
   const lastsLabel = exhaustedIn ? `lasts ${escapeHtml(exhaustedIn)}` : '';
   const resetsIn = w.resets_at ? countdown(w.resets_at) : '-';
   const resetLabel = w.resets_at ? `+${used.toFixed(1)}% in ${resetsIn}` : '+ in -';
@@ -551,12 +552,12 @@ function renderUsageBar(provider, w) {
       </div>
       <div class="bar">
         <div class="seg remain" style="${remainingStyle}"></div>
-        ${tempo > 0 ? `<div class="seg" style="${tempoStyle}"></div>` : ''}
-        ${spentInBurnWindow > 0 ? `<div class="seg" style="${burnStyle}"></div>` : ''}
-        ${spentOutsideBurnWindow > 0 ? `<div class="seg used" style="${outsideStyle}"></div>` : ''}
+        <div class="seg" style="${tempoStyle}"></div>
+        <div class="seg" style="${burnStyle}"></div>
+        <div class="seg used" style="${outsideStyle}"></div>
         <div class="bar-copy">
           <span class="bar-stat primary">${remaining.toFixed(1)}%${lastsLabel ? `, ${lastsLabel}` : ''}</span>
-          ${showPace ? `<span class="bar-stat">${burnPct}/${burnLabel}</span>` : ''}
+          ${hasTempo ? `<span class="bar-stat">${paceOutlastsReset ? '-' : burnPct}/${burnLabel}</span>` : ''}
           <span class="reset-group"><span class="bar-stat reset">${escapeHtml(resetLabel)}</span><span class="reset-icon" title="${w.resets_at ? 'Reset window' : 'Reset time unavailable'}">${w.resets_at ? '↻' : '?'}</span></span>
         </div>
       </div>
