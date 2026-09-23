@@ -83,7 +83,7 @@
   .barrow:last-child { margin-bottom: 0; }
   .barrow .title { display: flex; align-items: center; justify-content: space-between; gap: 0.55rem; min-width: 0; font-size: 0.8rem; color: var(--text); font-weight: 600; margin-bottom: 0.35rem; }
   .barrow .window-label { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .bar { position: relative; height: 4rem; border-radius: 0.65rem; background: #1c2028; overflow: hidden; padding: 0.85rem 1.1rem; display: flex; align-items: center; }
+  .bar { position: relative; height: 4rem; border-radius: 0.65rem; background: #1c2028; overflow: hidden; padding: 0.85rem 0.6375rem; display: flex; align-items: center; }
   .bar .seg { position: absolute; top: 0; bottom: 0; z-index: 0; transition: left 0.3s, right 0.3s, width 0.3s; }
   .bar .seg.used { right: 0; left: auto; }
   .bar .seg.remain { left: 0; }
@@ -106,7 +106,7 @@
   .count-separator { color: #fff; padding: 0 0.12rem; font-weight: 700; }
   .reset-group { display: flex; align-items: center; gap: 0.35rem; margin-left: auto; flex: 0 0 auto; }
   .reset-icon { display: inline-flex; align-items: center; justify-content: center; width: 1.2rem; height: 1.2rem; border: none; border-radius: 50%; color: var(--text); font-size: 0.75rem; }
-  .threshold-marker { position: absolute; top: 0; bottom: 0; z-index: 3; width: 7px; transform: translateX(-50%); background: rgba(23, 26, 33, 0.5); cursor: help; pointer-events: auto; }
+  .threshold-marker { position: absolute; top: 0; bottom: 0; z-index: 1; width: 7px; transform: translateX(-50%); background: rgba(23, 26, 33, 0.5); cursor: help; pointer-events: auto; }
   .threshold-marker::after { content: ''; position: absolute; top: 0; bottom: 0; left: 2px; width: 3px; background: repeating-linear-gradient(to bottom, currentColor 0 3px, transparent 3px 7px); }
   .threshold-marker.advisory { color: #aeb4c0; }
   .threshold-marker.keepalive { color: #60a5fa; }
