@@ -526,16 +526,11 @@ function lerp(a, b, amount) {
   return a + (b - a) * amount;
 }
 
-function thresholdOpacity(projectedRemaining, points) {
-  if (projectedRemaining <= points[0][0]) return points[0][1];
-  for (let i = 1; i < points.length; i += 1) {
-    const [endX, endOpacity] = points[i];
-    const [startX, startOpacity] = points[i - 1];
-    if (projectedRemaining <= endX) {
-      return lerp(startOpacity, endOpacity, (projectedRemaining - startX) / (endX - startX));
-    }
-  }
-  return points[points.length - 1][1];
+function thresholdOpacity(projectedRemaining, thresholdPct) {
+  const thresholdRemaining = Math.max(0, 100 - thresholdPct);
+  const fullOpacityUntil = thresholdRemaining * 2;
+  if (projectedRemaining <= fullOpacityUntil) return 1;
+  return lerp(1, 0, Math.min(1, (projectedRemaining - fullOpacityUntil) / (100 - fullOpacityUntil)));
 }
 
 function burnDisplayWindow(provider, kind) {
@@ -598,9 +593,9 @@ function renderUsageBar(provider, w) {
   const exhaustedIn = showPaceDuration && w.depletes_at ? countdown(w.depletes_at) : null;
   const resetsIn = w.resets_at ? countdown(w.resets_at) : '-';
   const projectedRemaining = Math.max(0, remaining - tempo);
-  const advisoryOpacity = thresholdOpacity(projectedRemaining, [[10, 1], [15, 0.5], [30, 0]]);
-  const keepaliveOpacity = thresholdOpacity(projectedRemaining, [[15, 1], [30, 0.5], [45, 0]]);
-  const scheduleOpacity = thresholdOpacity(projectedRemaining, [[15, 1], [30, 0.75], [45, 0.5], [60, 0]]);
+  const advisoryOpacity = thresholdOpacity(projectedRemaining, advisoryPct);
+  const keepaliveOpacity = thresholdOpacity(projectedRemaining, keepalivePct);
+  const scheduleOpacity = thresholdOpacity(projectedRemaining, schedulePct);
   const markerStyle = (left, opacity) => `left:${left}%;--marker-line-opacity:${opacity};--marker-highlight-opacity:${opacity * 0.5}`;
   const resetAfterExhaustion = exhaustedIn && w.resets_at && w.depletes_at
     && new Date(w.resets_at).getTime() > new Date(w.depletes_at).getTime()
