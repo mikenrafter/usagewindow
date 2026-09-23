@@ -83,12 +83,12 @@
   .barrow:last-child { margin-bottom: 0; }
   .barrow .title { display: flex; align-items: center; justify-content: space-between; gap: 0.55rem; min-width: 0; font-size: 0.8rem; color: var(--text); font-weight: 600; margin-bottom: 0.35rem; }
   .barrow .window-label { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .bar { position: relative; height: 4rem; border-radius: 0.65rem; background: #1c2028; overflow: hidden; padding: 0.85rem 0.6375rem; display: flex; align-items: center; }
+  .bar { position: relative; height: 4rem; border-radius: 0.65rem; background: #1c2028; overflow: hidden; padding: 1rem 0.8rem; display: flex; align-items: center; }
   .bar .seg { position: absolute; top: 0; bottom: 0; z-index: 0; transition: left 0.3s, right 0.3s, width 0.3s; }
   .bar .seg.used { right: 0; left: auto; }
   .bar .seg.remain { left: 0; }
   .stripe-overlay { position: absolute; top: 0; bottom: 0; z-index: 1; pointer-events: none; background: repeating-linear-gradient(135deg, rgba(255,255,255,0.16) 0 4px, rgba(0,0,0,0.16) 4px 8px); }
-  .bar-island { position: relative; z-index: 2; width: 100%; height: 100%; min-width: 0; padding: 0 0.75rem; display: flex; align-items: center; background: var(--panel); border-radius: 0.35rem; pointer-events: none; user-select: none; }
+  .bar-island { position: relative; z-index: 2; width: 100%; height: 100%; min-width: 0; padding: 0 0.8rem; display: flex; align-items: center; background: var(--panel); border-radius: 0.4rem; pointer-events: none; user-select: none; }
   .bar-copy { position: relative; z-index: 4; width: 100%; min-width: 0; display: flex; align-items: center; gap: 0.75rem; flex-wrap: nowrap; overflow: hidden; text-shadow: 0 1px 2px rgba(0,0,0,0.75); }
   .bar-stat { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--text); font-size: 0.75rem; line-height: 1.15; white-space: nowrap; font-weight: 700; }
   .bar-stat.primary { flex: 0 1 auto; }
@@ -102,6 +102,20 @@
   .title .active { color: var(--text); }
   .title .keptalive { color: #93c5fd; }
   .title .scheduled { color: #fde68a; }
+  .title .counts > span.zero { color: #9ca3af !important; opacity: 0.6; }
+  .title .active:not(.zero) {
+    color: var(--active-dim-color) !important;
+    animation: active-text-pulse 2s linear infinite;
+  }
+  .title .keptalive:not(.zero) { animation: keepalive-wave 2s ease-in-out infinite; }
+  @keyframes active-text-pulse {
+    0%, 100% { color: var(--active-dim-color); }
+    50% { color: var(--active-full-color); }
+  }
+  @keyframes keepalive-wave {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(96, 165, 250, 0); }
+    50% { box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.45), 0 0 0 7px rgba(96, 165, 250, 0.14); }
+  }
   .bar-stat.reset { color: var(--text); }
   .count-separator { color: #fff; padding: 0 0.12rem; font-weight: 700; }
   .reset-group { display: flex; align-items: center; gap: 0.35rem; margin-left: auto; flex: 0 0 auto; }
@@ -545,8 +559,18 @@ function renderUsageBar(provider, w) {
   const spentInBurnWindow = activeSpent + keptaliveSpent + inactiveSpent;
   const spentOutsideBurnWindow = Math.max(0, used - spentInBurnWindow);
   const remainingWithTempo = Math.max(0, remaining - tempo);
+  const advisoryPct = w.compact_advisory_pct || 85;
+  const keepalivePct = w.keepalive_pct || 90;
+  const schedulePct = w.compact_schedule_pct || 95;
+  const remainingBarColor = remaining <= 100 - schedulePct
+    ? '#f5c542'
+    : remaining <= 100 - keepalivePct
+      ? '#60a5fa'
+      : remaining <= 100 - advisoryPct
+        ? '#aeb4c0'
+        : hslColor(hue, 100);
   const tempoStyle = `left:${remainingWithTempo}%;width:${tempo}%;background:${hslColor(hue, 70)}`;
-  const remainingStyle = `width:${remainingWithTempo}%;background:${hslColor(hue, 100)}`;
+  const remainingStyle = `width:${remainingWithTempo}%;background:${remainingBarColor}`;
   const burnStart = remainingWithTempo + tempo;
   const activeStyle = `left:${burnStart}%;width:${activeSpent}%;background:${hslColor(hue, 50)}`;
   const keptaliveStyle = `left:${burnStart + activeSpent}%;width:${keptaliveSpent}%;background:hsl(210, 70%, 48%)`;
@@ -569,7 +593,7 @@ function renderUsageBar(provider, w) {
       <div class="title">
         <span class="window-label">${escapeHtml(windowLabel(w.window))}${w.exceeded ? ' · exceeded' : ''}</span>
         <span class="counts" title="active / keepalive / inactive / scheduled" aria-label="active / keepalive / inactive / scheduled">
-          <span class="active" style="color:${hslColor(hue, 100)}">${w.active_sessions || 0} active</span><span class="count-separator">/</span><span class="keptalive">${w.keptalive_sessions || 0} keepalive</span><span class="count-separator">/</span><span class="inactive">${w.inactive_sessions || 0} inactive</span><span class="count-separator">/</span><span class="scheduled">${w.scheduled_sessions || 0} scheduled</span>
+          <span class="active${w.active_sessions ? '' : ' zero'}" style="--active-dim-color:${hslColor(hue, 50)};--active-full-color:${hslColor(hue, 100)}">${w.active_sessions || 0} active</span><span class="count-separator">/</span><span class="keptalive${w.keptalive_sessions ? '' : ' zero'}">${w.keptalive_sessions || 0} keepalive</span><span class="count-separator">/</span><span class="inactive${w.inactive_sessions ? '' : ' zero'}">${w.inactive_sessions || 0} inactive</span><span class="count-separator">/</span><span class="scheduled${w.scheduled_sessions ? '' : ' zero'}">${w.scheduled_sessions || 0} scheduled</span>
         </span>
       </div>
       <div class="bar">
@@ -587,9 +611,9 @@ function renderUsageBar(provider, w) {
             <span class="reset-group"><span class="bar-stat reset">${escapeHtml(timeRemaining)}</span><span class="reset-icon" title="${w.resets_at ? 'Reset window' : 'Reset time unavailable'}">${w.resets_at ? '↻' : '?'}</span></span>
           </div>
         </div>
-        <span class="threshold-marker advisory" style="left:${100 - (w.compact_advisory_pct || 85)}%" title="Compact advisory begins at ${Math.round(w.compact_advisory_pct || 85)}% spent"></span>
-        <span class="threshold-marker keepalive" style="left:${100 - (w.keepalive_pct || 90)}%" title="Keepalive threshold begins at ${Math.round(w.keepalive_pct || 90)}% spent"></span>
-        <span class="threshold-marker schedule" style="left:${100 - (w.compact_schedule_pct || 95)}%" title="Compact + schedule threshold begins at ${Math.round(w.compact_schedule_pct || 95)}% spent"></span>
+        <span class="threshold-marker advisory" style="left:${100 - advisoryPct}%" title="Compact advisory begins at ${Math.round(advisoryPct)}% spent"></span>
+        <span class="threshold-marker keepalive" style="left:${100 - keepalivePct}%" title="Keepalive threshold begins at ${Math.round(keepalivePct)}% spent"></span>
+        <span class="threshold-marker schedule" style="left:${100 - schedulePct}%" title="Compact + schedule threshold begins at ${Math.round(schedulePct)}% spent"></span>
       </div>
     </div>`;
 }
@@ -634,7 +658,7 @@ async function loadStatus() {
     lastStatus = status;
     lastStatusOkAt = Date.now();
     setBanner(null);
-    $('#usagemeta').textContent = `refreshed ${fmtDate(status.last_updated)} · ${status.keepalive_active_count} keepalive'd`;
+    $('#usagemeta').textContent = `refreshed ${fmtDate(status.last_updated)}`;
     renderUsage(status);
   } catch (e) {
     setBanner(`Failed to refresh from server: ${e.message}${lastStatusOkAt ? ' — showing data as of ' + fmtDate(new Date(lastStatusOkAt).toISOString()) : ''}`);
