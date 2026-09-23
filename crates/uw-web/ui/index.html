@@ -84,10 +84,11 @@
   .barrow .title { display: flex; align-items: center; justify-content: space-between; gap: 0.55rem; min-width: 0; font-size: 0.8rem; color: var(--text); font-weight: 600; margin-bottom: 0.35rem; }
   .barrow .window-label { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .bar { position: relative; height: 3rem; border-radius: 0.65rem; background: #1c2028; overflow: hidden; padding: 0.45rem 0.65rem; display: flex; align-items: center; }
-  .bar .seg { position: absolute; top: 0; bottom: 0; transition: left 0.3s, right 0.3s, width 0.3s; }
+  .bar .seg { position: absolute; top: 0; bottom: 0; z-index: 0; transition: left 0.3s, right 0.3s, width 0.3s; }
   .bar .seg.used { right: 0; left: auto; }
   .bar .seg.remain { left: 0; }
-  .bar-copy { position: relative; z-index: 1; width: 100%; min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 0.55rem; flex-wrap: nowrap; overflow: hidden; text-shadow: 0 1px 2px rgba(0,0,0,0.75); }
+  .stripe-overlay { position: absolute; top: 0; bottom: 0; z-index: 1; pointer-events: none; background: repeating-linear-gradient(135deg, rgba(255,255,255,0.16) 0 4px, rgba(0,0,0,0.16) 4px 8px); }
+  .bar-copy { position: relative; z-index: 2; width: 100%; min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 0.55rem; flex-wrap: nowrap; overflow: hidden; text-shadow: 0 1px 2px rgba(0,0,0,0.75); }
   .bar-stat { min-width: 0; overflow: hidden; text-overflow: ellipsis; padding: 0.18rem 0.35rem; border-radius: 0.35rem; background: rgba(0, 0, 0, 0.33); color: var(--text); font-size: 0.72rem; line-height: 1.15; white-space: nowrap; font-weight: 700; }
   .bar-stat.primary { font-size: 0.86rem; }
   .title .counts { flex: 0 1 auto; display: flex; align-items: center; gap: 0; min-width: 0; max-width: 100%; overflow: hidden; white-space: nowrap; font-size: 0.68rem; }
@@ -97,7 +98,7 @@
   .bar-stat.active { color: #86efac; }
   .bar-stat.keptalive { color: #93c5fd; }
   .bar-stat.scheduled { color: #fde68a; }
-  .title .active { color: #86efac; }
+  .title .active { color: var(--text); }
   .title .keptalive { color: #93c5fd; }
   .title .scheduled { color: #fde68a; }
   .bar-stat.reset { color: #d1d5db; }
@@ -494,20 +495,6 @@ function hslColor(hue, sat, light = 48) {
   return `hsl(${hue.toFixed(1)}, ${sat}%, ${light}%)`;
 }
 
-function stripedOutsideSection(hue) {
-  return `repeating-linear-gradient(135deg, ${hslColor(hue, 30, 42)} 0 4px, ${hslColor(hue, 10, 39)} 4px 8px)`;
-}
-
-function stripedSpendSection(kind) {
-  if (kind === 'active') {
-    return 'repeating-linear-gradient(135deg, hsl(120, 50%, 48%) 0 4px, hsl(120, 30%, 42%) 4px 8px)';
-  }
-  if (kind === 'keepalive') {
-    return 'repeating-linear-gradient(135deg, hsl(210, 50%, 48%) 0 4px, hsl(210, 30%, 42%) 4px 8px)';
-  }
-  return 'repeating-linear-gradient(135deg, hsl(0, 0%, 48%) 0 4px, hsl(0, 0%, 30%) 4px 8px)';
-}
-
 function burnDisplayWindow(provider, kind) {
   if (provider === 'Cursor') return { minutes: 1440, label: '24h' };
   if (kind.WeeklyModel || kind.WeeklySurface) return { minutes: 1440, label: '24h' };
@@ -549,10 +536,12 @@ function renderUsageBar(provider, w) {
   const tempoStyle = `left:${remainingWithTempo}%;width:${tempo}%;background:${hslColor(hue, 70)}`;
   const remainingStyle = `width:${remainingWithTempo}%;background:${hslColor(hue, 100)}`;
   const burnStart = remainingWithTempo + tempo;
-  const activeStyle = `left:${burnStart}%;width:${activeSpent}%;background:${stripedSpendSection('active')}`;
-  const keptaliveStyle = `left:${burnStart + activeSpent}%;width:${keptaliveSpent}%;background:${stripedSpendSection('keepalive')}`;
-  const inactiveStyle = `left:${burnStart + activeSpent + keptaliveSpent}%;width:${inactiveSpent}%;background:${stripedSpendSection('inactive')}`;
-  const outsideStyle = `width:${spentOutsideBurnWindow}%;background:${stripedOutsideSection(hue)}`;
+  const activeStyle = `left:${burnStart}%;width:${activeSpent}%;background:${hslColor(hue, 100)}`;
+  const keptaliveStyle = `left:${burnStart + activeSpent}%;width:${keptaliveSpent}%;background:hsl(210, 70%, 48%)`;
+  const inactiveStyle = `left:${burnStart + activeSpent + keptaliveSpent}%;width:${inactiveSpent}%;background:hsl(0, 0%, 48%)`;
+  const outsideStyle = `width:${spentOutsideBurnWindow}%;background:${hslColor(hue, 30, 42)}`;
+  const stripeStart = burnStart;
+  const stripeWidth = spentInBurnWindow + spentOutsideBurnWindow;
   const exhaustedIn = showPaceDuration && w.depletes_at ? countdown(w.depletes_at) : null;
   const lastsLabel = exhaustedIn ? `lasts ${escapeHtml(exhaustedIn)}` : '';
   const resetsIn = w.resets_at ? countdown(w.resets_at) : '-';
@@ -562,7 +551,7 @@ function renderUsageBar(provider, w) {
       <div class="title">
         <span class="window-label">${escapeHtml(windowLabel(w.window))}${w.exceeded ? ' · exceeded' : ''}</span>
         <span class="counts" title="inactive / active / keepalive / scheduled" aria-label="inactive / active / keepalive / scheduled">
-          <span class="inactive">${w.inactive_sessions || 0} inactive</span><span class="count-separator">/</span><span class="active">${w.active_sessions || 0} active</span><span class="count-separator">/</span><span class="keptalive">${w.keptalive_sessions || 0} keepalive</span><span class="count-separator">/</span><span class="scheduled">${w.scheduled_sessions || 0} scheduled</span>
+          <span class="inactive">${w.inactive_sessions || 0} inactive</span><span class="count-separator">/</span><span class="active" style="color:${hslColor(hue, 100)}">${w.active_sessions || 0} active</span><span class="count-separator">/</span><span class="keptalive">${w.keptalive_sessions || 0} keepalive</span><span class="count-separator">/</span><span class="scheduled">${w.scheduled_sessions || 0} scheduled</span>
         </span>
       </div>
       <div class="bar">
@@ -572,6 +561,7 @@ function renderUsageBar(provider, w) {
         <div class="seg" style="${keptaliveStyle}"></div>
         <div class="seg" style="${inactiveStyle}"></div>
         <div class="seg used" style="${outsideStyle}"></div>
+        <div class="stripe-overlay" style="left:${stripeStart}%;width:${stripeWidth}%"></div>
         <div class="bar-copy">
           <span class="bar-stat primary">${Math.round(remaining)}%${lastsLabel ? `, ${lastsLabel}` : ''}</span>
           ${hasTempo ? `<span class="bar-stat">${paceOutlastsReset ? '-' : burnPct}/${burnLabel}</span>` : ''}
