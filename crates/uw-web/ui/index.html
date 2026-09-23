@@ -550,8 +550,8 @@ function renderUsageBar(provider, w) {
     <div class="barrow">
       <div class="title">
         <span class="window-label">${escapeHtml(windowLabel(w.window))}${w.exceeded ? ' · exceeded' : ''}</span>
-        <span class="counts" title="inactive / active / keepalive / scheduled" aria-label="inactive / active / keepalive / scheduled">
-          <span class="inactive">${w.inactive_sessions || 0} inactive</span><span class="count-separator">/</span><span class="active" style="color:${hslColor(hue, 100)}">${w.active_sessions || 0} active</span><span class="count-separator">/</span><span class="keptalive">${w.keptalive_sessions || 0} keepalive</span><span class="count-separator">/</span><span class="scheduled">${w.scheduled_sessions || 0} scheduled</span>
+        <span class="counts" title="active / keepalive / inactive / scheduled" aria-label="active / keepalive / inactive / scheduled">
+          <span class="active" style="color:${hslColor(hue, 100)}">${w.active_sessions || 0} active</span><span class="count-separator">/</span><span class="keptalive">${w.keptalive_sessions || 0} keepalive</span><span class="count-separator">/</span><span class="inactive">${w.inactive_sessions || 0} inactive</span><span class="count-separator">/</span><span class="scheduled">${w.scheduled_sessions || 0} scheduled</span>
         </span>
       </div>
       <div class="bar">
