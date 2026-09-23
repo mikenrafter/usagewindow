@@ -82,7 +82,7 @@
   .barrow { margin-bottom: 0.7rem; }
   .barrow:last-child { margin-bottom: 0; }
   .barrow .title { display: flex; align-items: center; justify-content: space-between; gap: 0.55rem; min-width: 0; font-size: 0.8rem; color: var(--text); font-weight: 600; margin-bottom: 0.35rem; }
-  .barrow .window-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .barrow .window-label { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .bar { position: relative; height: 3rem; border-radius: 0.65rem; background: #1c2028; overflow: hidden; padding: 0.45rem 0.65rem; display: flex; align-items: center; }
   .bar .seg { position: absolute; top: 0; bottom: 0; transition: left 0.3s, right 0.3s, width 0.3s; }
   .bar .seg.used { right: 0; left: auto; }
@@ -90,8 +90,8 @@
   .bar-copy { position: relative; z-index: 1; width: 100%; min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 0.55rem; flex-wrap: nowrap; overflow: hidden; text-shadow: 0 1px 2px rgba(0,0,0,0.75); }
   .bar-stat { min-width: 0; overflow: hidden; text-overflow: ellipsis; padding: 0.18rem 0.35rem; border-radius: 0.35rem; background: rgba(0, 0, 0, 0.33); color: var(--text); font-size: 0.72rem; line-height: 1.15; white-space: nowrap; font-weight: 700; }
   .bar-stat.primary { font-size: 0.86rem; }
-  .title .counts { flex: 0 1 auto; display: flex; align-items: center; gap: 0; min-width: 0; overflow: hidden; white-space: nowrap; }
-  .title .counts > span:not(.count-separator) { padding: 0.16rem 0.28rem; border-radius: 0.3rem; background: rgba(0, 0, 0, 0.33); font-weight: 700; }
+  .title .counts { flex: 0 1 auto; display: flex; align-items: center; gap: 0; min-width: 0; max-width: 100%; overflow: hidden; white-space: nowrap; font-size: 0.68rem; }
+  .title .counts > span:not(.count-separator) { min-width: 0; padding: 0.16rem 0.28rem; border-radius: 0.3rem; background: rgba(0, 0, 0, 0.33); font-weight: 700; }
   .bar-stat.counts { flex: 0 1 auto; }
   .bar-stat.counts .inactive, .title .inactive { color: #c4c8d0; }
   .bar-stat.active { color: #86efac; }
@@ -156,6 +156,9 @@
     header button { padding: 0.35rem 0.65rem; }
     main { grid-template-columns: 1fr; padding: 0.6rem; gap: 0.8rem; }
     .cardgrid { grid-template-columns: 1fr; }
+    .barrow .title { gap: 0.25rem; }
+    .title .counts { font-size: 0.62rem; }
+    .title .counts > span:not(.count-separator) { padding: 0.12rem 0.16rem; }
 
     /* Text inputs/selects don't shrink below their intrinsic min-content width
        in a flex/grid row, so a search box next to a dropdown (or two side-by-side
