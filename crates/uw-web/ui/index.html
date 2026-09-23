@@ -120,8 +120,9 @@
   .count-separator { color: #fff; padding: 0 0.12rem; font-weight: 700; }
   .reset-group { display: flex; align-items: center; gap: 0.35rem; margin-left: auto; flex: 0 0 auto; }
   .reset-icon { display: inline-flex; align-items: center; justify-content: center; width: 1.2rem; height: 1.2rem; border: none; border-radius: 50%; color: var(--text); font-size: 0.75rem; }
-  .threshold-marker { position: absolute; top: 0; bottom: 0; z-index: 1; width: 7px; transform: translateX(-50%); background: rgba(23, 26, 33, 0.5); cursor: help; pointer-events: auto; }
-  .threshold-marker::after { content: ''; position: absolute; top: 0; bottom: 0; left: 2px; width: 3px; background: repeating-linear-gradient(to bottom, currentColor 0 3px, transparent 3px 7px); }
+  .threshold-marker { position: absolute; top: 0; bottom: 0; z-index: 1; width: 7px; transform: translateX(-50%); cursor: help; pointer-events: auto; }
+  .threshold-marker::before { content: ''; position: absolute; inset: 0; background: rgba(23, 26, 33, 0.5); opacity: var(--marker-highlight-opacity, 0.5); }
+  .threshold-marker::after { content: ''; position: absolute; top: 0; bottom: 0; left: 2px; width: 3px; background: repeating-linear-gradient(to bottom, currentColor 0 3px, transparent 3px 7px); opacity: var(--marker-line-opacity, 1); }
   .threshold-marker.advisory { color: #aeb4c0; }
   .threshold-marker.keepalive { color: #60a5fa; }
   .threshold-marker.schedule { color: #f5c542; }
@@ -521,6 +522,22 @@ function hslColor(hue, sat, light = 48) {
   return `hsl(${hue.toFixed(1)}, ${sat}%, ${light}%)`;
 }
 
+function lerp(a, b, amount) {
+  return a + (b - a) * amount;
+}
+
+function thresholdOpacity(projectedRemaining, points) {
+  if (projectedRemaining <= points[0][0]) return points[0][1];
+  for (let i = 1; i < points.length; i += 1) {
+    const [endX, endOpacity] = points[i];
+    const [startX, startOpacity] = points[i - 1];
+    if (projectedRemaining <= endX) {
+      return lerp(startOpacity, endOpacity, (projectedRemaining - startX) / (endX - startX));
+    }
+  }
+  return points[points.length - 1][1];
+}
+
 function burnDisplayWindow(provider, kind) {
   if (provider === 'Cursor') return { minutes: 1440, label: '24h' };
   if (kind.WeeklyModel || kind.WeeklySurface) return { minutes: 1440, label: '24h' };
@@ -580,6 +597,11 @@ function renderUsageBar(provider, w) {
   const stripeWidth = spentInBurnWindow + spentOutsideBurnWindow;
   const exhaustedIn = showPaceDuration && w.depletes_at ? countdown(w.depletes_at) : null;
   const resetsIn = w.resets_at ? countdown(w.resets_at) : '-';
+  const projectedRemaining = Math.max(0, remaining - tempo);
+  const advisoryOpacity = thresholdOpacity(projectedRemaining, [[10, 1], [15, 0.5], [30, 0]]);
+  const keepaliveOpacity = thresholdOpacity(projectedRemaining, [[15, 1], [30, 0.5], [45, 0]]);
+  const scheduleOpacity = thresholdOpacity(projectedRemaining, [[15, 1], [30, 0.75], [45, 0.5], [60, 0]]);
+  const markerStyle = (left, opacity) => `left:${left}%;--marker-line-opacity:${opacity};--marker-highlight-opacity:${opacity * 0.5}`;
   const resetAfterExhaustion = exhaustedIn && w.resets_at && w.depletes_at
     && new Date(w.resets_at).getTime() > new Date(w.depletes_at).getTime()
     ? durationBetween(w.resets_at, w.depletes_at)
@@ -592,8 +614,8 @@ function renderUsageBar(provider, w) {
     <div class="barrow">
       <div class="title">
         <span class="window-label">${escapeHtml(windowLabel(w.window))}${w.exceeded ? ' · exceeded' : ''}</span>
-        <span class="counts" title="active / keepalive / inactive / scheduled" aria-label="active / keepalive / inactive / scheduled">
-          <span class="active${w.active_sessions ? '' : ' zero'}" style="--active-dim-color:${hslColor(hue, 50)};--active-full-color:${hslColor(hue, 100)}">${w.active_sessions || 0} active</span><span class="count-separator">/</span><span class="keptalive${w.keptalive_sessions ? '' : ' zero'}">${w.keptalive_sessions || 0} keepalive</span><span class="count-separator">/</span><span class="inactive${w.inactive_sessions ? '' : ' zero'}">${w.inactive_sessions || 0} inactive</span><span class="count-separator">/</span><span class="scheduled${w.scheduled_sessions ? '' : ' zero'}">${w.scheduled_sessions || 0} scheduled</span>
+        <span class="counts" title="active|/ keepalive | inactive | scheduled" aria-label="active | keepalive | inactive | scheduled">
+          <span class="active${w.active_sessions ? '' : ' zero'}" style="--active-dim-color:${hslColor(hue, 50)};--active-full-color:${hslColor(hue, 100)}">${w.active_sessions || 0} active</span><span class="count-separator">|</span><span class="keptalive${w.keptalive_sessions ? '' : ' zero'}">${w.keptalive_sessions || 0} keepalive</span><span class="count-separator">|</span><span class="inactive${w.inactive_sessions ? '' : ' zero'}">${w.inactive_sessions || 0} inactive</span><span class="count-separator">|</span><span class="scheduled${w.scheduled_sessions ? '' : ' zero'}">${w.scheduled_sessions || 0} scheduled</span>
         </span>
       </div>
       <div class="bar">
@@ -611,9 +633,9 @@ function renderUsageBar(provider, w) {
             <span class="reset-group"><span class="bar-stat reset">${escapeHtml(timeRemaining)}</span><span class="reset-icon" title="${w.resets_at ? 'Reset window' : 'Reset time unavailable'}">${w.resets_at ? '↻' : '?'}</span></span>
           </div>
         </div>
-        <span class="threshold-marker advisory" style="left:${100 - advisoryPct}%" title="Compact advisory begins at ${Math.round(advisoryPct)}% spent"></span>
-        <span class="threshold-marker keepalive" style="left:${100 - keepalivePct}%" title="Keepalive threshold begins at ${Math.round(keepalivePct)}% spent"></span>
-        <span class="threshold-marker schedule" style="left:${100 - schedulePct}%" title="Compact + schedule threshold begins at ${Math.round(schedulePct)}% spent"></span>
+        <span class="threshold-marker advisory" style="${markerStyle(100 - advisoryPct, advisoryOpacity)}" title="Compact advisory begins at ${Math.round(advisoryPct)}% spent"></span>
+        <span class="threshold-marker keepalive" style="${markerStyle(100 - keepalivePct, keepaliveOpacity)}" title="Keepalive threshold begins at ${Math.round(keepalivePct)}% spent"></span>
+        <span class="threshold-marker schedule" style="${markerStyle(100 - schedulePct, scheduleOpacity)}" title="Compact + schedule threshold begins at ${Math.round(schedulePct)}% spent"></span>
       </div>
     </div>`;
 }
