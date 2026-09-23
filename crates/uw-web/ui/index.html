@@ -88,8 +88,8 @@
   .bar .seg.used { right: 0; left: auto; }
   .bar .seg.remain { left: 0; }
   .stripe-overlay { position: absolute; top: 0; bottom: 0; z-index: 1; pointer-events: none; background: repeating-linear-gradient(135deg, rgba(255,255,255,0.16) 0 4px, rgba(0,0,0,0.16) 4px 8px); }
-  .bar-island { position: relative; z-index: 2; width: 100%; height: 100%; min-width: 0; padding: 0 0.75rem; display: flex; align-items: center; background: var(--panel); border-radius: 0.35rem; }
-  .bar-copy { width: 100%; min-width: 0; display: flex; align-items: center; gap: 0.75rem; flex-wrap: nowrap; overflow: hidden; text-shadow: 0 1px 2px rgba(0,0,0,0.75); }
+  .bar-island { position: relative; z-index: 2; width: 100%; height: 100%; min-width: 0; padding: 0 0.75rem; display: flex; align-items: center; background: var(--panel); border-radius: 0.35rem; pointer-events: none; user-select: none; }
+  .bar-copy { position: relative; z-index: 4; width: 100%; min-width: 0; display: flex; align-items: center; gap: 0.75rem; flex-wrap: nowrap; overflow: hidden; text-shadow: 0 1px 2px rgba(0,0,0,0.75); }
   .bar-stat { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--text); font-size: 0.75rem; line-height: 1.15; white-space: nowrap; font-weight: 700; }
   .bar-stat.primary { flex: 0 1 auto; }
   .title .counts { flex: 0 1 auto; display: flex; align-items: center; gap: 0; min-width: 0; max-width: 100%; overflow: hidden; white-space: nowrap; font-size: 0.68rem; }
@@ -105,8 +105,9 @@
   .bar-stat.reset { color: var(--text); }
   .count-separator { color: #fff; padding: 0 0.12rem; font-weight: 700; }
   .reset-group { display: flex; align-items: center; gap: 0.35rem; margin-left: auto; flex: 0 0 auto; }
-  .reset-icon { display: inline-flex; align-items: center; justify-content: center; width: 1.2rem; height: 1.2rem; border: 1px solid rgba(255,255,255,0.45); border-radius: 50%; color: var(--text); font-size: 0.75rem; }
-  .threshold-marker { position: absolute; bottom: 0; z-index: 3; height: 0.85rem; border-left: 2px dotted currentColor; cursor: help; }
+  .reset-icon { display: inline-flex; align-items: center; justify-content: center; width: 1.2rem; height: 1.2rem; border: none; border-radius: 50%; color: var(--text); font-size: 0.75rem; }
+  .threshold-marker { position: absolute; top: 0; bottom: 0; z-index: 3; width: 7px; transform: translateX(-50%); background: rgba(23, 26, 33, 0.5); cursor: help; pointer-events: auto; }
+  .threshold-marker::after { content: ''; position: absolute; top: 0; bottom: 0; left: 2px; width: 3px; background: repeating-linear-gradient(to bottom, currentColor 0 3px, transparent 3px 7px); }
   .threshold-marker.advisory { color: #aeb4c0; }
   .threshold-marker.keepalive { color: #60a5fa; }
   .threshold-marker.schedule { color: #f5c542; }
@@ -524,15 +525,15 @@ function renderUsageBar(provider, w) {
   const burnConsumed = w.burn_rate_pct_per_hour != null
     ? w.burn_rate_pct_per_hour * burnWindowMinutes / 60
     : null;
-  const burnRounded = burnConsumed == null ? null : Math.round(Math.abs(burnConsumed));
-  const burnPct = burnRounded == null || burnRounded === 0
-    ? '-'
+  const burnRounded = burnConsumed == null ? 0 : Math.round(Math.abs(burnConsumed));
+  const burnPct = burnConsumed == null || burnRounded === 0
+    ? '0%'
     : (burnConsumed > 0 ? '-' : '+') + burnRounded + '%';
   const paceOutlastsReset = w.depletes_at && w.resets_at
     && new Date(w.depletes_at).getTime() > new Date(w.resets_at).getTime();
-  const hasTempo = burnConsumed != null;
-  const showPaceDuration = hasTempo && !paceOutlastsReset;
-  const tempo = hasTempo ? Math.min(remaining, Math.max(0, burnConsumed)) : 0;
+  const hasTempo = true;
+  const showPaceDuration = burnConsumed != null && !paceOutlastsReset;
+  const tempo = burnConsumed != null ? Math.min(remaining, Math.max(0, burnConsumed)) : 0;
   const activeBurn = Math.max(0, w.active_burn_pct || 0);
   const keptaliveBurn = Math.max(0, w.keptalive_burn_pct || 0);
   const inactiveBurn = Math.max(0, w.inactive_burn_pct || 0);
@@ -554,15 +555,15 @@ function renderUsageBar(provider, w) {
   const stripeStart = burnStart;
   const stripeWidth = spentInBurnWindow + spentOutsideBurnWindow;
   const exhaustedIn = showPaceDuration && w.depletes_at ? countdown(w.depletes_at) : null;
+  const resetsIn = w.resets_at ? countdown(w.resets_at) : '-';
   const resetAfterExhaustion = exhaustedIn && w.resets_at && w.depletes_at
     && new Date(w.resets_at).getTime() > new Date(w.depletes_at).getTime()
     ? durationBetween(w.resets_at, w.depletes_at)
     : null;
-  const lastsLabel = exhaustedIn
-    ? `lasts ${escapeHtml(exhaustedIn)}${resetAfterExhaustion ? ` + ${escapeHtml(resetAfterExhaustion)}` : ''}`
-    : '';
-  const resetsIn = w.resets_at ? countdown(w.resets_at) : '-';
-  const resetLabel = w.resets_at ? `+${Math.round(used)}% in ${resetsIn}` : '+ in -';
+  const timeRemaining = exhaustedIn
+    ? `${exhaustedIn}${resetAfterExhaustion ? ` + ${resetAfterExhaustion}` : ''}`
+    : resetsIn;
+  const tempoLabel = `${burnPct} per ${burnLabel}`;
   return `
     <div class="barrow">
       <div class="title">
@@ -572,23 +573,23 @@ function renderUsageBar(provider, w) {
         </span>
       </div>
       <div class="bar">
-        <div class="seg remain" style="${remainingStyle}"></div>
-        <div class="seg" style="${tempoStyle}"></div>
-        <div class="seg" style="${activeStyle}"></div>
-        <div class="seg" style="${keptaliveStyle}"></div>
-        <div class="seg" style="${inactiveStyle}"></div>
-        <div class="seg used" style="${outsideStyle}"></div>
+        <div class="seg remain" style="${remainingStyle}" title="Remaining with tempo: ${Math.round(remainingWithTempo)}%"></div>
+        <div class="seg" style="${tempoStyle}" title="Spent with tempo: ${Math.round(tempo)}%"></div>
+        <div class="seg" style="${activeStyle}" title="Spent in burn window by active sessions: ${Math.round(activeSpent)}%"></div>
+        <div class="seg" style="${keptaliveStyle}" title="Spent in burn window by keepalive sessions: ${Math.round(keptaliveSpent)}%"></div>
+        <div class="seg" style="${inactiveStyle}" title="Spent in burn window by inactive sessions: ${Math.round(inactiveSpent)}%"></div>
+        <div class="seg used" style="${outsideStyle}" title="Spent outside the burn window: ${Math.round(spentOutsideBurnWindow)}%"></div>
         <div class="stripe-overlay" style="left:${stripeStart}%;width:${stripeWidth}%"></div>
         <div class="bar-island">
           <div class="bar-copy">
-            <span class="bar-stat primary">${Math.round(remaining)}%${lastsLabel ? `, ${lastsLabel}` : ''}</span>
-            ${hasTempo ? `<span class="bar-stat">${paceOutlastsReset ? '-' : burnPct}/${burnLabel}</span>` : ''}
-            <span class="reset-group"><span class="bar-stat reset">${escapeHtml(resetLabel)}</span><span class="reset-icon" title="${w.resets_at ? 'Reset window' : 'Reset time unavailable'}">${w.resets_at ? '↻' : '?'}</span></span>
+            <span class="bar-stat primary">${Math.round(remaining)}%</span>
+            <span class="bar-stat">${escapeHtml(tempoLabel)}</span>
+            <span class="reset-group"><span class="bar-stat reset">${escapeHtml(timeRemaining)}</span><span class="reset-icon" title="${w.resets_at ? 'Reset window' : 'Reset time unavailable'}">${w.resets_at ? '↻' : '?'}</span></span>
           </div>
         </div>
-        <span class="threshold-marker advisory" style="left:${w.compact_advisory_pct || 85}%" title="Compact advisory begins at ${Math.round(w.compact_advisory_pct || 85)}% spent"></span>
-        <span class="threshold-marker keepalive" style="left:${w.keepalive_pct || 90}%" title="Keepalive threshold begins at ${Math.round(w.keepalive_pct || 90)}% spent"></span>
-        <span class="threshold-marker schedule" style="left:${w.compact_schedule_pct || 95}%" title="Compact + schedule threshold begins at ${Math.round(w.compact_schedule_pct || 95)}% spent"></span>
+        <span class="threshold-marker advisory" style="left:${100 - (w.compact_advisory_pct || 85)}%" title="Compact advisory begins at ${Math.round(w.compact_advisory_pct || 85)}% spent"></span>
+        <span class="threshold-marker keepalive" style="left:${100 - (w.keepalive_pct || 90)}%" title="Keepalive threshold begins at ${Math.round(w.keepalive_pct || 90)}% spent"></span>
+        <span class="threshold-marker schedule" style="left:${100 - (w.compact_schedule_pct || 95)}%" title="Compact + schedule threshold begins at ${Math.round(w.compact_schedule_pct || 95)}% spent"></span>
       </div>
     </div>`;
 }
