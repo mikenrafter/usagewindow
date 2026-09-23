@@ -536,7 +536,7 @@ function renderUsageBar(provider, w) {
   const tempoStyle = `left:${remainingWithTempo}%;width:${tempo}%;background:${hslColor(hue, 70)}`;
   const remainingStyle = `width:${remainingWithTempo}%;background:${hslColor(hue, 100)}`;
   const burnStart = remainingWithTempo + tempo;
-  const activeStyle = `left:${burnStart}%;width:${activeSpent}%;background:${hslColor(hue, 100)}`;
+  const activeStyle = `left:${burnStart}%;width:${activeSpent}%;background:${hslColor(hue, 50)}`;
   const keptaliveStyle = `left:${burnStart + activeSpent}%;width:${keptaliveSpent}%;background:hsl(210, 70%, 48%)`;
   const inactiveStyle = `left:${burnStart + activeSpent + keptaliveSpent}%;width:${inactiveSpent}%;background:hsl(0, 0%, 48%)`;
   const outsideStyle = `width:${spentOutsideBurnWindow}%;background:${hslColor(hue, 30, 42)}`;
