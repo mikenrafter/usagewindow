@@ -14,9 +14,12 @@ test('threshold opacity uses each threshold remaining budget independently', () 
 
   assert.equal(opacity(20, 90), 1, '90% threshold is fully visible below 20% projected remaining');
   assert.equal(opacity(30, 85), 1, '85% threshold is fully visible below 30% projected remaining');
-  assert.equal(opacity(15, 95), 0.9444444444444444);
+  assert.equal(opacity(15, 95), 0.75);
   assert.equal(opacity(15, 90), 1);
   assert.equal(opacity(15, 85), 1);
+  assert.equal(opacity(30, 90), 0.75);
+  assert.equal(opacity(40, 90), 0.5);
+  assert.equal(opacity(50, 90), 0);
 
   assert.ok(opacity(25, 95) < opacity(25, 90));
   assert.ok(opacity(25, 90) < opacity(25, 85));

@@ -528,9 +528,22 @@ function lerp(a, b, amount) {
 
 function thresholdOpacity(projectedRemaining, thresholdPct) {
   const thresholdRemaining = Math.max(0, 100 - thresholdPct);
-  const fullOpacityUntil = thresholdRemaining * 2;
-  if (projectedRemaining <= fullOpacityUntil) return 1;
-  return lerp(1, 0, Math.min(1, (projectedRemaining - fullOpacityUntil) / (100 - fullOpacityUntil)));
+  if (thresholdRemaining === 0) return projectedRemaining === 0 ? 1 : 0;
+  const points = [
+    [thresholdRemaining * 2, 1],
+    [thresholdRemaining * 3, 0.75],
+    [thresholdRemaining * 4, 0.5],
+    [thresholdRemaining * 5, 0],
+  ];
+  if (projectedRemaining <= points[0][0]) return points[0][1];
+  for (let i = 1; i < points.length; i += 1) {
+    const [endX, endOpacity] = points[i];
+    const [startX, startOpacity] = points[i - 1];
+    if (projectedRemaining <= endX) {
+      return lerp(startOpacity, endOpacity, (projectedRemaining - startX) / (endX - startX));
+    }
+  }
+  return points[points.length - 1][1];
 }
 
 function burnDisplayWindow(provider, kind) {
