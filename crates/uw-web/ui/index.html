@@ -81,21 +81,28 @@
   .card .stale { margin-left: auto; }
   .barrow { margin-bottom: 0.7rem; }
   .barrow:last-child { margin-bottom: 0; }
-  .barrow .title { text-align: center; font-size: 0.8rem; color: var(--text); font-weight: 600; margin-bottom: 0.35rem; }
+  .barrow .title { display: flex; align-items: center; justify-content: space-between; gap: 0.55rem; min-width: 0; font-size: 0.8rem; color: var(--text); font-weight: 600; margin-bottom: 0.35rem; }
+  .barrow .window-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .bar { position: relative; height: 3rem; border-radius: 0.65rem; background: #1c2028; overflow: hidden; padding: 0.45rem 0.65rem; display: flex; align-items: center; }
   .bar .seg { position: absolute; top: 0; bottom: 0; transition: left 0.3s, right 0.3s, width 0.3s; }
-  .bar .seg.used { right: 0; left: auto; border-radius: 0.65rem 0 0 0.65rem; }
-  .bar .seg.remain { left: 0; border-radius: 0 0.65rem 0.65rem 0; }
+  .bar .seg.used { right: 0; left: auto; }
+  .bar .seg.remain { left: 0; }
   .bar-copy { position: relative; z-index: 1; width: 100%; min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 0.55rem; flex-wrap: nowrap; overflow: hidden; text-shadow: 0 1px 2px rgba(0,0,0,0.75); }
-  .bar-stat { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--text); font-size: 0.72rem; line-height: 1.15; white-space: nowrap; font-weight: 700; }
+  .bar-stat { min-width: 0; overflow: hidden; text-overflow: ellipsis; padding: 0.18rem 0.35rem; border-radius: 0.35rem; background: rgba(0, 0, 0, 0.33); color: var(--text); font-size: 0.72rem; line-height: 1.15; white-space: nowrap; font-weight: 700; }
   .bar-stat.primary { font-size: 0.86rem; }
+  .title .counts { flex: 0 1 auto; display: flex; align-items: center; gap: 0; min-width: 0; overflow: hidden; white-space: nowrap; }
+  .title .counts > span:not(.count-separator) { padding: 0.16rem 0.28rem; border-radius: 0.3rem; background: rgba(0, 0, 0, 0.33); font-weight: 700; }
   .bar-stat.counts { flex: 0 1 auto; }
-  .bar-stat.counts .inactive { color: #c4c8d0; }
+  .bar-stat.counts .inactive, .title .inactive { color: #c4c8d0; }
   .bar-stat.active { color: #86efac; }
   .bar-stat.keptalive { color: #93c5fd; }
   .bar-stat.scheduled { color: #fde68a; }
+  .title .active { color: #86efac; }
+  .title .keptalive { color: #93c5fd; }
+  .title .scheduled { color: #fde68a; }
   .bar-stat.reset { color: #d1d5db; }
-  .count-separator { color: #fff; padding: 0 0.12rem; }
+  .count-separator { color: #fff; padding: 0 0.12rem; font-weight: 700; }
+  .reset-group { display: flex; align-items: center; gap: 0.35rem; margin-left: auto; flex: 0 0 auto; }
   .reset-icon { display: inline-flex; align-items: center; justify-content: center; width: 1.45rem; height: 1.45rem; border: 1px solid rgba(255,255,255,0.45); border-radius: 50%; color: var(--text); font-size: 1rem; }
 
   .actionrow { border-bottom: 1px solid var(--border); padding: 0.5rem 0; font-size: 0.82rem; }
@@ -312,7 +319,7 @@ function fmtDuration(ms) {
   if (ms == null) return null;
   const past = ms < 0;
   ms = Math.abs(ms);
-  const totalSeconds = Math.floor(ms / 1000);
+  const totalSeconds = Math.round(ms / 1000);
   const totalMinutes = Math.floor(totalSeconds / 60);
   const totalHours = Math.floor(totalMinutes / 60);
   const totalDays = Math.floor(totalHours / 24);
@@ -484,19 +491,14 @@ function hslColor(hue, sat, light = 48) {
   return `hsl(${hue.toFixed(1)}, ${sat}%, ${light}%)`;
 }
 
-function usedHazardBg(hue, sessionCount) {
-  const count = Math.max(1, Math.min(8, sessionCount || 1));
-  const colors = [
-    hslColor(hue, 30, 42),
-    hslColor(hue, 40, 39),
-  ];
-  const stops = [];
-  for (let index = 0; index < count; index += 1) {
-    const start = (index / count * 100).toFixed(2);
-    const end = ((index + 1) / count * 100).toFixed(2);
-    stops.push(`${colors[index % 2]} ${start}% ${end}%`);
-  }
-  return `repeating-linear-gradient(135deg, ${stops.join(', ')})`;
+function stripedSection(hue, lightnessA, lightnessB) {
+  const colorA = hslColor(hue, 50, lightnessA);
+  const colorB = hslColor(hue, 30, lightnessB);
+  return `repeating-linear-gradient(135deg, ${colorA} 0 4px, ${colorB} 4px 8px)`;
+}
+
+function stripedOutsideSection(hue) {
+  return `repeating-linear-gradient(135deg, ${hslColor(hue, 30, 42)} 0 4px, ${hslColor(hue, 10, 39)} 4px 8px)`;
 }
 
 function burnDisplayWindow(provider, kind) {
@@ -524,31 +526,35 @@ function renderUsageBar(provider, w) {
   const paceOutlastsReset = w.depletes_at && w.resets_at
     && new Date(w.depletes_at).getTime() > new Date(w.resets_at).getTime();
   const showPace = burnConsumed != null && !paceOutlastsReset;
-  const sessionCount = (w.inactive_sessions || 0) + (w.active_sessions || 0)
-    + (w.keptalive_sessions || 0) + (w.scheduled_sessions || 0);
-  const projected = showPace ? Math.min(remaining, Math.max(0, burnConsumed)) : 0;
-  const usedStyle = `width:${used}%;background:${usedHazardBg(hue, sessionCount)}`;
-  const projectedStyle = `right:${used}%;width:${projected}%;background:${hslColor(hue, 50)}`;
-  const remainStyle = `width:${Math.max(0, remaining - projected)}%;background:${hslColor(hue, 100)}`;
+  const tempo = showPace ? Math.min(remaining, Math.max(0, burnConsumed)) : 0;
+  const spentInBurnWindow = showPace ? Math.min(used, Math.max(0, burnConsumed)) : 0;
+  const spentOutsideBurnWindow = Math.max(0, used - spentInBurnWindow);
+  const remainingWithTempo = Math.max(0, remaining - tempo);
+  const tempoStyle = `width:${tempo}%;background:${hslColor(hue, 70)}`;
+  const remainingStyle = `width:${remainingWithTempo}%;background:${hslColor(hue, 100)}`;
+  const burnStyle = `width:${spentInBurnWindow}%;background:${stripedSection(hue, 48, 42)}`;
+  const outsideStyle = `width:${spentOutsideBurnWindow}%;background:${stripedOutsideSection(hue)}`;
   const exhaustedIn = showPace && w.depletes_at ? countdown(w.depletes_at) : null;
-  const lastsLabel = exhaustedIn ? `lasts ${escapeHtml(exhaustedIn)}` : 'lasts.';
+  const lastsLabel = exhaustedIn ? `lasts ${escapeHtml(exhaustedIn)}` : '';
   const resetsIn = w.resets_at ? countdown(w.resets_at) : '-';
-  const resetLabel = w.resets_at ? `+${used.toFixed(1)}% in ${resetsIn}` : '';
+  const resetLabel = w.resets_at ? `+${used.toFixed(1)}% in ${resetsIn}` : '+ in -';
   return `
     <div class="barrow">
-      <div class="title">${escapeHtml(windowLabel(w.window))}${w.exceeded ? ' · exceeded' : ''}</div>
+      <div class="title">
+        <span class="window-label">${escapeHtml(windowLabel(w.window))}${w.exceeded ? ' · exceeded' : ''}</span>
+        <span class="counts" title="inactive / active / keepalive / scheduled" aria-label="inactive / active / keepalive / scheduled">
+          <span class="inactive">${w.inactive_sessions || 0} inactive</span><span class="count-separator">/</span><span class="active">${w.active_sessions || 0} active</span><span class="count-separator">/</span><span class="keptalive">${w.keptalive_sessions || 0} keepalive</span><span class="count-separator">/</span><span class="scheduled">${w.scheduled_sessions || 0} scheduled</span>
+        </span>
+      </div>
       <div class="bar">
-        <div class="seg remain" style="${remainStyle}"></div>
-        ${projected > 0 ? `<div class="seg" style="${projectedStyle}"></div>` : ''}
-        ${used > 0 ? `<div class="seg used" style="${usedStyle}"></div>` : ''}
+        <div class="seg remain" style="${remainingStyle}"></div>
+        ${tempo > 0 ? `<div class="seg" style="${tempoStyle}"></div>` : ''}
+        ${spentInBurnWindow > 0 ? `<div class="seg" style="${burnStyle}"></div>` : ''}
+        ${spentOutsideBurnWindow > 0 ? `<div class="seg used" style="${outsideStyle}"></div>` : ''}
         <div class="bar-copy">
-          <span class="bar-stat primary">${remaining.toFixed(1)}%, ${lastsLabel}</span>
+          <span class="bar-stat primary">${remaining.toFixed(1)}%${lastsLabel ? `, ${lastsLabel}` : ''}</span>
           ${showPace ? `<span class="bar-stat">${burnPct}/${burnLabel}</span>` : ''}
-          <span class="bar-stat counts" title="inactive / active / keepalive / scheduled" aria-label="inactive / active / keepalive / scheduled">
-            <span class="inactive">${w.inactive_sessions || 0}</span><span class="count-separator">/</span><span class="active">${w.active_sessions || 0}</span><span class="count-separator">/</span><span class="keptalive">${w.keptalive_sessions || 0}</span><span class="count-separator">/</span><span class="scheduled">${w.scheduled_sessions || 0}</span>
-          </span>
-          ${resetLabel ? `<span class="bar-stat reset">${escapeHtml(resetLabel)}</span>` : ''}
-          ${w.resets_at ? '<span class="reset-icon" title="Reset window">↻</span>' : ''}
+          <span class="reset-group"><span class="bar-stat reset">${escapeHtml(resetLabel)}</span><span class="reset-icon" title="${w.resets_at ? 'Reset window' : 'Reset time unavailable'}">${w.resets_at ? '↻' : '?'}</span></span>
         </div>
       </div>
     </div>`;
