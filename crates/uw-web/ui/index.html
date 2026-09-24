@@ -594,7 +594,8 @@ function renderUsageBar(provider, w) {
       : remaining <= 100 - advisoryPct
         ? '#aeb4c0'
         : hslColor(hue, 100);
-  const tempoStyle = `left:${remainingWithTempo}%;width:${tempo}%;background:${hslColor(hue, 70)}`;
+  const tempoColor = hslColor(hue, 70);
+  const tempoStyle = `left:${remainingWithTempo}%;width:${tempo}%;background:${tempoColor}`;
   const remainingStyle = `width:${remainingWithTempo}%;background:${remainingBarColor}`;
   const burnStart = remainingWithTempo + tempo;
   const activeStyle = `left:${burnStart}%;width:${activeSpent}%;background:${hslColor(hue, 50)}`;
@@ -617,6 +618,9 @@ function renderUsageBar(provider, w) {
   const timeRemaining = exhaustedIn
     ? `${exhaustedIn}${resetAfterExhaustion ? ` + ${resetAfterExhaustion}` : ''}`
     : resetsIn;
+  const timeRemainingMarkup = exhaustedIn && resetAfterExhaustion
+    ? `<span class="added-time" style="color:${tempoColor}">${escapeHtml(exhaustedIn)}</span> + ${escapeHtml(resetAfterExhaustion)}`
+    : escapeHtml(timeRemaining);
   const tempoLabel = `${burnPct} per ${burnLabel}`;
   return `
     <div class="barrow">
@@ -638,7 +642,7 @@ function renderUsageBar(provider, w) {
           <div class="bar-copy">
             <span class="bar-stat primary">${Math.round(remaining)}%</span>
             <span class="bar-stat">${escapeHtml(tempoLabel)}</span>
-            <span class="reset-group"><span class="bar-stat reset">${escapeHtml(timeRemaining)}</span><span class="reset-icon" title="${w.resets_at ? 'Reset window' : 'Reset time unavailable'}">${w.resets_at ? '↻' : '?'}</span></span>
+            <span class="reset-group"><span class="bar-stat reset">${timeRemainingMarkup}</span><span class="reset-icon" title="${w.resets_at ? 'Reset window' : 'Reset time unavailable'}">${w.resets_at ? '↻' : '?'}</span></span>
           </div>
         </div>
         <span class="threshold-marker advisory" style="${markerStyle(100 - advisoryPct, advisoryOpacity)}" title="Compact advisory begins at ${Math.round(advisoryPct)}% spent"></span>

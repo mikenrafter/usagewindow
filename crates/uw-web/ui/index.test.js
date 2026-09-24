@@ -9,6 +9,21 @@ const end = html.indexOf('function burnDisplayWindow', start);
 const context = {};
 vm.runInNewContext(`${html.slice(start, end)}; globalThis.thresholdOpacity = thresholdOpacity;`, context);
 
+const renderStart = html.indexOf('function hslColor(');
+const renderEnd = html.indexOf('function setBanner', renderStart);
+const renderContext = {
+  escapeHtml: value => value,
+  remainingHue: () => 180,
+  burnDisplayWindow: () => ({ minutes: 30, label: '30m' }),
+  countdown: () => '2h',
+  durationBetween: () => '30m',
+  windowLabel: () => 'test window',
+};
+vm.runInNewContext(
+  `${html.slice(renderStart, renderEnd)}; globalThis.renderUsageBar = renderUsageBar;`,
+  renderContext,
+);
+
 test('threshold opacity uses each threshold remaining budget independently', () => {
   const opacity = context.thresholdOpacity;
 
@@ -23,4 +38,20 @@ test('threshold opacity uses each threshold remaining budget independently', () 
 
   assert.ok(opacity(25, 95) < opacity(25, 90));
   assert.ok(opacity(25, 90) < opacity(25, 85));
+});
+
+test('added reset time uses the tempo shade', () => {
+  const output = renderContext.renderUsageBar('Test', {
+    pct: 80,
+    burn_rate_pct_per_hour: 10,
+    active_burn_pct: 0,
+    keptalive_burn_pct: 0,
+    inactive_burn_pct: 0,
+    depletes_at: '2026-09-23T12:00:00Z',
+    resets_at: '2026-09-23T12:30:00Z',
+    window: {},
+  });
+
+  assert.match(output, /<span class="added-time"[^>]*> 1h 30m<\/span> \+ 30m/);
+  assert.match(output, /class="added-time"[^>]*color:\s*hsl\(180\.0, 70%, 48%\)/);
 });
