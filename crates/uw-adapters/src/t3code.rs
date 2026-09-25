@@ -533,6 +533,27 @@ mod tests {
         }
     }
 
+    /// Build the serialized shape expected from provider-neutral session
+    /// lineage without requiring the production model to exist during the red
+    /// phase. Serde currently ignores `lineage`, so descendant ownership tests
+    /// compile and fail through the public adapter behavior. Once the model
+    /// retains this field, the same fixtures exercise it without changing the
+    /// tests.
+    fn with_lineage(
+        session: SessionSummary,
+        parent: Option<&str>,
+        root: Option<&str>,
+        related: &[&str],
+    ) -> SessionSummary {
+        let mut value = serde_json::to_value(session).unwrap();
+        value["lineage"] = serde_json::json!({
+            "parent": parent,
+            "root": root,
+            "related": related,
+        });
+        serde_json::from_value(value).unwrap()
+    }
+
     fn compaction_request(session: &SessionSummary) -> CompactionRequest {
         CompactionRequest {
             id: uuid::Uuid::new_v4(),
@@ -791,6 +812,170 @@ mod tests {
             assert_eq!(calls[4].1["threadId"], t3_thread_id);
             fs::remove_file(path).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn lineage_compaction_resolves_a_cursor_descendant_to_its_owned_t3_root() {
+        let child_id = "e5ded152-88c0-4222-be0d-d629dc344555";
+        let root_id = "a293a959-d37d-4e73-8848-f5b7f3d560a0";
+        let t3_thread_id = "4a9941d1-eebf-4201-8fad-ecdf4a1871f0";
+        let child = with_lineage(
+            SessionSummary {
+                id: SessionId(child_id.into()),
+                ..native_cursor_session()
+            },
+            Some(root_id),
+            Some(root_id),
+            &[],
+        );
+        let path = owner_db(&[(
+            t3_thread_id,
+            "cursor",
+            &format!(r#"{{"sessionId":"{root_id}"}}"#),
+        )]);
+        let transport = Arc::new(FakeTransport::with_thread(serde_json::json!({
+            "thread": {
+                "id": t3_thread_id,
+                "session": {"status": "stopped", "providerName": "cursor"}
+            }
+        })));
+        let adapter = T3CodeAdapter::with_state_db(transport.clone(), &path);
+
+        let result = adapter.compact(&child, &compaction_request(&child)).await;
+        let calls = transport.calls.lock().unwrap();
+        let called_thread_ids = calls
+            .iter()
+            .filter_map(|(kind, payload)| match kind.as_str() {
+                "get_thread" => payload.as_str(),
+                "dispatch" | "interrupt" => payload.get("threadId").and_then(Value::as_str),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        fs::remove_file(path).unwrap();
+
+        assert!(
+            matches!(result, Ok(DeliveryOutcome::Delivered)),
+            "Cursor descendant compaction should resolve root {root_id} to T3 thread {t3_thread_id}, got {result:?}"
+        );
+        assert_eq!(called_thread_ids, vec![t3_thread_id; 5]);
+    }
+
+    #[tokio::test]
+    async fn lineage_resume_resolves_a_claude_descendant_to_its_owned_t3_root() {
+        let child_id = "01f0ec42-f575-4fb8-a1d4-5720e2379fdd";
+        let parent_id = "e3110253-b0c7-4cc4-8bff-d68e60ea31a2";
+        let root_id = "de50f3dc-713e-44ff-baaa-ea46fd0e4e1a";
+        let t3_thread_id = "d02b9d75-f564-4cbd-8dcd-62bb445b28c6";
+        let child = with_lineage(
+            SessionSummary {
+                id: SessionId(child_id.into()),
+                ..native_claude_session()
+            },
+            Some(parent_id),
+            Some(root_id),
+            &[],
+        );
+        let path = owner_db(&[(
+            t3_thread_id,
+            "claudeAgent",
+            &format!(r#"{{"resume":"{root_id}"}}"#),
+        )]);
+        let transport = Arc::new(FakeTransport::with_thread(serde_json::json!({
+            "thread": {
+                "id": t3_thread_id,
+                "session": {"status": "stopped", "providerName": "claudeAgent"}
+            }
+        })));
+        let adapter = T3CodeAdapter::with_state_db(transport.clone(), &path);
+
+        let result = adapter.resume_session(&child, Some("continue")).await;
+        let calls = transport.calls.lock().unwrap();
+        let called_thread_ids = calls
+            .iter()
+            .filter_map(|(kind, payload)| match kind.as_str() {
+                "get_thread" => payload.as_str(),
+                "dispatch" => payload.get("threadId").and_then(Value::as_str),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        fs::remove_file(path).unwrap();
+
+        assert!(
+            result.is_ok(),
+            "Claude descendant resume should resolve root {root_id} to T3 thread {t3_thread_id}, got {result:?}"
+        );
+        assert_eq!(called_thread_ids, vec![t3_thread_id; 2]);
+    }
+
+    #[tokio::test]
+    async fn lineage_unknown_ancestors_remain_unsupported_without_dispatch() {
+        let child = with_lineage(
+            SessionSummary {
+                id: SessionId("unowned-cursor-child".into()),
+                ..native_cursor_session()
+            },
+            Some("unowned-cursor-parent"),
+            Some("unowned-cursor-root"),
+            &["unowned-related-session"],
+        );
+        let path = owner_db(&[(
+            "unrelated-t3-thread",
+            "cursor",
+            r#"{"sessionId":"unrelated-cursor-root"}"#,
+        )]);
+        let transport = Arc::new(FakeTransport::new());
+        let adapter = T3CodeAdapter::with_state_db(transport.clone(), &path);
+
+        let result = adapter.resume_session(&child, None).await;
+        let calls = transport.calls.lock().unwrap().len();
+        fs::remove_file(path).unwrap();
+
+        assert!(matches!(result, Err(AdapterError::Unsupported)));
+        assert_eq!(calls, 0, "an unowned lineage must not contact T3Code");
+    }
+
+    #[tokio::test]
+    async fn lineage_direct_ownership_wins_over_an_ancestor_mapping() {
+        let child_id = "cursor-child-with-direct-owner";
+        let root_id = "cursor-root-with-another-owner";
+        let direct_thread_id = "t3-direct-child-thread";
+        let child = with_lineage(
+            SessionSummary {
+                id: SessionId(child_id.into()),
+                ..native_cursor_session()
+            },
+            Some(root_id),
+            Some(root_id),
+            &[],
+        );
+        let root_cursor = format!(r#"{{"sessionId":"{root_id}"}}"#);
+        let child_cursor = format!(r#"{{"sessionId":"{child_id}"}}"#);
+        let path = owner_db(&[
+            ("t3-ancestor-thread", "cursor", &root_cursor),
+            (direct_thread_id, "cursor", &child_cursor),
+        ]);
+        let transport = Arc::new(FakeTransport::with_thread(serde_json::json!({
+            "thread": {
+                "id": direct_thread_id,
+                "session": {"status": "stopped", "providerName": "cursor"}
+            }
+        })));
+        let adapter = T3CodeAdapter::with_state_db(transport.clone(), &path);
+
+        let result = adapter.resume_session(&child, Some("continue")).await;
+        let calls = transport.calls.lock().unwrap();
+        let called_thread_ids = calls
+            .iter()
+            .filter_map(|(kind, payload)| match kind.as_str() {
+                "get_thread" => payload.as_str(),
+                "dispatch" => payload.get("threadId").and_then(Value::as_str),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        fs::remove_file(path).unwrap();
+
+        assert!(result.is_ok(), "direct ownership should remain routable");
+        assert_eq!(called_thread_ids, vec![direct_thread_id; 2]);
     }
 
     #[test]
