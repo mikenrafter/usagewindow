@@ -15,7 +15,7 @@ const renderContext = {
   escapeHtml: value => value,
   remainingHue: () => 180,
   burnDisplayWindow: () => ({ minutes: 30, label: '30m' }),
-  countdown: () => '2h',
+  countdown: () => '1h 30m',
   durationBetween: () => '30m',
   windowLabel: () => 'test window',
 };
@@ -44,6 +44,7 @@ test('added reset time uses the tempo shade', () => {
   const output = renderContext.renderUsageBar('Test', {
     pct: 80,
     burn_rate_pct_per_hour: 10,
+    tempo_pct: 5,
     active_burn_pct: 0,
     keptalive_burn_pct: 0,
     inactive_burn_pct: 0,
@@ -52,6 +53,6 @@ test('added reset time uses the tempo shade', () => {
     window: {},
   });
 
-  assert.match(output, /<span class="added-time"[^>]*> 1h 30m<\/span> \+ 30m/);
+  assert.match(output, /<span class="added-time"[^>]*>1h 30m<\/span> \+ 30m/);
   assert.match(output, /class="added-time"[^>]*color:\s*hsl\(180\.0, 70%, 48%\)/);
 });

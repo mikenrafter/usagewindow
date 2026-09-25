@@ -189,6 +189,31 @@ pub fn burn_rate_pct_per_hour(block: &WindowBlock, lookback: Duration) -> Option
 /// zero-length intervals; callers can use this during daemon startup when a
 /// fresh window has only a few minutes of history.
 pub fn burn_rate_pct_per_hour_available(block: &WindowBlock, lookback: Duration) -> Option<f32> {
+    let anchor = available_anchor(block, lookback)?;
+    pct_delta_between(block, anchor).map(|(delta, hours)| delta / hours)
+}
+
+/// Percent of quota actually consumed within the available lookback history —
+/// the raw delta between the oldest and newest sample in range, with no
+/// extrapolation to the nominal lookback length. A block that is younger than
+/// `lookback` reports only the consumption it has actually observed, instead
+/// of projecting a short, possibly bursty interval up to a full-window
+/// figure (which is how a few minutes of Cursor usage right after a reset
+/// could previously get reported as hundreds of percent "per 24h").
+pub fn burn_pct_available(block: &WindowBlock, lookback: Duration) -> Option<f32> {
+    let anchor = available_anchor(block, lookback)?;
+    pct_delta_between(block, anchor).map(|(delta, _)| delta)
+}
+
+struct Anchor {
+    first_index: usize,
+    first_at: DateTime<Utc>,
+    first_pct: f32,
+    last_at: DateTime<Utc>,
+    last_pct: f32,
+}
+
+fn available_anchor(block: &WindowBlock, lookback: Duration) -> Option<Anchor> {
     let &(last_at, last_pct) = block.points.last()?;
     let cutoff = last_at - lookback;
     let (first_index, &(first_at, first_pct)) = block
@@ -196,7 +221,13 @@ pub fn burn_rate_pct_per_hour_available(block: &WindowBlock, lookback: Duration)
         .iter()
         .enumerate()
         .find(|(_, (at, _))| *at >= cutoff && *at < last_at)?;
-    burn_rate_between(block, first_index, first_at, first_pct, last_at, last_pct)
+    Some(Anchor {
+        first_index,
+        first_at,
+        first_pct,
+        last_at,
+        last_pct,
+    })
 }
 
 fn burn_rate_between(
@@ -207,6 +238,21 @@ fn burn_rate_between(
     last_at: DateTime<Utc>,
     last_pct: f32,
 ) -> Option<f32> {
+    pct_delta_between(
+        block,
+        Anchor {
+            first_index,
+            first_at,
+            first_pct,
+            last_at,
+            last_pct,
+        },
+    )
+    .map(|(delta, hours)| delta / hours)
+}
+
+fn pct_delta_between(block: &WindowBlock, anchor: Anchor) -> Option<(f32, f32)> {
+    let Anchor { first_index, first_at, first_pct, last_at, last_pct } = anchor;
     if first_at >= last_at
         || !same_window_instance(
             block
@@ -226,7 +272,7 @@ fn burn_rate_between(
         return None;
     }
     let hours = (last_at - first_at).num_seconds() as f32 / 3600.0;
-    (hours > 0.0).then_some((last_pct - first_pct) / hours)
+    (hours > 0.0).then_some((last_pct - first_pct, hours))
 }
 
 /// Estimates per-session token work from rollout records. Each record describes
@@ -682,6 +728,33 @@ mod tests {
             burn_rate_pct_per_hour_available(&b, Duration::minutes(30)),
             Some(18.0)
         );
+    }
+
+    #[test]
+    fn available_burn_pct_reports_observed_delta_not_a_window_projection() {
+        // Only 10 minutes of history exist, well inside a 24h lookback. The
+        // rate-based figure would extrapolate this burst across the full 24h;
+        // burn_pct_available must report just the 3 points actually consumed.
+        let b = block(
+            vec![(at(20), 0.), (at(25), 1.), (at(30), 3.)],
+            Some(at(100)),
+        );
+        assert_eq!(burn_pct_available(&b, Duration::hours(24)), Some(3.0));
+    }
+
+    #[test]
+    fn available_burn_pct_needs_an_anchor_and_same_window_instance() {
+        let b = block(vec![(at(20), 10.), (at(40), 20.)], Some(at(100)));
+        assert_eq!(burn_pct_available(&b, Duration::minutes(10)), None);
+        let reset = WindowBlock {
+            key: key(),
+            account: None,
+            started_at: at(0),
+            resets_at: Some(at(100)),
+            points: vec![(at(0), 90.), (at(20), 10.)],
+            point_resets_at: vec![Some(at(100)), Some(at(200))],
+        };
+        assert_eq!(burn_pct_available(&reset, Duration::minutes(30)), None);
     }
 
     #[test]

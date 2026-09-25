@@ -592,6 +592,7 @@ impl DirectReader for StoreReader {
                         // CLI status stays lightweight: burn rate / exhaustion projection and
                         // per-window session counts are HTTP-API-only (see uw-web::status).
                         burn_rate_pct_per_hour: None,
+                        tempo_pct: 0.0,
                         compact_advisory_pct: 85.0,
                         keepalive_pct: 90.0,
                         compact_schedule_pct: 95.0,

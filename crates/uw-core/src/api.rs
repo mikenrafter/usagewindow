@@ -23,6 +23,10 @@ pub struct UsageWindowSummary {
     pub resets_at: Option<DateTime<Utc>>,
     pub exceeded: bool,
     pub burn_rate_pct_per_hour: Option<f32>,
+    /// Percent of quota actually consumed within the display lookback window,
+    /// with no extrapolation to a nominal window length — see
+    /// `uw_policy::burn_pct_available`. This is what the UI renders as tempo.
+    pub tempo_pct: f32,
     pub compact_advisory_pct: f32,
     pub keepalive_pct: f32,
     pub compact_schedule_pct: f32,
@@ -189,6 +193,7 @@ mod tests {
                     resets_at: None,
                     exceeded: false,
                     burn_rate_pct_per_hour: Some(1.5),
+                    tempo_pct: 3.0,
                     compact_advisory_pct: 85.0,
                     keepalive_pct: 90.0,
                     compact_schedule_pct: 95.0,

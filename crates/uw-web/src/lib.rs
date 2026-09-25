@@ -680,10 +680,12 @@ async fn status(
                 let total_tokens = active_tokens
                     .saturating_add(keptalive_tokens)
                     .saturating_add(inactive_tokens);
-                let burn_pct = burn_rate_pct_per_hour
-                    .filter(|rate| *rate > 0.0)
-                    .map(|rate| rate * purview.num_minutes() as f32 / 60.0)
+                let tempo_pct = blocks
+                    .last()
+                    .and_then(|block| uw_policy::burn_pct_available(block, burn_lookback))
+                    .filter(|pct| *pct > 0.0)
                     .unwrap_or(0.0);
+                let burn_pct = tempo_pct;
                 let token_to_pct = |tokens: u64| {
                     if total_tokens == 0 {
                         0.0
@@ -710,6 +712,7 @@ async fn status(
                     resets_at: window.resets_at,
                     exceeded: window.exceeded,
                     burn_rate_pct_per_hour,
+                    tempo_pct,
                     compact_advisory_pct,
                     keepalive_pct,
                     compact_schedule_pct,
@@ -1769,8 +1772,12 @@ mod tests {
         assert_eq!(value.usage[0].windows[0].inactive_sessions, 1);
         assert_eq!(value.usage[0].windows[0].active_sessions, 1);
         let window = &value.usage[0].windows[0];
-        assert!((window.active_burn_pct - 26.1818).abs() < 0.01, "active={} inactive={} rate={:?}", window.active_burn_pct, window.inactive_burn_pct, window.burn_rate_pct_per_hour);
-        assert!((window.inactive_burn_pct - 21.8181).abs() < 0.01);
+        // tempo_pct is the raw pct actually observed over the lookback (2.0,
+        // from 40.0 -> 42.0), not that rate extrapolated out to a full 24h
+        // window — see burn_pct_available.
+        assert!((window.tempo_pct - 2.0).abs() < 0.01);
+        assert!((window.active_burn_pct - 1.0909).abs() < 0.01, "active={} inactive={} rate={:?}", window.active_burn_pct, window.inactive_burn_pct, window.burn_rate_pct_per_hour);
+        assert!((window.inactive_burn_pct - 0.9090).abs() < 0.01);
         assert_eq!(window.keptalive_burn_pct, 0.0);
     }
 

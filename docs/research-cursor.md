@@ -76,6 +76,88 @@ Only Cursor's format is verified here. The `SessionLineage` model is provider-ne
 Claude Code and Codex adapters can populate it if their child-session formats are later
 verified.
 
+## Per-session context usage (verified 2026-09-25)
+
+Cursor exposes no raw token counts anywhere on disk. Checked and ruled out:
+
+- `~/.cursor/projects/<cwd>/agent-transcripts/<id>/<id>.jsonl` — bare
+  `{"role","message"}` lines, no usage field (already documented above).
+- `~/.cursor/acp-sessions/<id>/store.db` (`blobs`/`meta` tables, one JSON
+  document per row) — a first pass found rows shaped like
+  `{"timestamp":...,"type":"token_usage_record","payload":{"usage":{...}}}`,
+  which looked like a real structured telemetry record. It was not: those
+  rows were verbatim file content from a session where an agent had read
+  `crates/uw-adapters/src/codex.rs`'s own test fixtures as tool output, and
+  Rust's `format!()` `{{`/`}}` brace-escaping was still present in the text
+  (`"usage":{{"input_tokens":10,...}}`). Confirmed by checking a session
+  scoped to an unrelated repo (`phoe-nix`): zero `usage`/`token`/`context`
+  hits anywhere in that store. **`acp-sessions` carries no usage telemetry**;
+  a grep hit for those field names there is conversation content, not schema.
+- `~/.cursor/chats/<workspace-hash>/<session-id>/store.db` (same
+  blobs/meta shape as acp-sessions, used today only for lineage) — checked a
+  51MB store from a real conversation, same null result.
+- `~/.cursor/ai-tracking/ai-code-tracking.db` — tracks AI-vs-human line
+  attribution for commits, not token/context usage.
+
+The real source is the **desktop Cursor app's** own VSCode-fork global state,
+which this adapter already opens for auth (`read_access_token_from_state_db`,
+`CURSOR_STATE_DB` env override, default
+`$XDG_CONFIG_HOME/Cursor/User/globalStorage/state.vscdb` or
+`~/.config/...` when unset): table `cursorDiskKV`, key
+`composerData:<session-id>` (JSON blob, `key like 'composerData:%'` to list).
+Verified fields on a live conversation:
+
+```json
+{
+  "contextUsagePercent": 66.2265,
+  "name": "Subagent implementation for project remediations",
+  "createdAt": 1779405474151,
+  "lastUpdatedAt": 1779419767658,
+  "usageData": {}
+}
+```
+
+`contextUsagePercent` is exactly the number the Cursor UI shows for a
+conversation's context-window fill. `createdAt`/`lastUpdatedAt` are real
+epoch-millisecond timestamps — strictly better than the transcript-mtime
+approximation `scan_cursor_transcript` uses today for `first_seen`/
+`last_seen`, and `name` is a real title rather than the first-120-chars
+scrape. `usageData` was empty on every composer checked; do not rely on it.
+The session-id in the key matches the existing `SessionId` this adapter
+already assigns from the transcript filename — confirmed directly: composer
+id `5caf2dec-a694-4bdc-a180-4775e75bb307` has a matching
+`agent-transcripts/5caf2dec-.../` directory. No new correlation is needed to
+join this onto an already-discovered session.
+
+Two open items a future change should account for, not assume away:
+
+- **Coverage is unverified.** `composerData` rows exist for every composer id
+  I sampled on this machine, but I could not confirm whether `cursor-agent`
+  writes one for a session that only ever ran headless (never opened or
+  resumed through the desktop IDE). This machine has both installed, so a
+  present row here doesn't rule out a purely-CLI machine having none. Treat
+  a missing `composerData` row as "no percent signal available," not as an
+  error.
+- **Per-message `tokenCount` is unreliable.** Individual conversation turns
+  are stored separately at `cursorDiskKV` key `bubbleId:<composerId>:<bubbleId>`,
+  each with a `tokenCount: {inputTokens, outputTokens}` field. Every bubble
+  sampled across a 400-message conversation had `{0, 0}`. `contextUsagePercent`
+  on the composer record is the only field that reads as populated in
+  practice; don't build anything on `tokenCount`.
+- This composer store lives only in the **global** `state.vscdb`; the two
+  per-workspace `state.vscdb` files checked on this machine had zero
+  `composerData` rows. Only read the global one.
+
+`contextUsagePercent` is a percentage, not a token count — it cannot be
+plugged into `TokenUsageRecord.total_tokens`-based accounting (weighted burn
+rate, token-tier idle-compact thresholds) without a known context-window
+size, which Cursor doesn't expose either. It is being wired in as a parallel
+percent-based signal (`TokenUsageRecord.context_pct`,
+`SessionSummary.last_known_context_pct`) rather than converted into a fake
+token count — `uw-policy::should_idle_compact` gets an independent
+percent-threshold path (`IdleCompactConfig.percent_threshold_pct`, default
+`65.0`) instead of estimating tokens from a percentage.
+
 ## Compaction TODO
 
 Status: usage polling is implemented. Native Cursor compaction delivery remains disabled

@@ -560,19 +560,19 @@ function renderUsageBar(provider, w) {
   const used = Math.min(100, Math.max(0, w.pct));
   const remaining = 100 - used;
   const hue = remainingHue(remaining);
-  const { minutes: burnWindowMinutes, label: burnLabel } = burnDisplayWindow(provider, w.window);
-  const burnConsumed = w.burn_rate_pct_per_hour != null
-    ? w.burn_rate_pct_per_hour * burnWindowMinutes / 60
-    : null;
-  const burnRounded = burnConsumed == null ? 0 : Math.round(Math.abs(burnConsumed));
-  const burnPct = burnConsumed == null || burnRounded === 0
+  const { label: burnLabel } = burnDisplayWindow(provider, w.window);
+  // tempo_pct is the pct actually consumed within the display lookback (no
+  // extrapolation to a nominal window length) — see uw_policy::burn_pct_available.
+  const burnConsumed = w.tempo_pct || 0;
+  const burnRounded = Math.round(Math.abs(burnConsumed));
+  const burnPct = burnRounded === 0
     ? '0%'
     : (burnConsumed > 0 ? '-' : '+') + burnRounded + '%';
   const paceOutlastsReset = w.depletes_at && w.resets_at
     && new Date(w.depletes_at).getTime() > new Date(w.resets_at).getTime();
   const hasTempo = true;
-  const showPaceDuration = burnConsumed != null && !paceOutlastsReset;
-  const tempo = burnConsumed != null ? Math.min(remaining, Math.max(0, burnConsumed)) : 0;
+  const showPaceDuration = w.burn_rate_pct_per_hour != null && !paceOutlastsReset;
+  const tempo = Math.min(remaining, Math.max(0, burnConsumed));
   const activeBurn = Math.max(0, w.active_burn_pct || 0);
   const keptaliveBurn = Math.max(0, w.keptalive_burn_pct || 0);
   const inactiveBurn = Math.max(0, w.inactive_burn_pct || 0);
