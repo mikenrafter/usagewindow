@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uw_core::adapter::{
     AdapterError, AdapterResult, Capabilities, DeliveryOutcome, DiscoveredSession, HarnessAdapter,
-    StatusEvent,
+    StatusEvent, TokenUsageRecord,
 };
 use uw_core::model::*;
 
@@ -474,6 +474,73 @@ pub struct CursorAdapter {
     discovery_cache: Mutex<HashMap<String, CachedCursorTranscript>>,
     plan_reader: Arc<dyn CursorPlanReader>,
     chat_metadata_root: Option<std::path::PathBuf>,
+    global_storage_db: Option<std::path::PathBuf>,
+}
+
+/// A composer's context-window fill, read from the desktop app's global
+/// `state.vscdb` (see `docs/research-cursor.md`, "Per-session context
+/// usage"). `name`/`created_at`/`last_updated_at` are real metadata Cursor
+/// keeps alongside the percentage — strictly better than this adapter's
+/// transcript-derived title/mtime approximations when present.
+struct CursorComposerUsage {
+    context_pct: f32,
+    name: Option<String>,
+    created_at: Option<DateTime<Utc>>,
+    last_updated_at: Option<DateTime<Utc>>,
+}
+
+/// Mirrors `CursorAuth::discover_from_environment`'s `state.vscdb` path
+/// resolution: `CURSOR_STATE_DB` env override, else
+/// `$XDG_CONFIG_HOME/Cursor/User/globalStorage/state.vscdb` (or
+/// `~/.config/...` when unset).
+fn default_global_storage_db() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("CURSOR_STATE_DB") {
+        return Some(std::path::PathBuf::from(path));
+    }
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    Some(config.join("Cursor/User/globalStorage/state.vscdb"))
+}
+
+/// Reads `cursorDiskKV` key `composerData:<session-id>` from the desktop
+/// app's global `state.vscdb`. Returns `None` for any of: no such row (a
+/// purely-headless session may never have one — see the research doc's
+/// "coverage is unverified" caveat), an unreadable/missing database, or a
+/// row with no usable `contextUsagePercent`. Never treated as an error:
+/// composer usage is a best-effort enrichment, not a required signal.
+fn read_composer_usage_from_state_db(
+    path: &std::path::Path,
+    session_id: &SessionId,
+) -> Option<CursorComposerUsage> {
+    let connection = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .ok()?;
+    let raw = connection
+        .query_row(
+            "SELECT value FROM cursorDiskKV WHERE key = ?1",
+            [format!("composerData:{}", session_id.0)],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let context_pct = value.get("contextUsagePercent").and_then(Value::as_f64)? as f32;
+    if !context_pct.is_finite() {
+        return None;
+    }
+    Some(CursorComposerUsage {
+        context_pct,
+        name: value
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned),
+        created_at: value.get("createdAt").and_then(parse_epoch_millis),
+        last_updated_at: value.get("lastUpdatedAt").and_then(parse_epoch_millis),
+    })
 }
 
 impl CursorAdapter {
@@ -492,6 +559,7 @@ impl CursorAdapter {
                         .map(std::path::PathBuf::from)
                         .map(|home| home.join(".cursor/chats"))
                 }),
+            global_storage_db: default_global_storage_db(),
         }
     }
 
@@ -524,6 +592,11 @@ impl CursorAdapter {
         self
     }
 
+    pub fn with_global_storage_db(mut self, path: std::path::PathBuf) -> Self {
+        self.global_storage_db = Some(path);
+        self
+    }
+
     pub fn capabilities_static() -> Capabilities {
         Capabilities {
             can_trigger_compaction: false,
@@ -544,6 +617,47 @@ impl CursorAdapter {
         tokio::task::spawn_blocking(move || read_cursor_chat_lineage(&root, &session_id))
             .await
             .unwrap_or_default()
+    }
+
+    async fn composer_usage_for(&self, session_id: &SessionId) -> Option<CursorComposerUsage> {
+        let path = self.global_storage_db.clone()?;
+        let session_id = session_id.clone();
+        tokio::task::spawn_blocking(move || read_composer_usage_from_state_db(&path, &session_id))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Enriches a discovered session with composer context usage when
+    /// available. A missing composer row (unverified on headless-only
+    /// machines, see `docs/research-cursor.md`) leaves the session exactly as
+    /// the transcript scan produced it — this is enrichment, never required.
+    async fn apply_composer_usage(&self, session: &mut DiscoveredSession) {
+        let Some(usage) = self.composer_usage_for(&session.id).await else {
+            return;
+        };
+        session.last_known_context_pct = Some(usage.context_pct);
+        let at = usage.last_updated_at.unwrap_or_else(|| (self.now)());
+        session.token_usage.push(TokenUsageRecord {
+            at,
+            model: None,
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 0,
+            context_pct: Some(usage.context_pct),
+        });
+        if let Some(name) = usage.name {
+            session.title = Some(name);
+        }
+        if let Some(created_at) = usage.created_at {
+            session.first_seen = Some(created_at);
+        }
+        if let Some(last_updated_at) = usage.last_updated_at {
+            session.last_seen = Some(last_updated_at);
+        }
     }
 
     fn parse_sample(&self, value: &Value, plan: Option<String>) -> AdapterResult<UsageSample> {
@@ -691,6 +805,7 @@ impl HarnessAdapter for CursorAdapter {
             };
             if let Some(mut session) = cached_session {
                 session.lineage = self.lineage_for(&session.id).await;
+                self.apply_composer_usage(&mut session).await;
                 discovered.push(session);
                 continue;
             }
@@ -710,6 +825,7 @@ impl HarnessAdapter for CursorAdapter {
                         );
                 }
                 session.lineage = self.lineage_for(&session.id).await;
+                self.apply_composer_usage(&mut session).await;
                 discovered.push(session);
             }
         }
@@ -1216,5 +1332,162 @@ mod tests {
             assert_eq!(discovered[0].id, SessionId(id.into()));
             assert!(discovered[0].lineage.is_empty());
         }
+    }
+
+    fn global_storage_db_with_composer(session_id: &str, value: Value) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "usagewindow-cursor-global-{}.vscdb",
+            uuid::Uuid::new_v4()
+        ));
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                rusqlite::params![format!("composerData:{session_id}"), value.to_string()],
+            )
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn reads_composer_usage_from_the_global_state_db() {
+        let session_id = "5caf2dec-a694-4bdc-a180-4775e75bb307";
+        let path = global_storage_db_with_composer(
+            session_id,
+            json!({
+                "contextUsagePercent": 66.2265,
+                "name": "Subagent implementation for project remediations",
+                "createdAt": 1779405474151_i64,
+                "lastUpdatedAt": 1779419767658_i64,
+                "usageData": {}
+            }),
+        );
+
+        let usage =
+            read_composer_usage_from_state_db(&path, &SessionId(session_id.into())).unwrap();
+
+        assert_eq!(usage.context_pct, 66.2265_f32);
+        assert_eq!(
+            usage.name,
+            Some("Subagent implementation for project remediations".into())
+        );
+        assert_eq!(
+            usage.created_at,
+            Utc.timestamp_millis_opt(1779405474151).single()
+        );
+        assert_eq!(
+            usage.last_updated_at,
+            Utc.timestamp_millis_opt(1779419767658).single()
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn missing_composer_row_reads_as_no_usage() {
+        let session_id = "5caf2dec-a694-4bdc-a180-4775e75bb307";
+        let path = global_storage_db_with_composer(
+            "a-completely-different-session",
+            json!({"contextUsagePercent": 10.0}),
+        );
+
+        assert!(read_composer_usage_from_state_db(&path, &SessionId(session_id.into())).is_none());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn composer_row_without_a_usable_percent_reads_as_no_usage() {
+        let session_id = "5caf2dec-a694-4bdc-a180-4775e75bb307";
+        let path = global_storage_db_with_composer(session_id, json!({"name": "no percent here"}));
+
+        assert!(read_composer_usage_from_state_db(&path, &SessionId(session_id.into())).is_none());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn discover_sessions_enriches_with_composer_context_usage() {
+        let id = "5caf2dec-a694-4bdc-a180-4775e75bb307";
+        let transcript_path = format!(
+            "/home/v0id/.cursor/projects/home-v0id-Documents-repos-usagewindow/agent-transcripts/{id}/{id}.jsonl"
+        );
+        let global_db = global_storage_db_with_composer(
+            id,
+            json!({
+                "contextUsagePercent": 66.2265,
+                "name": "Subagent implementation for project remediations",
+                "createdAt": 1779405474151_i64,
+                "lastUpdatedAt": 1779419767658_i64,
+                "usageData": {}
+            }),
+        );
+        let adapter = CursorAdapter::new(Arc::new(FakeTransport(json!({}))))
+            .with_transcript_fs(Arc::new(FixtureTranscriptFs(vec![(
+                transcript_path,
+                cursor_transcript_line("user", "hello"),
+            )])))
+            .with_global_storage_db(global_db.clone());
+
+        let discovered = adapter.discover_sessions().await.unwrap();
+
+        assert_eq!(discovered.len(), 1);
+        let session = &discovered[0];
+        assert_eq!(session.last_known_context_pct, Some(66.2265_f32));
+        assert_eq!(
+            session.title,
+            Some("Subagent implementation for project remediations".into())
+        );
+        assert_eq!(
+            session.first_seen,
+            Utc.timestamp_millis_opt(1779405474151).single()
+        );
+        assert_eq!(
+            session.last_seen,
+            Utc.timestamp_millis_opt(1779419767658).single()
+        );
+        assert_eq!(session.token_usage.len(), 1);
+        let record = &session.token_usage[0];
+        assert_eq!(record.context_pct, Some(66.2265_f32));
+        assert_eq!(record.total_tokens, 0);
+        assert_eq!(
+            record.at,
+            Utc.timestamp_millis_opt(1779419767658).single().unwrap()
+        );
+
+        let _ = std::fs::remove_file(global_db);
+    }
+
+    #[tokio::test]
+    async fn discover_sessions_without_a_composer_row_leaves_context_pct_unset() {
+        let id = "b283a138-1a72-4d11-8d02-2ac1a333619a";
+        let transcript_path = format!(
+            "/home/v0id/.cursor/projects/home-v0id-Documents-repos-usagewindow/agent-transcripts/{id}/{id}.jsonl"
+        );
+        let global_db = global_storage_db_with_composer(
+            "a-completely-different-session",
+            json!({"contextUsagePercent": 10.0}),
+        );
+        let adapter = CursorAdapter::new(Arc::new(FakeTransport(json!({}))))
+            .with_transcript_fs(Arc::new(FixtureTranscriptFs(vec![(
+                transcript_path,
+                cursor_transcript_line("user", "hello"),
+            )])))
+            .with_global_storage_db(global_db.clone());
+
+        let discovered = adapter.discover_sessions().await.unwrap();
+
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].last_known_context_pct, None);
+        assert!(discovered[0].token_usage.is_empty());
+        assert_eq!(discovered[0].title, Some("hello".into()));
+
+        let _ = std::fs::remove_file(global_db);
     }
 }
