@@ -134,6 +134,74 @@ fn scan_cursor_transcript(
     })
 }
 
+fn decode_hex(input: &str) -> Option<Vec<u8>> {
+    if !input.len().is_multiple_of(2) {
+        return None;
+    }
+    input
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let digits = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(digits, 16).ok()
+        })
+        .collect()
+}
+
+fn cursor_metadata_session_id(value: Option<&Value>) -> Option<SessionId> {
+    let id = value?.as_str()?;
+    uuid::Uuid::parse_str(id).ok()?;
+    Some(SessionId(id.to_owned()))
+}
+
+fn read_cursor_chat_lineage(
+    chats_root: &std::path::Path,
+    session_id: &SessionId,
+) -> SessionLineage {
+    let Ok(workspaces) = std::fs::read_dir(chats_root) else {
+        return SessionLineage::default();
+    };
+    for workspace in workspaces.flatten() {
+        let store_path = workspace.path().join(&session_id.0).join("store.db");
+        if !store_path.is_file() {
+            continue;
+        }
+        let Ok(connection) = rusqlite::Connection::open_with_flags(
+            store_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            continue;
+        };
+        let Ok(encoded) =
+            connection.query_row("SELECT value FROM meta WHERE key = '0'", [], |row| {
+                row.get::<_, String>(0)
+            })
+        else {
+            continue;
+        };
+        let Some(bytes) = decode_hex(&encoded) else {
+            continue;
+        };
+        let Ok(metadata) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if metadata.get("agentId").and_then(Value::as_str) != Some(session_id.0.as_str()) {
+            return SessionLineage::default();
+        }
+        let subagent = metadata.get("subagentInfo");
+        return SessionLineage {
+            parent: cursor_metadata_session_id(
+                subagent.and_then(|value| value.get("parentAgentId")),
+            ),
+            root: cursor_metadata_session_id(
+                subagent.and_then(|value| value.get("rootParentAgentId")),
+            ),
+            related: Vec::new(),
+        };
+    }
+    SessionLineage::default()
+}
+
 #[async_trait]
 pub trait CursorUsageTransport: Send + Sync {
     async fn current_period_usage(&self) -> AdapterResult<Value>;
@@ -404,6 +472,7 @@ pub struct CursorAdapter {
     transcript_fs: Arc<dyn TranscriptFileSystem>,
     discovery_cache: Mutex<HashMap<String, CachedCursorTranscript>>,
     plan_reader: Arc<dyn CursorPlanReader>,
+    chat_metadata_root: Option<std::path::PathBuf>,
 }
 
 impl CursorAdapter {
@@ -415,6 +484,13 @@ impl CursorAdapter {
             transcript_fs: Arc::new(CursorTranscriptFileSystem),
             discovery_cache: Mutex::new(HashMap::new()),
             plan_reader: Arc::new(CursorCliPlanReader),
+            chat_metadata_root: std::env::var_os("CURSOR_CHATS_DIR")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .map(std::path::PathBuf::from)
+                        .map(|home| home.join(".cursor/chats"))
+                }),
         }
     }
 
@@ -442,6 +518,11 @@ impl CursorAdapter {
         self
     }
 
+    pub fn with_chat_metadata_root(mut self, root: std::path::PathBuf) -> Self {
+        self.chat_metadata_root = Some(root);
+        self
+    }
+
     pub fn capabilities_static() -> Capabilities {
         Capabilities {
             can_trigger_compaction: false,
@@ -452,6 +533,16 @@ impl CursorAdapter {
             headless_resume: false,
             seed_modes: vec![],
         }
+    }
+
+    async fn lineage_for(&self, session_id: &SessionId) -> SessionLineage {
+        let Some(root) = self.chat_metadata_root.clone() else {
+            return SessionLineage::default();
+        };
+        let session_id = session_id.clone();
+        tokio::task::spawn_blocking(move || read_cursor_chat_lineage(&root, &session_id))
+            .await
+            .unwrap_or_default()
     }
 
     fn parse_sample(&self, value: &Value, plan: Option<String>) -> AdapterResult<UsageSample> {
@@ -582,7 +673,7 @@ impl HarnessAdapter for CursorAdapter {
                 .await
                 .ok()
                 .map(|metadata| (metadata.len(), metadata.modified().ok()));
-            if let Some(fingerprint) = fingerprint {
+            let cached_session = if let Some(fingerprint) = fingerprint {
                 let cached = self
                     .discovery_cache
                     .lock()
@@ -590,13 +681,21 @@ impl HarnessAdapter for CursorAdapter {
                 if let Some(entry) = cached.get(&path)
                     && entry.fingerprint == fingerprint
                 {
-                    discovered.push(entry.session.clone());
-                    continue;
+                    Some(entry.session.clone())
+                } else {
+                    None
                 }
+            } else {
+                None
+            };
+            if let Some(mut session) = cached_session {
+                session.lineage = self.lineage_for(&session.id).await;
+                discovered.push(session);
+                continue;
             }
             let content = self.transcript_fs.read_to_string(&path).await?;
             let modified = fingerprint.and_then(|(_, modified)| modified);
-            if let Some(session) = scan_cursor_transcript(&path, &content, modified) {
+            if let Some(mut session) = scan_cursor_transcript(&path, &content, modified) {
                 if let Some(fingerprint) = fingerprint {
                     self.discovery_cache
                         .lock()
@@ -609,6 +708,7 @@ impl HarnessAdapter for CursorAdapter {
                             },
                         );
                 }
+                session.lineage = self.lineage_for(&session.id).await;
                 discovered.push(session);
             }
         }
@@ -892,6 +992,82 @@ mod tests {
         json!({"role": role, "message": {"content": [{"type": "text", "text": text}]}}).to_string()
     }
 
+    struct CursorChatFixture {
+        root: std::path::PathBuf,
+    }
+
+    impl CursorChatFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("usagewindow-cursor-chats-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+
+        fn insert_meta(&self, directory_session_id: &str, metadata: Value) {
+            let session_dir = self
+                .root
+                .join("3489ad9e9dbc710184e395124ffa1db2")
+                .join(directory_session_id);
+            std::fs::create_dir_all(&session_dir).unwrap();
+            let connection = rusqlite::Connection::open(session_dir.join("store.db")).unwrap();
+            connection
+                .execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)", [])
+                .unwrap();
+            let encoded = metadata
+                .to_string()
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            connection
+                .execute("INSERT INTO meta (key, value) VALUES ('0', ?1)", [encoded])
+                .unwrap();
+        }
+
+        fn insert_corrupt_meta(&self, directory_session_id: &str) {
+            let session_dir = self
+                .root
+                .join("3489ad9e9dbc710184e395124ffa1db2")
+                .join(directory_session_id);
+            std::fs::create_dir_all(&session_dir).unwrap();
+            let connection = rusqlite::Connection::open(session_dir.join("store.db")).unwrap();
+            connection
+                .execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)", [])
+                .unwrap();
+            connection
+                .execute("INSERT INTO meta (key, value) VALUES ('0', 'not-hex')", [])
+                .unwrap();
+        }
+
+        fn insert_unreadable_store(&self, directory_session_id: &str) {
+            let store_path = self
+                .root
+                .join("3489ad9e9dbc710184e395124ffa1db2")
+                .join(directory_session_id)
+                .join("store.db");
+            std::fs::create_dir_all(store_path).unwrap();
+        }
+    }
+
+    impl Drop for CursorChatFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn cursor_adapter_with_chat_root(id: &str, chat_root: std::path::PathBuf) -> CursorAdapter {
+        let path = format!(
+            "/home/v0id/.cursor/projects/home-v0id-Documents-repos-usagewindow/agent-transcripts/{id}/{id}.jsonl"
+        );
+        CursorAdapter::new(Arc::new(FakeTransport(json!({}))))
+            .with_transcript_fs(Arc::new(FixtureTranscriptFs(vec![(
+                path,
+                cursor_transcript_line("user", "hello"),
+            )])))
+            .with_chat_metadata_root(chat_root)
+    }
+
     #[test]
     fn decodes_project_dir_name_into_a_cwd() {
         assert_eq!(
@@ -960,5 +1136,84 @@ mod tests {
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].id, SessionId(id.into()));
         assert_eq!(discovered[0].cwd, "/home/v0id/Documents/repos/usagewindow");
+    }
+
+    #[tokio::test]
+    async fn discovers_cursor_child_lineage_from_hex_encoded_chat_metadata() {
+        let fixture = CursorChatFixture::new();
+        let child = "e5ded152-88c0-4222-be0d-d629dc344555";
+        let root = "a293a959-d37d-4e73-8848-f5b7f3d560a0";
+        fixture.insert_meta(
+            child,
+            json!({
+                "agentId": child,
+                "latestRootBlobId": "6271900c",
+                "name": "New Agent",
+                "mode": "default",
+                "isRunEverything": false,
+                "createdAt": 1790257726036_i64,
+                "subagentInfo": {
+                    "parentAgentId": root,
+                    "rootParentAgentId": root,
+                    "toolCallId": "tool_f9fe97e1-7daf-4e7f-8662-ac0d7ccfcfc4",
+                    "typeName": "generalPurpose"
+                }
+            }),
+        );
+        let adapter = cursor_adapter_with_chat_root(child, fixture.root.clone());
+
+        let discovered = adapter.discover_sessions().await.unwrap();
+
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(
+            discovered[0].lineage,
+            SessionLineage {
+                parent: Some(SessionId(root.into())),
+                root: Some(SessionId(root.into())),
+                related: Vec::new(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_chat_metadata_agent_id_mismatch_fails_closed() {
+        let fixture = CursorChatFixture::new();
+        let child = "e5ded152-88c0-4222-be0d-d629dc344555";
+        let root = "a293a959-d37d-4e73-8848-f5b7f3d560a0";
+        fixture.insert_meta(
+            child,
+            json!({
+                "agentId": "ffffffff-ffff-4fff-8fff-ffffffffffff",
+                "subagentInfo": {
+                    "parentAgentId": root,
+                    "rootParentAgentId": root
+                }
+            }),
+        );
+        let adapter = cursor_adapter_with_chat_root(child, fixture.root.clone());
+
+        let discovered = adapter.discover_sessions().await.unwrap();
+
+        assert_eq!(discovered.len(), 1);
+        assert!(discovered[0].lineage.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_or_corrupt_cursor_chat_metadata_keeps_transcript_discovery_working() {
+        let fixture = CursorChatFixture::new();
+        let corrupt = "e5ded152-88c0-4222-be0d-d629dc344555";
+        let missing = "b283a138-1a72-4d11-8d02-2ac1a333619a";
+        let unreadable = "73f1c40d-9152-4a27-ac20-34efb98b99bd";
+        fixture.insert_corrupt_meta(corrupt);
+        fixture.insert_unreadable_store(unreadable);
+
+        for id in [corrupt, missing, unreadable] {
+            let adapter = cursor_adapter_with_chat_root(id, fixture.root.clone());
+            let discovered = adapter.discover_sessions().await.unwrap();
+
+            assert_eq!(discovered.len(), 1);
+            assert_eq!(discovered[0].id, SessionId(id.into()));
+            assert!(discovered[0].lineage.is_empty());
+        }
     }
 }

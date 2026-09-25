@@ -68,12 +68,15 @@ UsageSample = { at, fetched_at: Option<DateTime<Utc>>, source: ProviderReported 
 // must default to Headless and let the user `claude attach`/`codex agents` in manually;
 // only a session that was already Headless can be silently re-launched Headless.
 SessionSummary = { id: SessionId, harness: Provider, model: Option<ModelId>,
+                    lineage: SessionLineage,
                     account: Option<AccountId>, first_seen, last_seen,
                     cwd: String, state_path: Option<String>,
                     context_window_size: Option<u64>, last_known_token_count: Option<u64>,
                     launch_mode: LaunchMode, pid: Option<u32>,
                     stopped_reason: Option<StopReason>, resume_marker: Option<ResumeMarker>,
                     reseeded_from: Option<SessionId> }
+SessionLineage = { parent: Option<SessionId>, root: Option<SessionId>,
+                    related: Vec<SessionId> }
 LaunchMode = Interactive | Headless
 StopReason = UsageLimit { window: WindowKey } | UserQuit | Crashed | Unknown
 
@@ -185,6 +188,26 @@ the configured meta-harness adapter, such as T3Code or Paseo. If every route fai
 queue row is marked failed with both errors. This keeps the fallback provider-neutral:
 future providers use the same decorator and do not need to know whether the owner is
 Paseo, T3Code, or another meta-harness.
+
+Meta-harness ownership uses provider-neutral session lineage. A native adapter may add
+verified parent, root, or related session IDs during discovery. The store persists that
+lineage with the session. When native compaction fails, the meta-harness checks the
+requested ID first, followed by parent, root, and related IDs. A match selects the
+owner's thread without changing the queued request's original session ID. Direct matches
+take priority, and no match fails closed before any delivery call. Provider-specific
+storage parsing stays in the native adapter; the meta-harness only consumes
+`SessionLineage`.
+
+The destructive sequence remains claim before act:
+
+1. The daemon atomically changes the queued request from `pending` to `sending`.
+2. The native adapter attempts compaction for the requested session.
+3. On native error, the fallback passes the stored session and lineage to the configured
+   meta-harness.
+4. The meta-harness resolves the direct or ancestor owner. Failure sends nothing.
+5. T3Code sends the preservation instruction, interrupts that turn, then sends
+   `/compact` to the resolved owner thread.
+6. The daemon records `sent` or the combined terminal failure on the original request.
 
 Policy implication (Phase 3): the near-limit "ask" trigger only calls `advise` when
 `can_advise_mid_turn` (or degrades to `can_inject_at_session_start`, queued for the next
@@ -418,7 +441,7 @@ usage_samples(id, provider, account, window_kind, window_scope_value, pct, reset
 -- cwd/state_path/context_window_size/launch_mode/pid: see SessionSummary in the domain
 -- model section above for why each is load-bearing (resume needs cwd+launch_mode,
 -- idle-compact needs context_window_size, liveness needs pid).
-sessions(id PRIMARY KEY, harness, model, account, cwd, state_path,
+sessions(id PRIMARY KEY, harness, model, account, cwd, state_path, lineage_json,
          context_window_size, last_known_token_count, launch_mode, pid,
          first_seen, last_seen, stopped_reason, stopped_window_kind,
          superseded_by, reseeded_from)

@@ -18,7 +18,8 @@ with **no per-line timestamp, session id, or cwd field** — unlike Claude
 Code's and Codex's transcripts, which carry `cwd`/`sessionId` directly. This
 is the Cursor CLI/background-agent transcript store; the Cursor IDE's chat
 panel keeps a separate sqlite-backed store under `~/.cursor/chats/<workspace
-hash>/<session-uuid>/store.db`, which this adapter does not read.
+hash>/<session-uuid>/store.db`. The adapter reads that second store only for
+child-session lineage, as documented below.
 
 Consequences of the missing structured fields:
 
@@ -40,10 +41,47 @@ Consequences of the missing structured fields:
   since there is no in-content timestamp to read.
 - **title** is the first user message's text, truncated to 120 characters.
 
+## Child-session lineage (verified 2026-09-24)
+
+Cursor stores child-agent identity outside the transcript tree. The chat store at
+`~/.cursor/chats/<workspace-hash>/<session-uuid>/store.db` has a `meta` table whose
+row with key `0` contains hex-encoded JSON. For the failed compaction incident,
+session `e5ded152-88c0-4222-be0d-d629dc344555` decoded to this relationship:
+
+```json
+{
+  "agentId": "e5ded152-88c0-4222-be0d-d629dc344555",
+  "subagentInfo": {
+    "parentAgentId": "a293a959-d37d-4e73-8848-f5b7f3d560a0",
+    "rootParentAgentId": "a293a959-d37d-4e73-8848-f5b7f3d560a0",
+    "typeName": "generalPurpose"
+  }
+}
+```
+
+`CursorAdapter::discover_sessions` reads this database in read-only mode after it
+parses each transcript. It records the two ancestor IDs in `SessionLineage`, which the
+daemon persists with the discovered session. `CURSOR_CHATS_DIR` overrides the chat root;
+the default is `$HOME/.cursor/chats`.
+
+Lineage enrichment is best effort. A missing database, unreadable database, absent row,
+invalid hex, or invalid JSON leaves lineage empty and does not hide the transcript.
+Malformed ancestor UUIDs are ignored. The decoded `agentId` must equal the transcript
+filename ID. A mismatch discards the complete metadata record so an unrelated child
+cannot be routed through the wrong owner. Discovery checks lineage again on
+transcript-cache hits because Cursor can create the chat metadata after the transcript
+first appears.
+
+Only Cursor's format is verified here. The `SessionLineage` model is provider-neutral;
+Claude Code and Codex adapters can populate it if their child-session formats are later
+verified.
+
 ## Compaction TODO
 
-Status: usage polling is implemented. Compaction delivery remains disabled until a
-supported, owner-preserving send path is verified.
+Status: usage polling is implemented. Native Cursor compaction delivery remains disabled
+until a supported, owner-preserving send path is verified. The provider-neutral fallback
+can deliver through T3Code when discovered lineage resolves the Cursor session to a
+T3Code-owned ancestor.
 
 - [x] Keep the Cursor adapter's `can_trigger_compaction` and `headless_resume`
   capabilities false until delivery and identity are proven.
@@ -103,9 +141,10 @@ Agent CLI token in `~/.config/cursor/auth.json`. `CURSOR_STATE_DB` and
 
 Cursor's bars are monthly billing-pool percentages, not duration-keyed rolling
 windows. They are stored as `WindowKind::Custom("auto")` and
-`WindowKind::Custom("api")`, both using `billingCycleEnd` as their reset. Cursor
-does not expose a supported external message-delivery or resume channel through
-this integration, so the adapter cannot currently receive a compaction request.
+`WindowKind::Custom("api")`, both using `billingCycleEnd` as their reset. Cursor does
+not expose a supported external message-delivery or resume channel through this native
+integration, so the Cursor adapter cannot deliver a compaction request by itself. A
+configured meta-harness fallback can deliver through an owner such as T3Code.
 Cursor's CLI does expose `/compress`, with `/summarize` as the canonical command and
 `/compress` as an alias. That is useful syntax for a future interactive delivery adapter,
 but it is not an API that usagewindow can send to a running session today.

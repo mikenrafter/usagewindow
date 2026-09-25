@@ -181,3 +181,24 @@ session must consult this local database to discover its owning T3Code thread;
 looking up the native ID directly through the HTTP snapshot endpoint cannot
 establish ownership. The adapter will treat the state-database path as
 configuration, defaulting to `$HOME/.t3/userdata/state.sqlite`.
+
+## Descendant ownership routing (verified 2026-09-24)
+
+T3Code persists the provider session that it owns, but a provider can create child
+sessions without adding one row per child to `provider_session_runtime`. In the Cursor
+incident, T3Code owned root session `a293a959-d37d-4e73-8848-f5b7f3d560a0` through
+thread `4a9941d1-eebf-4201-8fad-ecdf4a1871f0`. Cursor then created child session
+`e5ded152-88c0-4222-be0d-d629dc344555`. The child chat metadata named the T3-owned
+session as both its parent and root, while the T3 database correctly retained only the
+root binding.
+
+The T3Code adapter now receives lineage on `SessionSummary` and checks ownership
+candidates in this order: requested session, parent, root, then related IDs. The first
+matching provider-native ID selects the T3 thread. Direct ownership therefore wins when
+both a child and an ancestor have bindings. If none match, the operation remains
+`Unsupported` and the adapter does not contact T3Code.
+
+T3Code does not parse provider storage. Each native adapter owns that work and supplies
+verified lineage during discovery. Cursor currently supplies parent and root IDs from
+its chat database. No Claude Code or Codex child format is claimed here; those adapters
+can use the same model after their formats are verified.
