@@ -480,6 +480,15 @@ function formatTokens(value) {
   return `${Math.round(thousands)}k`;
 }
 
+// Harnesses that don't expose token counts (e.g. Cursor) report context fill
+// as a percentage instead — fall back to that when there's no token count.
+function formatContext(tokenCount, contextPct) {
+  const tokens = formatTokens(tokenCount);
+  if (tokens !== '-') return tokens;
+  if (contextPct == null || !Number.isFinite(Number(contextPct))) return '-';
+  return `${Number(contextPct).toFixed(1)}%`;
+}
+
 function windowLabel(w) {
   if (typeof w === 'string') return w;
   if (w.Rolling) {
@@ -788,7 +797,7 @@ async function loadSessions() {
         <td data-label="model">${escapeHtml(s.model || '-')}</td>
         <td data-label="account" class="muted acct">${escapeHtml(s.account || '-')}</td>
         <td data-label="max context">${formatTokens(s.context_window_size)}</td>
-        <td data-label="recent context">${formatTokens(s.last_known_token_count)}</td>
+        <td data-label="recent context">${formatContext(s.last_known_token_count, s.last_known_context_pct)}</td>
         <td data-label="last seen">${fmtDate(s.last_seen)}</td>
         <td data-label="status">${pillFor(s)}${s.keepalive ? ' <span class="pill keepalive">keepalive</span>' : ''}</td>
       </tr>`).join('');
@@ -831,7 +840,7 @@ async function selectSession(id) {
       <div class="k">first seen</div><div class="v">${fmtDate(s.first_seen)}</div>
       <div class="k">last seen</div><div class="v">${fmtDate(s.last_seen)}</div>
       <div class="k">context window</div><div class="v">${formatTokens(s.context_window_size)}</div>
-      <div class="k">last token count</div><div class="v">${formatTokens(s.last_known_token_count)}</div>
+      <div class="k">last token count</div><div class="v">${formatContext(s.last_known_token_count, s.last_known_context_pct)}</div>
       <div class="k">pid</div><div class="v">${escapeHtml(s.pid)}</div>
       <div class="k">stopped reason</div><div class="v">${escapeHtml(s.stopped_reason)}</div>
       <div class="k">keepalive</div><div class="v">${keptAlive ? '<span class="pill keepalive">on</span>' : '<span class="muted">off</span>'}</div>

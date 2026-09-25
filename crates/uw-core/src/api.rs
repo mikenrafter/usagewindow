@@ -39,7 +39,7 @@ pub struct UsageWindowSummary {
     pub scheduled_sessions: u32,
     pub depletes_at: Option<DateTime<Utc>>,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionListItem {
     pub id: SessionId,
     /// Resolved display title: this session's own title if it has one, else
@@ -58,6 +58,9 @@ pub struct SessionListItem {
     pub cached: bool,
     pub context_window_size: Option<u64>,
     pub last_known_token_count: Option<u64>,
+    /// Context fill as a percentage, for harnesses (e.g. Cursor) that report
+    /// how full the context is without exposing token counts.
+    pub last_known_context_pct: Option<f32>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionsPage {
@@ -242,6 +245,7 @@ mod tests {
             account: None,
             context_window_size: None,
             last_known_token_count: None,
+            last_known_context_pct: None,
             last_seen: Utc::now(),
             stopped_reason: None,
             resume_status: None,

@@ -577,7 +577,6 @@ async fn status(
             }
         }
         let now = Utc::now();
-        let activity_cutoff = now - Duration::minutes(30);
         let mut marker_thresholds = HashMap::new();
         for sample in latest.values() {
             if !marker_thresholds.contains_key(&sample.provider) {
@@ -592,12 +591,12 @@ async fn status(
             .map(|session| {
                 let records = store.token_usage_for_session(&session.id)?;
                 let active = session.stopped_reason.is_none()
-                    && records.iter().any(|record| {
-                        record.at >= activity_cutoff && record.total_tokens > 0
-                    });
+                    && uw_core::model::session_has_recent_token_activity(&records, now);
                 let activity = records
                     .iter()
-                    .filter(|record| record.total_tokens > 0)
+                    .filter(|record| {
+                        record.total_tokens > 0 || record.context_pct.is_some_and(|pct| pct > 0.0)
+                    })
                     .map(|record| record.at)
                     .collect::<Vec<_>>();
                 let token_usage = records
@@ -771,12 +770,10 @@ async fn sessions(
                     continue;
                 }
                 let active = s.stopped_reason.is_none()
-                    && store
-                        .token_usage_for_session(&s.id)?
-                        .into_iter()
-                        .any(|record| {
-                            record.at >= now - Duration::minutes(30) && record.total_tokens > 0
-                        });
+                    && uw_core::model::session_has_recent_token_activity(
+                        &store.token_usage_for_session(&s.id)?,
+                        now,
+                    );
                 if !harness.as_ref().is_none_or(|h| h == &s.harness)
                     || (!include_inactive && !active)
                 {
@@ -818,6 +815,7 @@ async fn sessions(
                     account: s.account,
                     context_window_size: s.context_window_size,
                     last_known_token_count: s.last_known_token_count,
+                    last_known_context_pct: s.last_known_context_pct,
                     last_seen: s.last_seen,
                     stopped_reason: s.stopped_reason,
                     resume_status,
@@ -2571,6 +2569,46 @@ mod tests {
             .unwrap();
         let page: SessionsPage = serde_json::from_slice(&body).unwrap();
         assert_eq!(page.total, 2);
+    }
+
+    #[tokio::test]
+    async fn a_percent_only_cursor_session_counts_as_active_and_reports_its_context_pct() {
+        let store = Store::open_memory().unwrap();
+        let mut cursor_session = session();
+        cursor_session.id = SessionId("cursor-percent-only".into());
+        cursor_session.harness = Provider::Cursor;
+        cursor_session.last_known_context_pct = Some(66.2265);
+        store.insert_session(&cursor_session).unwrap();
+        store
+            .insert_token_usage_records(
+                &cursor_session.id,
+                &[TokenUsageRecord {
+                    at: Utc::now(),
+                    model: None,
+                    input_tokens: 0,
+                    cached_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 0,
+                    reasoning_output_tokens: 0,
+                    total_tokens: 0,
+                    context_pct: Some(66.2265),
+                }],
+            )
+            .unwrap();
+
+        let router = app(store);
+        let response = router
+            .oneshot(Request::get("/api/sessions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: SessionsPage = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, cursor_session.id);
+        assert!(page.items[0].active);
+        assert_eq!(page.items[0].last_known_context_pct, Some(66.2265));
     }
 
     #[tokio::test]
