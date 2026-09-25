@@ -71,6 +71,20 @@ impl Store {
         {
             return Err(err.into());
         }
+        if let Err(err) = self.connection.execute(
+            "ALTER TABLE resume_markers ADD COLUMN preempt INTEGER NOT NULL DEFAULT 1",
+            [],
+        ) && !err.to_string().contains("duplicate column name")
+        {
+            return Err(err.into());
+        }
+        if let Err(err) = self.connection.execute(
+            "ALTER TABLE compaction_requests ADD COLUMN preempt INTEGER NOT NULL DEFAULT 1",
+            [],
+        ) && !err.to_string().contains("duplicate column name")
+        {
+            return Err(err.into());
+        }
         if let Err(err) = self
             .connection
             .execute("ALTER TABLE sessions ADD COLUMN title TEXT", [])
@@ -91,6 +105,8 @@ impl Store {
             "ALTER TABLE sessions ADD COLUMN superseded_stop_reason_note TEXT",
             "ALTER TABLE sessions ADD COLUMN lineage_json TEXT",
             "ALTER TABLE sessions ADD COLUMN last_seen_missing INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN last_known_context_pct REAL",
+            "ALTER TABLE session_token_usage ADD COLUMN context_pct REAL",
             "ALTER TABLE provider_fetch_status ADD COLUMN non_blocking INTEGER NOT NULL DEFAULT 0",
         ] {
             if let Err(err) = self.connection.execute(stmt, [])
@@ -288,9 +304,9 @@ impl Store {
     }
     pub fn read_session(&self, id: &SessionId) -> StoreResult<SessionSummary> {
         let r = self.connection.query_row(
-            "SELECT id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,superseded_by,reseeded_from,superseded_stop_reason,superseded_stop_reason_at,superseded_stop_reason_note,lineage_json FROM sessions WHERE id=?",
+            "SELECT id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,superseded_by,reseeded_from,superseded_stop_reason,superseded_stop_reason_at,superseded_stop_reason_note,lineage_json,last_known_context_pct FROM sessions WHERE id=?",
             [id.0.as_str()],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?, row.get(4)?, row.get(5)?, row.get::<_, Option<i64>>(6)?, row.get::<_, Option<i64>>(7)?, row.get::<_, String>(8)?, row.get::<_, Option<i64>>(9)?, row.get(10)?, row.get(11)?, row.get::<_, Option<String>>(12)?, row.get::<_, Option<String>>(13)?, row.get::<_, Option<String>>(14)?, row.get::<_, Option<String>>(15)?, row.get::<_, Option<DateTime<Utc>>>(16)?, row.get::<_, Option<String>>(17)?, row.get::<_, Option<String>>(18)?)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?, row.get(4)?, row.get(5)?, row.get::<_, Option<i64>>(6)?, row.get::<_, Option<i64>>(7)?, row.get::<_, String>(8)?, row.get::<_, Option<i64>>(9)?, row.get(10)?, row.get(11)?, row.get::<_, Option<String>>(12)?, row.get::<_, Option<String>>(13)?, row.get::<_, Option<String>>(14)?, row.get::<_, Option<String>>(15)?, row.get::<_, Option<DateTime<Utc>>>(16)?, row.get::<_, Option<String>>(17)?, row.get::<_, Option<String>>(18)?, row.get::<_, Option<f32>>(19)?)),
         ).optional()?.ok_or(StoreError::NotFound)?;
         Ok(SessionSummary {
             id: SessionId(r.0),
@@ -306,6 +322,7 @@ impl Store {
             state_path: r.5,
             context_window_size: r.6.map(|x| x as u64),
             last_known_token_count: r.7.map(|x| x as u64),
+            last_known_context_pct: r.19,
             launch_mode: serde_json::from_str(&r.8)?,
             pid: r.9.map(|x| x as u32),
             first_seen: r.10,
@@ -400,12 +417,12 @@ impl Store {
             && session_has_recent_token_activity(&records, now))
     }
     pub fn resume_markers_for_session(&self, id: &SessionId) -> StoreResult<Vec<ResumeMarker>> {
-        let mut stmt = self.connection.prepare("SELECT id,session_id,reason,resume_at,requested_at,created_at,status,status_detail,message FROM resume_markers WHERE session_id=? ORDER BY created_at,id")?;
+        let mut stmt = self.connection.prepare("SELECT id,session_id,reason,resume_at,requested_at,created_at,status,status_detail,message,preempt FROM resume_markers WHERE session_id=? ORDER BY created_at,id")?;
         let rows = stmt.query_map([id.0.as_str()], decode_resume_marker_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
     pub fn active_resume_marker(&self, id: &SessionId) -> StoreResult<Option<ResumeMarker>> {
-        let mut stmt = self.connection.prepare("SELECT id,session_id,reason,resume_at,requested_at,created_at,status,status_detail,message FROM resume_markers WHERE session_id=? AND status IN ('pending','scheduled')")?;
+        let mut stmt = self.connection.prepare("SELECT id,session_id,reason,resume_at,requested_at,created_at,status,status_detail,message,preempt FROM resume_markers WHERE session_id=? AND status IN ('pending','scheduled')")?;
         Ok(stmt
             .query_row([id.0.as_str()], decode_resume_marker_row)
             .optional()?)
@@ -414,7 +431,7 @@ impl Store {
         &self,
         id: &SessionId,
     ) -> StoreResult<Vec<CompactionRequest>> {
-        let mut stmt = self.connection.prepare("SELECT id,session_id,kind,prompt,reason,resume_after_compaction,status,status_detail,created_at FROM compaction_requests WHERE session_id=? ORDER BY created_at,id")?;
+        let mut stmt = self.connection.prepare("SELECT id,session_id,kind,prompt,reason,resume_after_compaction,preempt,status,status_detail,created_at FROM compaction_requests WHERE session_id=? ORDER BY created_at,id")?;
         let rows = stmt.query_map([id.0.as_str()], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -423,13 +440,25 @@ impl Store {
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, i64>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get(8)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get(9)?,
             ))
         })?;
         rows.map(|row| {
-            let (id, session_id, kind, prompt, reason, resume_after_compaction, status, detail, created_at) = row?;
+            let (
+                id,
+                session_id,
+                kind,
+                prompt,
+                reason,
+                resume_after_compaction,
+                preempt,
+                status,
+                detail,
+                created_at,
+            ) = row?;
             Ok(CompactionRequest {
                 id: uuid::Uuid::parse_str(&id)
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
@@ -439,6 +468,7 @@ impl Store {
                 prompt,
                 reason,
                 resume_after_compaction: resume_after_compaction != 0,
+                preempt: preempt != 0,
                 status: decode_compaction_status(&status, detail),
                 created_at,
             })
@@ -446,7 +476,7 @@ impl Store {
         .collect()
     }
     pub fn due_resume_markers(&self, now: DateTime<Utc>) -> StoreResult<Vec<ResumeMarker>> {
-        let mut stmt = self.connection.prepare("SELECT id,session_id,reason,resume_at,requested_at,created_at,status,status_detail,message FROM resume_markers WHERE status IN ('pending','scheduled') AND resume_at IS NOT NULL AND resume_at<=? ORDER BY resume_at,id")?;
+        let mut stmt = self.connection.prepare("SELECT id,session_id,reason,resume_at,requested_at,created_at,status,status_detail,message,preempt FROM resume_markers WHERE status IN ('pending','scheduled') AND resume_at IS NOT NULL AND resume_at<=? ORDER BY resume_at,id")?;
         let rows = stmt.query_map([now], decode_resume_marker_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
@@ -458,13 +488,13 @@ impl Store {
         Ok(())
     }
     pub fn insert_session(&self, s: &SessionSummary) -> StoreResult<()> {
-        self.connection.execute("INSERT INTO sessions(id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,stopped_window_kind,superseded_by,reseeded_from,lineage_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![s.id.0,json(&s.harness)?,opt_json(&s.model)?,opt_json(&s.account)?,s.cwd,s.state_path,s.context_window_size.map(|x|x as i64),s.last_known_token_count.map(|x|x as i64),json(&s.launch_mode)?,s.pid.map(|x|x as i64),s.first_seen,s.last_seen,opt_json(&s.stopped_reason)?,Option::<String>::None,s.superseded_by.as_ref().map(|x|&x.0),s.reseeded_from.as_ref().map(|x|&x.0),lineage_json(&s.lineage)?])?;
+        self.connection.execute("INSERT INTO sessions(id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,stopped_window_kind,superseded_by,reseeded_from,lineage_json,last_known_context_pct) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![s.id.0,json(&s.harness)?,opt_json(&s.model)?,opt_json(&s.account)?,s.cwd,s.state_path,s.context_window_size.map(|x|x as i64),s.last_known_token_count.map(|x|x as i64),json(&s.launch_mode)?,s.pid.map(|x|x as i64),s.first_seen,s.last_seen,opt_json(&s.stopped_reason)?,Option::<String>::None,s.superseded_by.as_ref().map(|x|&x.0),s.reseeded_from.as_ref().map(|x|&x.0),lineage_json(&s.lineage)?,s.last_known_context_pct])?;
         Ok(())
     }
     pub fn upsert_session(&self, s: &SessionSummary) -> StoreResult<()> {
         self.connection.execute(
-            "INSERT INTO sessions(id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,stopped_window_kind,superseded_by,reseeded_from,lineage_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET harness=excluded.harness,model=COALESCE(excluded.model,sessions.model),account=COALESCE(excluded.account,sessions.account),cwd=excluded.cwd,state_path=COALESCE(excluded.state_path,sessions.state_path),context_window_size=CASE WHEN excluded.last_seen > sessions.last_seen THEN COALESCE(excluded.context_window_size,sessions.context_window_size) ELSE sessions.context_window_size END,last_known_token_count=CASE WHEN excluded.last_seen > sessions.last_seen THEN COALESCE(excluded.last_known_token_count,sessions.last_known_token_count) ELSE sessions.last_known_token_count END,pid=COALESCE(excluded.pid,sessions.pid),last_seen=MAX(sessions.last_seen,excluded.last_seen),lineage_json=COALESCE(excluded.lineage_json,sessions.lineage_json)",
-            params![s.id.0,json(&s.harness)?,opt_json(&s.model)?,opt_json(&s.account)?,s.cwd,s.state_path,s.context_window_size.map(|x|x as i64),s.last_known_token_count.map(|x|x as i64),json(&s.launch_mode)?,s.pid.map(|x|x as i64),s.first_seen,s.last_seen,opt_json(&s.stopped_reason)?,Option::<String>::None,s.superseded_by.as_ref().map(|x|&x.0),s.reseeded_from.as_ref().map(|x|&x.0),lineage_json(&s.lineage)?],
+            "INSERT INTO sessions(id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,stopped_window_kind,superseded_by,reseeded_from,lineage_json,last_known_context_pct) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET harness=excluded.harness,model=COALESCE(excluded.model,sessions.model),account=COALESCE(excluded.account,sessions.account),cwd=excluded.cwd,state_path=COALESCE(excluded.state_path,sessions.state_path),context_window_size=CASE WHEN excluded.last_seen > sessions.last_seen THEN COALESCE(excluded.context_window_size,sessions.context_window_size) ELSE sessions.context_window_size END,last_known_token_count=CASE WHEN excluded.last_seen > sessions.last_seen THEN COALESCE(excluded.last_known_token_count,sessions.last_known_token_count) ELSE sessions.last_known_token_count END,last_known_context_pct=CASE WHEN excluded.last_seen > sessions.last_seen THEN COALESCE(excluded.last_known_context_pct,sessions.last_known_context_pct) ELSE sessions.last_known_context_pct END,pid=COALESCE(excluded.pid,sessions.pid),last_seen=MAX(sessions.last_seen,excluded.last_seen),lineage_json=COALESCE(excluded.lineage_json,sessions.lineage_json)",
+            params![s.id.0,json(&s.harness)?,opt_json(&s.model)?,opt_json(&s.account)?,s.cwd,s.state_path,s.context_window_size.map(|x|x as i64),s.last_known_token_count.map(|x|x as i64),json(&s.launch_mode)?,s.pid.map(|x|x as i64),s.first_seen,s.last_seen,opt_json(&s.stopped_reason)?,Option::<String>::None,s.superseded_by.as_ref().map(|x|&x.0),s.reseeded_from.as_ref().map(|x|&x.0),lineage_json(&s.lineage)?,s.last_known_context_pct],
         )?;
         Ok(())
     }
@@ -557,7 +587,7 @@ impl Store {
         let tx = self.connection.unchecked_transaction()?;
         for record in records {
             tx.execute(
-                "INSERT OR IGNORE INTO session_token_usage(session_id,at,model,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens) VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT OR IGNORE INTO session_token_usage(session_id,at,model,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,context_pct) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 params![
                     session_id.0,
                     record.at,
@@ -568,6 +598,7 @@ impl Store {
                     record.output_tokens as i64,
                     record.reasoning_output_tokens as i64,
                     record.total_tokens as i64,
+                    record.context_pct,
                 ],
             )?;
         }
@@ -579,7 +610,7 @@ impl Store {
         session_id: &SessionId,
     ) -> StoreResult<Vec<TokenUsageRecord>> {
         let mut statement = self.connection.prepare(
-            "SELECT at,model,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens FROM session_token_usage WHERE session_id=? ORDER BY at",
+            "SELECT at,model,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,context_pct FROM session_token_usage WHERE session_id=? ORDER BY at",
         )?;
         let rows = statement.query_map([session_id.0.as_str()], |row| {
             let model: Option<String> = row.get(1)?;
@@ -601,6 +632,7 @@ impl Store {
                 output_tokens: row.get::<_, i64>(5)? as u64,
                 reasoning_output_tokens: row.get::<_, i64>(6)? as u64,
                 total_tokens: row.get::<_, i64>(7)? as u64,
+                context_pct: row.get(8)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -699,7 +731,7 @@ impl Store {
         Ok(())
     }
     pub fn insert_resume_marker(&self, m: &ResumeMarker) -> StoreResult<()> {
-        self.connection.execute("INSERT INTO resume_markers(id,session_id,reason,resume_at,requested_at,created_at,status,status_detail,message) VALUES(?,?,?,?,?,?,?,?,?)",params![m.id.to_string(),m.session_id.0,json(&m.reason)?,m.resume_at,m.requested_at,m.created_at,status_name(&m.status),status_detail(&m.status),m.message])?;
+        self.connection.execute("INSERT INTO resume_markers(id,session_id,reason,resume_at,requested_at,created_at,status,status_detail,message,preempt) VALUES(?,?,?,?,?,?,?,?,?,?)",params![m.id.to_string(),m.session_id.0,json(&m.reason)?,m.resume_at,m.requested_at,m.created_at,status_name(&m.status),status_detail(&m.status),m.message,boolean(m.preempt)])?;
         Ok(())
     }
     pub fn has_active_resume_marker(&self, session_id: &SessionId) -> StoreResult<bool> {
@@ -726,6 +758,21 @@ impl Store {
         )?;
         Ok(())
     }
+    /// Pulls an active marker's fire time earlier, for a preempt resume that
+    /// spends a window's last minutes of budget. The mirror of
+    /// `defer_resume_marker`: it refuses to push a marker later, and it never
+    /// revives one that already fired or was cancelled. Returns whether the
+    /// marker moved.
+    pub fn pull_resume_earlier(
+        &self,
+        id: uuid::Uuid,
+        resume_at: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        Ok(self.connection.execute(
+            "UPDATE resume_markers SET resume_at=?,status='scheduled',status_detail=NULL WHERE id=? AND status IN ('pending','scheduled') AND (resume_at IS NULL OR ? < resume_at)",
+            params![resume_at, id.to_string(), resume_at],
+        )? == 1)
+    }
     /// Claims a due resume marker before spawning the harness process.
     pub fn claim_resume_marker(&self, id: uuid::Uuid) -> StoreResult<bool> {
         Ok(self.connection.execute(
@@ -735,8 +782,8 @@ impl Store {
     }
     pub fn insert_compaction_request(&self, request: &CompactionRequest) -> StoreResult<()> {
         self.connection.execute(
-            "INSERT INTO compaction_requests(id,session_id,kind,prompt,reason,resume_after_compaction,status,status_detail,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            params![request.id.to_string(), request.session_id.0, json(&request.kind)?, request.prompt, request.reason, boolean(request.resume_after_compaction), compaction_status_name(&request.status), compaction_status_detail(&request.status), request.created_at, request.created_at],
+            "INSERT INTO compaction_requests(id,session_id,kind,prompt,reason,resume_after_compaction,preempt,status,status_detail,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            params![request.id.to_string(), request.session_id.0, json(&request.kind)?, request.prompt, request.reason, boolean(request.resume_after_compaction), boolean(request.preempt), compaction_status_name(&request.status), compaction_status_detail(&request.status), request.created_at, request.created_at],
         )?;
         Ok(())
     }
@@ -749,7 +796,7 @@ impl Store {
     }
     pub fn pending_compaction_requests(&self) -> StoreResult<Vec<CompactionRequest>> {
         let mut statement = self.connection.prepare(
-            "SELECT id,session_id,kind,prompt,reason,resume_after_compaction,status,status_detail,created_at FROM compaction_requests WHERE status='pending' ORDER BY created_at,id",
+            "SELECT id,session_id,kind,prompt,reason,resume_after_compaction,preempt,status,status_detail,created_at FROM compaction_requests WHERE status='pending' ORDER BY created_at,id",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -759,13 +806,25 @@ impl Store {
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, i64>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get(8)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get(9)?,
             ))
         })?;
         rows.map(|row| {
-            let (id, session_id, kind, prompt, reason, resume_after_compaction, status, detail, created_at) = row?;
+            let (
+                id,
+                session_id,
+                kind,
+                prompt,
+                reason,
+                resume_after_compaction,
+                preempt,
+                status,
+                detail,
+                created_at,
+            ) = row?;
             Ok(CompactionRequest {
                 id: uuid::Uuid::parse_str(&id)
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
@@ -774,6 +833,7 @@ impl Store {
                 prompt,
                 reason,
                 resume_after_compaction: resume_after_compaction != 0,
+                preempt: preempt != 0,
                 status: decode_compaction_status(&status, detail),
                 created_at,
             })
@@ -1215,6 +1275,7 @@ fn decode_resume_marker_row(row: &rusqlite::Row) -> rusqlite::Result<ResumeMarke
     let status: String = row.get(6)?;
     let detail: Option<String> = row.get(7)?;
     let message: Option<String> = row.get(8)?;
+    let preempt: i64 = row.get(9)?;
     Ok(ResumeMarker {
         id: uuid::Uuid::parse_str(&id)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
@@ -1226,6 +1287,7 @@ fn decode_resume_marker_row(row: &rusqlite::Row) -> rusqlite::Result<ResumeMarke
         created_at,
         status: decode_resume_status(&status, detail),
         message,
+        preempt: preempt != 0,
     })
 }
 fn compaction_status_name(s: &CompactionStatus) -> &'static str {
@@ -1283,7 +1345,7 @@ fn decode_compaction_event_row(row: &rusqlite::Row) -> rusqlite::Result<Compacti
         completed_at: row.get(9)?,
     })
 }
-const SCHEMA: &str = r#"PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS usage_samples(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,account TEXT,window_kind TEXT NOT NULL,window_scope_value TEXT NOT NULL,pct REAL NOT NULL,resets_at TEXT,exceeded INTEGER NOT NULL,active INTEGER NOT NULL,source TEXT NOT NULL,at TEXT NOT NULL,fetched_at TEXT,credits_json TEXT,plan TEXT);CREATE INDEX IF NOT EXISTS usage_samples_window_at ON usage_samples(provider,window_kind,window_scope_value,at);CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,harness TEXT NOT NULL,model TEXT,account TEXT,cwd TEXT NOT NULL,state_path TEXT,context_window_size INTEGER,last_known_token_count INTEGER,launch_mode TEXT NOT NULL,pid INTEGER,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,stopped_reason TEXT,stopped_window_kind TEXT,superseded_by TEXT,reseeded_from TEXT,title TEXT,superseded_stop_reason TEXT,superseded_stop_reason_at TEXT,superseded_stop_reason_note TEXT,lineage_json TEXT);CREATE TABLE IF NOT EXISTS session_token_usage(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),at TEXT NOT NULL,model TEXT,input_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_write_input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,UNIQUE(session_id,at,total_tokens,input_tokens,output_tokens));CREATE INDEX IF NOT EXISTS session_token_usage_session_at ON session_token_usage(session_id,at);CREATE TABLE IF NOT EXISTS resume_markers(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),reason TEXT NOT NULL,resume_at TEXT,requested_at TEXT,created_at TEXT NOT NULL,status TEXT NOT NULL,status_detail TEXT,message TEXT);CREATE INDEX IF NOT EXISTS resume_markers_session_status ON resume_markers(session_id,status);CREATE UNIQUE INDEX IF NOT EXISTS resume_markers_active ON resume_markers(session_id) WHERE status IN ('pending','scheduled');CREATE TABLE IF NOT EXISTS compaction_requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL,prompt TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS compaction_requests_session_status ON compaction_requests(session_id,status);CREATE TABLE IF NOT EXISTS threshold_overrides(id TEXT PRIMARY KEY,scope_kind TEXT NOT NULL,provider TEXT NOT NULL,model_value TEXT,session_value TEXT,field TEXT NOT NULL,value_json TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS threshold_overrides_key ON threshold_overrides(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field);CREATE TABLE IF NOT EXISTS idle_reseed_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,source_model TEXT NOT NULL,summary_text TEXT NOT NULL,token_count_before INTEGER NOT NULL,token_count_after INTEGER NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS keepalive_config(session_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL,last_ping_at TEXT,ping_day TEXT,ping_count INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS hook_messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,text TEXT NOT NULL,created_at TEXT NOT NULL,delivered_at TEXT);CREATE INDEX IF NOT EXISTS hook_messages_delivery ON hook_messages(session_id,event,delivered_at,created_at);CREATE TABLE IF NOT EXISTS hook_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,created_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS hook_events_session_created ON hook_events(session_id,created_at);CREATE TABLE IF NOT EXISTS provider_fetch_status(provider TEXT NOT NULL,account TEXT,last_attempt_at TEXT NOT NULL,last_success_at TEXT,last_error TEXT,consecutive_failures INTEGER NOT NULL DEFAULT 0,non_blocking INTEGER NOT NULL DEFAULT 0);CREATE UNIQUE INDEX IF NOT EXISTS provider_fetch_status_key ON provider_fetch_status(provider,COALESCE(account,''));CREATE TABLE IF NOT EXISTS compaction_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),source TEXT NOT NULL,trigger TEXT,context_pct_before REAL,usage_window_pct_before REAL,tokens_before INTEGER,tokens_after INTEGER,started_at TEXT NOT NULL,completed_at TEXT);CREATE INDEX IF NOT EXISTS compaction_events_session_started ON compaction_events(session_id,started_at);CREATE INDEX IF NOT EXISTS compaction_events_started ON compaction_events(started_at);"#;
+const SCHEMA: &str = r#"PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS usage_samples(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,account TEXT,window_kind TEXT NOT NULL,window_scope_value TEXT NOT NULL,pct REAL NOT NULL,resets_at TEXT,exceeded INTEGER NOT NULL,active INTEGER NOT NULL,source TEXT NOT NULL,at TEXT NOT NULL,fetched_at TEXT,credits_json TEXT,plan TEXT);CREATE INDEX IF NOT EXISTS usage_samples_window_at ON usage_samples(provider,window_kind,window_scope_value,at);CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,harness TEXT NOT NULL,model TEXT,account TEXT,cwd TEXT NOT NULL,state_path TEXT,context_window_size INTEGER,last_known_token_count INTEGER,launch_mode TEXT NOT NULL,pid INTEGER,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,stopped_reason TEXT,stopped_window_kind TEXT,superseded_by TEXT,reseeded_from TEXT,title TEXT,superseded_stop_reason TEXT,superseded_stop_reason_at TEXT,superseded_stop_reason_note TEXT,lineage_json TEXT,last_known_context_pct REAL);CREATE TABLE IF NOT EXISTS session_token_usage(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),at TEXT NOT NULL,model TEXT,input_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_write_input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,context_pct REAL,UNIQUE(session_id,at,total_tokens,input_tokens,output_tokens));CREATE INDEX IF NOT EXISTS session_token_usage_session_at ON session_token_usage(session_id,at);CREATE TABLE IF NOT EXISTS resume_markers(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),reason TEXT NOT NULL,resume_at TEXT,requested_at TEXT,created_at TEXT NOT NULL,status TEXT NOT NULL,status_detail TEXT,message TEXT,preempt INTEGER NOT NULL DEFAULT 1);CREATE INDEX IF NOT EXISTS resume_markers_session_status ON resume_markers(session_id,status);CREATE UNIQUE INDEX IF NOT EXISTS resume_markers_active ON resume_markers(session_id) WHERE status IN ('pending','scheduled');CREATE TABLE IF NOT EXISTS compaction_requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL,prompt TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS compaction_requests_session_status ON compaction_requests(session_id,status);CREATE TABLE IF NOT EXISTS threshold_overrides(id TEXT PRIMARY KEY,scope_kind TEXT NOT NULL,provider TEXT NOT NULL,model_value TEXT,session_value TEXT,field TEXT NOT NULL,value_json TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS threshold_overrides_key ON threshold_overrides(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field);CREATE TABLE IF NOT EXISTS idle_reseed_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,source_model TEXT NOT NULL,summary_text TEXT NOT NULL,token_count_before INTEGER NOT NULL,token_count_after INTEGER NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS keepalive_config(session_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL,last_ping_at TEXT,ping_day TEXT,ping_count INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS hook_messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,text TEXT NOT NULL,created_at TEXT NOT NULL,delivered_at TEXT);CREATE INDEX IF NOT EXISTS hook_messages_delivery ON hook_messages(session_id,event,delivered_at,created_at);CREATE TABLE IF NOT EXISTS hook_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,created_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS hook_events_session_created ON hook_events(session_id,created_at);CREATE TABLE IF NOT EXISTS provider_fetch_status(provider TEXT NOT NULL,account TEXT,last_attempt_at TEXT NOT NULL,last_success_at TEXT,last_error TEXT,consecutive_failures INTEGER NOT NULL DEFAULT 0,non_blocking INTEGER NOT NULL DEFAULT 0);CREATE UNIQUE INDEX IF NOT EXISTS provider_fetch_status_key ON provider_fetch_status(provider,COALESCE(account,''));CREATE TABLE IF NOT EXISTS compaction_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),source TEXT NOT NULL,trigger TEXT,context_pct_before REAL,usage_window_pct_before REAL,tokens_before INTEGER,tokens_after INTEGER,started_at TEXT NOT NULL,completed_at TEXT);CREATE INDEX IF NOT EXISTS compaction_events_session_started ON compaction_events(session_id,started_at);CREATE INDEX IF NOT EXISTS compaction_events_started ON compaction_events(started_at);"#;
 
 #[cfg(test)]
 mod tests {
@@ -1303,6 +1365,7 @@ mod tests {
             state_path: None,
             context_window_size: None,
             last_known_token_count: None,
+            last_known_context_pct: None,
             launch_mode: LaunchMode::Headless,
             pid: None,
             stopped_reason: None,
@@ -1671,6 +1734,7 @@ mod tests {
                     output_tokens: 0,
                     reasoning_output_tokens: 0,
                     total_tokens: 10,
+                    context_pct: None,
                 }],
             )
             .unwrap();
@@ -1737,6 +1801,7 @@ mod tests {
             output_tokens: 200,
             reasoning_output_tokens: 75,
             total_tokens: 1200,
+            context_pct: None,
         }];
 
         s.insert_token_usage_records(&sid, &records).unwrap();
@@ -1758,6 +1823,7 @@ mod tests {
             created_at: Utc::now(),
             status: ResumeStatus::Pending,
             message: None,
+            preempt: true,
         };
         s.insert_resume_marker(&m).unwrap();
         assert!(
@@ -1792,6 +1858,7 @@ mod tests {
             created_at: Utc::now(),
             status: ResumeStatus::Scheduled,
             message: None,
+            preempt: true,
         };
         s.insert_resume_marker(&marker).unwrap();
         assert!(s.claim_resume_marker(marker.id).unwrap());
@@ -1816,6 +1883,7 @@ mod tests {
             created_at: Utc::now(),
             status: ResumeStatus::Pending,
             message: None,
+            preempt: true,
         };
         s.insert_resume_marker(&marker).unwrap();
         assert_eq!(s.active_resume_marker(&sid).unwrap().unwrap().id, marker.id);
@@ -1912,6 +1980,7 @@ mod tests {
             created_at: Utc::now(),
             status: ResumeStatus::Pending,
             message: None,
+            preempt: true,
         })
         .unwrap();
         s.insert_compaction_request(&CompactionRequest {
@@ -1921,6 +1990,7 @@ mod tests {
             prompt: "p".into(),
             reason: "r".into(),
             resume_after_compaction: false,
+            preempt: true,
             status: CompactionStatus::Pending,
             created_at: Utc::now(),
         })
@@ -1954,6 +2024,7 @@ mod tests {
                 prompt: "compact".into(),
                 reason: "test".into(),
                 resume_after_compaction: false,
+                preempt: true,
                 status: CompactionStatus::Pending,
                 created_at: Utc::now(),
             })
@@ -1990,6 +2061,7 @@ mod tests {
             prompt: "compact".into(),
             reason: "test".into(),
             resume_after_compaction: false,
+            preempt: true,
             status: CompactionStatus::Pending,
             created_at: Utc::now(),
         })
@@ -2030,6 +2102,7 @@ mod tests {
                     prompt: "compact".into(),
                     reason: "hard quota boundary".into(),
                     resume_after_compaction: true,
+                    preempt: true,
                     status: CompactionStatus::Failed("provider rejected compaction".into()),
                     created_at: Utc::now(),
                 })
@@ -2044,6 +2117,7 @@ mod tests {
                     created_at: Utc::now(),
                     status: ResumeStatus::Scheduled,
                     message: None,
+                    preempt: true,
                 })
                 .unwrap();
             store.cancel_resume_markers(&sid).unwrap();
@@ -2377,6 +2451,7 @@ mod tests {
                 output_tokens: 1,
                 reasoning_output_tokens: 0,
                 total_tokens: 2,
+                context_pct: None,
             }],
         )
         .unwrap();

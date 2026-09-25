@@ -8,7 +8,11 @@ use std::collections::HashMap;
 pub const CACHE_WARM_APPROXIMATION_MINUTES: i64 = 5;
 
 pub fn is_cache_warm(last_seen: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-    is_cache_warm_for(last_seen, now, Duration::minutes(CACHE_WARM_APPROXIMATION_MINUTES))
+    is_cache_warm_for(
+        last_seen,
+        now,
+        Duration::minutes(CACHE_WARM_APPROXIMATION_MINUTES),
+    )
 }
 
 pub fn is_cache_warm_for(last_seen: DateTime<Utc>, now: DateTime<Utc>, ttl: Duration) -> bool {
@@ -25,7 +29,7 @@ pub fn session_has_recent_token_activity(
 ) -> bool {
     records.iter().any(|record| {
         record.at >= now - Duration::minutes(SESSION_ACTIVE_TOKEN_LOOKBACK_MINUTES)
-            && record.total_tokens > 0
+            && (record.total_tokens > 0 || record.context_pct.is_some_and(|pct| pct > 0.0))
     })
 }
 
@@ -213,7 +217,7 @@ impl SessionLineage {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: SessionId,
     #[serde(default)]
@@ -227,6 +231,10 @@ pub struct SessionSummary {
     pub state_path: Option<String>,
     pub context_window_size: Option<u64>,
     pub last_known_token_count: Option<u64>,
+    /// Context fill as a percentage, for harnesses (e.g. Cursor) that report
+    /// how full the context is without exposing token counts or a window size.
+    #[serde(default)]
+    pub last_known_context_pct: Option<f32>,
     pub launch_mode: LaunchMode,
     pub pid: Option<u32>,
     pub stopped_reason: Option<StopReason>,
@@ -254,6 +262,10 @@ pub enum StopReason {
     Crashed,
     Unknown,
 }
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeMarker {
     pub id: Uuid,
@@ -271,6 +283,10 @@ pub struct ResumeMarker {
     pub created_at: DateTime<Utc>,
     pub status: ResumeStatus,
     pub message: Option<String>,
+    /// When true (default), the preempt-resume tick may pull this marker
+    /// earlier onto expiring window budget. Older JSON / DB rows omit it → true.
+    #[serde(default = "default_true")]
+    pub preempt: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResumeReason {
@@ -294,6 +310,10 @@ pub struct CompactionRequest {
     pub reason: String,
     #[serde(default)]
     pub resume_after_compaction: bool,
+    /// Carried onto the resume marker queued after verified compaction.
+    /// Older JSON / DB rows omit it → true.
+    #[serde(default = "default_true")]
+    pub preempt: bool,
     pub status: CompactionStatus,
     pub created_at: DateTime<Utc>,
 }
@@ -318,10 +338,18 @@ pub struct IdleCompactConfig {
     pub margin: Duration,
     #[serde(default = "default_unknown_context_token_threshold")]
     pub unknown_context_token_threshold: u64,
+    /// Context-fill percentage at which a harness that reports no token counts
+    /// becomes eligible for opportunistic idle compaction.
+    #[serde(default = "default_percent_threshold_pct")]
+    pub percent_threshold_pct: f32,
 }
 
 fn default_unknown_context_token_threshold() -> u64 {
     150_000
+}
+
+fn default_percent_threshold_pct() -> f32 {
+    65.0
 }
 
 impl Default for IdleCompactConfig {
@@ -330,6 +358,7 @@ impl Default for IdleCompactConfig {
             tiers: Vec::new(),
             margin: Duration::zero(),
             unknown_context_token_threshold: default_unknown_context_token_threshold(),
+            percent_threshold_pct: default_percent_threshold_pct(),
         }
     }
 }
@@ -421,6 +450,7 @@ impl Default for ThresholdProfile {
                 // lands inside a 5m warm window (~4–4.5m), not after expiry.
                 margin: Duration::minutes(2),
                 unknown_context_token_threshold: 150_000,
+                percent_threshold_pct: default_percent_threshold_pct(),
             },
             reseed_auto: Default::default(),
             keepalive: None,
@@ -538,6 +568,7 @@ mod tests {
             state_path: None,
             context_window_size: Some(200_000),
             last_known_token_count: Some(100),
+            last_known_context_pct: None,
             launch_mode: LaunchMode::Headless,
             pid: None,
             stopped_reason: None,
@@ -573,6 +604,7 @@ mod tests {
             state_path: None,
             context_window_size: None,
             last_known_token_count: None,
+            last_known_context_pct: None,
             launch_mode: LaunchMode::Headless,
             pid: None,
             stopped_reason: None,
@@ -662,6 +694,7 @@ mod tests {
             state_path: None,
             context_window_size: None,
             last_known_token_count: None,
+            last_known_context_pct: None,
             launch_mode: LaunchMode::Interactive,
             pid: None,
             stopped_reason: None,
@@ -681,6 +714,7 @@ mod tests {
             output_tokens: 5,
             reasoning_output_tokens: 0,
             total_tokens: 15,
+            context_pct: None,
         }];
         assert!(is_keepalive_eligible(&session, &recent, now));
         session.last_seen = now - Duration::minutes(10);

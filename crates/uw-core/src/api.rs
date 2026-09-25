@@ -110,11 +110,18 @@ pub struct ResumeControls {
     pub can_resume: bool,
     pub marker: Option<ResumeMarker>,
 }
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeRequest {
     pub session_id: SessionId,
     pub at: Option<DateTime<Utc>>,
     pub message: Option<String>,
+    /// Allow window-reset preempt for the queued marker. Omit → true.
+    #[serde(default = "default_true")]
+    pub preempt: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeResponse {
@@ -130,6 +137,10 @@ pub struct CompactAskRequest {
     pub reason: Option<String>,
     #[serde(default)]
     pub resume_after_compaction: bool,
+    /// When `resume_after_compaction` is set, carried onto the queued resume
+    /// marker. Omit → true.
+    #[serde(default = "default_true")]
+    pub preempt: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CancelCompactRequest {
@@ -259,6 +270,7 @@ mod tests {
                 state_path: None,
                 context_window_size: None,
                 last_known_token_count: None,
+                last_known_context_pct: None,
                 launch_mode: LaunchMode::Headless,
                 pid: None,
                 stopped_reason: None,
@@ -290,6 +302,7 @@ mod tests {
             session_id: SessionId("s".into()),
             at: None,
             message: None,
+            preempt: true,
         });
         round_trip(ResumeResponse { marker: None });
         round_trip(CancelResumeRequest {
@@ -299,7 +312,14 @@ mod tests {
             session_id: SessionId("s".into()),
             reason: Some("r".into()),
             resume_after_compaction: true,
+            preempt: false,
         });
+        let omitted: ResumeRequest =
+            serde_json::from_str(r#"{"session_id":"s"}"#).expect("omit preempt");
+        assert!(omitted.preempt);
+        let omitted_ask: CompactAskRequest =
+            serde_json::from_str(r#"{"session_id":"s"}"#).expect("omit preempt");
+        assert!(omitted_ask.preempt);
         round_trip(CancelCompactRequest {
             session_id: SessionId("s".into()),
         });

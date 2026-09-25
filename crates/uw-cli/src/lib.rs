@@ -26,6 +26,10 @@ pub enum Command {
         at: Option<DateTime<Utc>>,
         #[arg(long)]
         message: Option<String>,
+        /// Allow window-reset preempt (default: true).
+        #[arg(long = "preempt", default_value_t = true, action = clap::ArgAction::SetTrue)]
+        #[arg(long = "no-preempt", action = clap::ArgAction::SetFalse, overrides_with = "preempt")]
+        preempt: bool,
         #[command(subcommand)]
         command: Option<ResumeCommand>,
     },
@@ -239,27 +243,33 @@ pub fn execute<A: ApiClient, D: DirectReader>(
         } => serde_json::to_value(client.api.supersede_stop(&session_id, note)?)?,
         Command::Provider {
             command: ProviderCommand::MarkNonBlocking { provider, account },
-        } => client.api.set_provider_non_blocking(SetFetchNonBlockingRequest {
-            provider,
-            account,
-            non_blocking: true,
-        })?,
+        } => client
+            .api
+            .set_provider_non_blocking(SetFetchNonBlockingRequest {
+                provider,
+                account,
+                non_blocking: true,
+            })?,
         Command::Provider {
             command: ProviderCommand::MarkBlocking { provider, account },
-        } => client.api.set_provider_non_blocking(SetFetchNonBlockingRequest {
-            provider,
-            account,
-            non_blocking: false,
-        })?,
+        } => client
+            .api
+            .set_provider_non_blocking(SetFetchNonBlockingRequest {
+                provider,
+                account,
+                non_blocking: false,
+            })?,
         Command::Resume {
             session_id: Some(session_id),
             at,
             message,
+            preempt,
             command: None,
         } => serde_json::to_value(client.api.resume(ResumeRequest {
             session_id,
             at,
             message,
+            preempt,
         })?)?,
         Command::Resume {
             command: Some(ResumeCommand::Cancel { session_id }),
@@ -277,15 +287,12 @@ pub fn execute<A: ApiClient, D: DirectReader>(
         }
         Command::Compact {
             command: CompactCommand::Ask { session_id, reason },
-        } => serde_json::to_value(
-            client
-                .api
-                .compact_ask(CompactAskRequest {
-                    session_id,
-                    reason,
-                    resume_after_compaction: false,
-                })?,
-        )?,
+        } => serde_json::to_value(client.api.compact_ask(CompactAskRequest {
+            session_id,
+            reason,
+            resume_after_compaction: false,
+            preempt: true,
+        })?)?,
         Command::Compact {
             command: CompactCommand::Cancel { session_id },
         } => {
@@ -760,7 +767,8 @@ mod tests {
             Ok(CompactStatusResponse { requests: vec![] })
         }
         fn cancel_compact(&mut self, r: CancelCompactRequest) -> Result<()> {
-            self.calls.push(format!("compact-cancel:{}", r.session_id.0));
+            self.calls
+                .push(format!("compact-cancel:{}", r.session_id.0));
             Ok(())
         }
         fn compact_status(&mut self, _: &SessionId) -> Result<CompactStatusResponse> {
@@ -842,8 +850,15 @@ mod tests {
     #[test]
     fn clap_parses_documented_command_shapes() {
         assert!(
-            matches!(Cli::try_parse_from(["uw", "resume", "s", "--at", "2026-01-01T00:00:00Z"]), Ok(Cli { command: Command::Resume { session_id: Some(SessionId(id)), command: None, .. }, .. }) if id == "s")
+            matches!(Cli::try_parse_from(["uw", "resume", "s", "--at", "2026-01-01T00:00:00Z"]), Ok(Cli { command: Command::Resume { session_id: Some(SessionId(id)), command: None, preempt: true, .. }, .. }) if id == "s")
         );
+        assert!(matches!(
+            Cli::try_parse_from(["uw", "resume", "s", "--no-preempt"]),
+            Ok(Cli {
+                command: Command::Resume { preempt: false, .. },
+                ..
+            })
+        ));
         assert!(Cli::try_parse_from(["uw", "resume", "cancel", "s", "--json"]).is_ok());
         assert!(
             Cli::try_parse_from(["uw", "compact", "ask", "s", "--reason", "why", "--json"]).is_ok()

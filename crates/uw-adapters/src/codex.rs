@@ -782,6 +782,7 @@ fn scan_rollout(path: &std::path::Path) -> Option<DiscoveredSession> {
                         .and_then(Value::as_u64)
                         .unwrap_or_default(),
                     total_tokens,
+                    context_pct: None,
                 };
                 last_known_token_count = Some(total_tokens);
                 token_usage.push(token_usage_record);
@@ -796,6 +797,7 @@ fn scan_rollout(path: &std::path::Path) -> Option<DiscoveredSession> {
         model,
         context_window_size,
         last_known_token_count,
+        last_known_context_pct: None,
         first_seen,
         last_seen,
         state_path: Some(path.to_string_lossy().into_owned()),
@@ -1210,6 +1212,7 @@ done
                     state_path: None,
                     context_window_size: None,
                     last_known_token_count: None,
+                    last_known_context_pct: None,
                     launch_mode: LaunchMode::Headless,
                     pid: None,
                     stopped_reason: None,
@@ -1288,6 +1291,7 @@ done
             prompt: String::new(),
             reason: String::new(),
             resume_after_compaction: false,
+            preempt: true,
             status: CompactionStatus::Pending,
             created_at: chrono::Utc::now(),
         }
@@ -1359,6 +1363,7 @@ done
             state_path: None,
             context_window_size: None,
             last_known_token_count: None,
+            last_known_context_pct: None,
             launch_mode: LaunchMode::Headless,
             pid: None,
             stopped_reason: None,
@@ -1494,6 +1499,7 @@ done
                 output_tokens: 1862,
                 reasoning_output_tokens: 321,
                 total_tokens: 14362,
+                context_pct: None,
             }]
         );
         assert_eq!(
@@ -1587,6 +1593,7 @@ done
                 output_tokens: 0,
                 reasoning_output_tokens: 0,
                 total_tokens: 22,
+                context_pct: None,
             }],
             "a growing rollout must emit only records beyond the saved byte offset"
         );
@@ -1633,6 +1640,7 @@ done
             state_path: None,
             context_window_size: None,
             last_known_token_count: None,
+            last_known_context_pct: None,
             launch_mode: LaunchMode::Interactive,
             pid: None,
             stopped_reason: None,

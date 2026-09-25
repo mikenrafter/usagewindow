@@ -290,6 +290,15 @@ pub trait DaemonStore: Send + Sync {
     async fn defer_resume(&self, _id: uuid::Uuid, _resume_at: DateTime<Utc>) -> anyhow::Result<()> {
         Ok(())
     }
+    /// Pulls an active marker's fire time earlier for a preempt resume. The
+    /// default is a no-op so lightweight fakes stay valid.
+    async fn pull_resume_earlier(
+        &self,
+        _id: uuid::Uuid,
+        _resume_at: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
     async fn claim_resume_marker(&self, _id: uuid::Uuid) -> anyhow::Result<bool> {
         Ok(false)
     }
@@ -320,6 +329,11 @@ pub trait DaemonStore: Send + Sync {
     }
     async fn mark_compaction_resume_queued(&self, _id: uuid::Uuid) -> anyhow::Result<()> {
         Ok(())
+    }
+    /// Sessions considered for a preempt-resume tick. Default empty so lightweight
+    /// fakes stay valid; SqliteDaemonStore returns every tracked session.
+    async fn sessions_for_preempt(&self) -> anyhow::Result<Vec<SessionSummary>> {
+        Ok(Vec::new())
     }
 }
 
@@ -538,6 +552,14 @@ impl DaemonStore for SqliteDaemonStore {
         self.blocking(move |s| Ok(s.defer_resume_marker(id, resume_at)?))
             .await
     }
+    async fn pull_resume_earlier(
+        &self,
+        id: uuid::Uuid,
+        resume_at: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        self.blocking(move |s| Ok(s.pull_resume_earlier(id, resume_at)?))
+            .await
+    }
     async fn resume_owner(&self, id: &SessionId) -> anyhow::Result<SessionSummary> {
         let id = id.clone();
         self.blocking(move |s| Ok(s.read_session(&id)?)).await
@@ -573,6 +595,9 @@ impl DaemonStore for SqliteDaemonStore {
     async fn mark_compaction_resume_queued(&self, id: uuid::Uuid) -> anyhow::Result<()> {
         self.blocking(move |s| Ok(s.mark_compaction_resume_queued(id)?))
             .await
+    }
+    async fn sessions_for_preempt(&self) -> anyhow::Result<Vec<SessionSummary>> {
+        self.blocking(|store| Ok(store.list_sessions()?)).await
     }
 }
 
@@ -683,6 +708,7 @@ impl ObservationStore for SqliteDaemonStore {
                 state_path: found.state_path,
                 context_window_size: found.context_window_size,
                 last_known_token_count: found.last_known_token_count,
+                last_known_context_pct: found.last_known_context_pct,
                 launch_mode: LaunchMode::Interactive,
                 pid: None,
                 stopped_reason: None,
@@ -825,11 +851,7 @@ pub async fn run_observation_tick(
                         .is_some_and(|state| !state.exceeded && state.pct < 100.0)
                 {
                     store
-                        .supersede_stop(
-                            &session.id,
-                            Some("provider window recovered"),
-                            Utc::now(),
-                        )
+                        .supersede_stop(&session.id, Some("provider window recovered"), Utc::now())
                         .await?;
                 }
             }
@@ -920,6 +942,7 @@ pub async fn run_reseed(
             state_path: None,
             context_window_size: None,
             last_known_token_count: None,
+            last_known_context_pct: None,
             launch_mode: LaunchMode::Headless,
             pid: None,
             stopped_reason: None,
@@ -1021,6 +1044,7 @@ where
             prompt: String::new(),
             reason: "automatic idle reseed".into(),
             resume_after_compaction: false,
+            preempt: true,
             status: CompactionStatus::Pending,
             created_at: now,
         };
@@ -1082,23 +1106,18 @@ fn t3_timestamp(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-fn verified_resume_requested_compaction(
-    requests: &[CompactionRequest],
+fn verified_resume_requested_compaction<'a>(
+    requests: &'a [CompactionRequest],
     events: &[CompactionEvent],
-) -> Option<uuid::Uuid> {
-    requests.iter().find_map(|request| {
-        if request.resume_after_compaction
+) -> Option<&'a CompactionRequest> {
+    requests.iter().find(|request| {
+        request.resume_after_compaction
             && matches!(request.status, CompactionStatus::Sent)
             && events.iter().any(|event| {
                 event.completed_at.is_some()
                     && event.started_at >= request.created_at
                     && event.session_id == request.session_id
             })
-        {
-            Some(request.id)
-        } else {
-            None
-        }
     })
 }
 
@@ -1619,7 +1638,7 @@ pub async fn run_policy_tick(
         }
         let compactions = store.compaction_requests_for_session(&session.id).await?;
         let events = store.compaction_events_for_session(&session.id).await?;
-        if let Some(compaction_id) = verified_resume_requested_compaction(&compactions, &events)
+        if let Some(compaction) = verified_resume_requested_compaction(&compactions, &events)
             && store.active_resume_marker(&session.id).await?.is_none()
         {
             store
@@ -1632,9 +1651,10 @@ pub async fn run_policy_tick(
                     created_at: now,
                     status: ResumeStatus::Pending,
                     message: Some("resume after requested compaction".into()),
+                    preempt: compaction.preempt,
                 })
                 .await?;
-            store.mark_compaction_resume_queued(compaction_id).await?;
+            store.mark_compaction_resume_queued(compaction.id).await?;
         }
         let resume = store.active_resume_marker(&session.id).await?;
         sync_t3_external_status(
@@ -1671,17 +1691,13 @@ impl IdleEpisodeTracker {
             self.enqueued.remove(&session.id);
             return Ok(false);
         }
-        let Some(tokens) = session.last_known_token_count else {
-            return Ok(false);
-        };
-        let Some(window) = session.context_window_size else {
-            return Ok(false);
-        };
+        let tokens = session.last_known_token_count.unwrap_or(0);
         let should = uw_policy::should_idle_compact(
             now - session.last_seen,
             cache_ttl,
             tokens,
-            Some(window),
+            session.context_window_size,
+            session.last_known_context_pct,
             &profile.idle_compact,
             &adapter.capabilities(),
         );
@@ -1694,6 +1710,7 @@ impl IdleEpisodeTracker {
                     prompt: uw_core::compaction::instruction_body("idle cache expiry"),
                     reason: "idle cache expiry".into(),
                     resume_after_compaction: false,
+                    preempt: true,
                     status: CompactionStatus::Pending,
                     created_at: Utc::now(),
                 })
@@ -1786,6 +1803,7 @@ async fn handle_hard_boundary(
                     prompt: uw_core::compaction::instruction_body(HARD_BOUNDARY_REASON),
                     reason: HARD_BOUNDARY_REASON.into(),
                     resume_after_compaction: true,
+                    preempt: true,
                     status: CompactionStatus::Pending,
                     created_at: now,
                 })
@@ -2039,7 +2057,170 @@ fn plan_resume_marker_with_burn(
         created_at: now,
         status: ResumeStatus::Scheduled,
         message: None,
+        preempt: true,
     })
+}
+
+/// Spends a window's last few minutes of budget on sessions that are otherwise
+/// parked until it resets, pulling one or two of them forward. The advisory,
+/// keepalive and plan-pressure thresholds do not gate this: the remaining
+/// budget expires at the reset either way. Returns how many resumes moved.
+pub async fn run_preempt_resume_tick(
+    store: &dyn DaemonStore,
+    sessions: &[SessionSummary],
+    now: DateTime<Utc>,
+    profile: &ThresholdProfile,
+) -> anyhow::Result<usize> {
+    let mut token_rates = HashMap::new();
+    let mut token_records = HashMap::new();
+    for session in sessions {
+        let burn_lookback = uw_policy::burn_rate_lookback(&session.harness);
+        let records = store.token_usage(&session.id).await?;
+        token_records.insert(session.id.clone(), records.clone());
+        if let Some(rate) = uw_policy::weighted_token_rate_per_minute(
+            &records,
+            now,
+            burn_lookback,
+            Duration::minutes(5),
+            1.2,
+            1.0,
+        ) {
+            token_rates.insert(session.id.clone(), rate);
+        }
+    }
+
+    let mut seen_windows = HashSet::new();
+    let mut moved = 0usize;
+    for session in sessions {
+        let samples = store.usage_samples(session).await?;
+        let mut keys = HashSet::new();
+        for sample in &samples {
+            keys.extend(sample.windows.keys().cloned());
+        }
+        for key in keys {
+            let window_id = (key.clone(), session.account.clone());
+            if !seen_windows.insert(window_id) {
+                continue;
+            }
+            let blocks = uw_policy::segment_blocks(&samples, &key, session.account.as_ref());
+            let Some(block) = blocks.last() else {
+                continue;
+            };
+            let Some(resets_at) = block.resets_at else {
+                continue;
+            };
+            if resets_at <= now {
+                continue;
+            }
+            let lead_minutes = (resets_at - now).num_milliseconds() as f32 / 60_000.0;
+            if lead_minutes > uw_policy::PREEMPT_MAX_LEAD_MINUTES {
+                continue;
+            }
+            let Some((_, pct)) = block.points.last() else {
+                continue;
+            };
+            let remaining_pct = 100.0 - *pct;
+
+            let peers: Vec<&SessionSummary> = sessions
+                .iter()
+                .filter(|peer| peer.harness == session.harness && peer.account == session.account)
+                .collect();
+            let mut candidates = Vec::new();
+            let mut context_samples = Vec::new();
+            let mut plan_samples = Vec::new();
+            for sample in &samples {
+                if sample.account != session.account {
+                    continue;
+                }
+                if let Some(window) = sample.windows.get(&key) {
+                    plan_samples.push(uw_policy::PlanUsageSample {
+                        at: sample.at,
+                        pct: window.pct,
+                    });
+                }
+            }
+            for peer in &peers {
+                let Some(marker) = store.active_resume_marker(&peer.id).await? else {
+                    continue;
+                };
+                if !marker.preempt {
+                    continue;
+                }
+                let Some(resume_at) = marker.resume_at else {
+                    continue;
+                };
+                let Some(burn_pct_per_minute) =
+                    scaled_token_burn_rate(block, peer, sessions, &token_rates)
+                else {
+                    continue;
+                };
+                if let Some(records) = token_records.get(&peer.id) {
+                    for record in records {
+                        context_samples.push(uw_policy::ContextSizeSample {
+                            at: record.at,
+                            context_tokens: peer
+                                .last_known_token_count
+                                .unwrap_or(record.total_tokens),
+                        });
+                    }
+                }
+                candidates.push(uw_policy::PreemptCandidate {
+                    session_id: peer.id.clone(),
+                    resume_at,
+                    burn_pct_per_minute: burn_pct_per_minute as f32,
+                    context_tokens: peer.last_known_token_count.unwrap_or(0),
+                });
+            }
+            if candidates.is_empty() {
+                continue;
+            }
+
+            let cache_write_pct_per_1k =
+                uw_policy::learned_cache_write_pct_per_1k_context(&context_samples, &plan_samples)
+                    .unwrap_or_else(|| {
+                        let tokens = candidates
+                            .iter()
+                            .map(|candidate| candidate.context_tokens)
+                            .max()
+                            .unwrap_or(0)
+                            .max(1);
+                        let model = peers
+                            .iter()
+                            .find_map(|peer| peer.model.as_ref().map(|model| model.0.as_str()))
+                            .unwrap_or("");
+                        let estimate =
+                            uw_policy::estimate_cache_write_pct(tokens, model, profile, &[]);
+                        estimate / (tokens as f32 / 1_000.0)
+                    });
+
+            let selected = uw_policy::select_preempt_resumes(
+                &candidates,
+                remaining_pct,
+                resets_at,
+                now,
+                cache_write_pct_per_1k,
+            );
+            for selection in selected {
+                let Some(marker) = store.active_resume_marker(&selection.session_id).await? else {
+                    continue;
+                };
+                if store
+                    .pull_resume_earlier(marker.id, selection.resume_at)
+                    .await?
+                {
+                    tracing::info!(
+                        session = %selection.session_id.0,
+                        resume_at = %selection.resume_at,
+                        lead_minutes = selection.lead_minutes,
+                        estimated_cost_pct = selection.estimated_cost_pct,
+                        "preempting resume onto expiring window budget"
+                    );
+                    moved += 1;
+                }
+            }
+        }
+    }
+    Ok(moved)
 }
 
 pub async fn run_resume_tick(
@@ -2164,7 +2345,20 @@ pub async fn run_scheduling_ticks(
     loop {
         ticker.tick().await;
         run_compaction_tick(store, adapters, liveness).await?;
-        run_resume_tick(store, adapters, Utc::now()).await?;
+        let now = Utc::now();
+        let sessions = match store.sessions_for_preempt().await {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::error!(%error, "failed to load sessions for preempt tick");
+                Vec::new()
+            }
+        };
+        if let Err(error) =
+            run_preempt_resume_tick(store, &sessions, now, &ThresholdProfile::default()).await
+        {
+            tracing::error!(%error, "preempt resume tick failed");
+        }
+        run_resume_tick(store, adapters, now).await?;
     }
 }
 
@@ -2233,7 +2427,25 @@ pub async fn run_production_ticks(
             last_maintenance = now;
         }
         if now.duration_since(last_policy) < policy_interval {
-            if let Err(error) = run_resume_tick(store.as_ref(), adapters, Utc::now()).await {
+            let now = Utc::now();
+            let sessions = match store.sessions_for_preempt().await {
+                Ok(sessions) => sessions,
+                Err(error) => {
+                    tracing::error!(%error, "failed to load sessions for preempt tick");
+                    Vec::new()
+                }
+            };
+            if let Err(error) = run_preempt_resume_tick(
+                store.as_ref(),
+                &sessions,
+                now,
+                &ThresholdProfile::default(),
+            )
+            .await
+            {
+                tracing::error!(%error, "preempt resume tick failed");
+            }
+            if let Err(error) = run_resume_tick(store.as_ref(), adapters, now).await {
                 tracing::error!(%error, "resume tick failed");
             }
             continue;
@@ -2322,6 +2534,16 @@ pub async fn run_production_ticks(
             .await
         {
             tracing::error!(%error, "auto-reseed tick failed");
+        }
+        if let Err(error) = run_preempt_resume_tick(
+            store.as_ref(),
+            &sessions,
+            Utc::now(),
+            &ThresholdProfile::default(),
+        )
+        .await
+        {
+            tracing::error!(%error, "preempt resume tick failed");
         }
         if let Err(error) = run_resume_tick(store.as_ref(), adapters, Utc::now()).await {
             tracing::error!(%error, "resume tick failed");
@@ -2650,6 +2872,7 @@ mod tests {
             prompt: "p".into(),
             reason: "r".into(),
             resume_after_compaction: false,
+            preempt: true,
             status: CompactionStatus::Pending,
             created_at: Utc::now(),
         }
@@ -2679,6 +2902,7 @@ mod tests {
             created_at: Utc::now(),
             status: ResumeStatus::Scheduled,
             message: None,
+            preempt: true,
         };
         let status = resolve_t3_external_status(
             &[compact],
@@ -2709,6 +2933,7 @@ mod tests {
             created_at: Utc::now(),
             status: ResumeStatus::Scheduled,
             message: None,
+            preempt: true,
         };
         let scheduled =
             resolve_t3_external_status(&[], &[], Some(&marker), None, Utc::now(), Utc::now())
@@ -2792,7 +3017,8 @@ mod tests {
             verified_resume_requested_compaction(
                 std::slice::from_ref(&request),
                 std::slice::from_ref(&event),
-            ),
+            )
+            .map(|request| request.id),
             Some(request.id)
         );
     }
@@ -2814,6 +3040,7 @@ mod tests {
             created_at: now,
             status: ResumeStatus::Scheduled,
             message: None,
+            preempt: true,
         };
 
         let status = resolve_t3_external_status(&[], &[], Some(&marker), None, now, now).unwrap();
@@ -2834,6 +3061,7 @@ mod tests {
             state_path: None,
             context_window_size: Some(200_000),
             last_known_token_count: Some(150_000),
+            last_known_context_pct: None,
             launch_mode: LaunchMode::Headless,
             pid: None,
             stopped_reason: None,
@@ -3010,6 +3238,7 @@ mod tests {
             created_at: now,
             status: ResumeStatus::Pending,
             message: Some("continue".into()),
+            preempt: true,
         };
         let store = FakeStore {
             request: StdMutex::new(None),
@@ -4473,6 +4702,7 @@ mod tests {
             created_at: Utc::now(),
             status: ResumeStatus::Scheduled,
             message: None,
+            preempt: true,
         };
         let store = ResumeFake {
             active: Some(already_scheduled),
@@ -4572,6 +4802,7 @@ mod tests {
             created_at: now,
             status: ResumeStatus::Pending,
             message: Some("resume now please".into()),
+            preempt: true,
         };
         let store = ResumeFake {
             active: Some(too_early.clone()),
@@ -4647,6 +4878,7 @@ mod tests {
             created_at: Utc::now() - Duration::minutes(1),
             status: ResumeStatus::Scheduled,
             message: None,
+            preempt: true,
         };
         let store = Arc::new(ResumeFake {
             active: None,
@@ -4752,6 +4984,7 @@ mod tests {
             created_at: now - Duration::minutes(1),
             status: ResumeStatus::Scheduled,
             message: Some("continue through the owning harness".into()),
+            preempt: true,
         }
     }
 
@@ -5020,6 +5253,7 @@ mod tests {
                 output_tokens: 5,
                 reasoning_output_tokens: 0,
                 total_tokens: 15,
+                context_pct: None,
             }],
         )]);
         let mut profile = ThresholdProfile {
@@ -5292,6 +5526,7 @@ mod tests {
             output_tokens: 50,
             reasoning_output_tokens: 0,
             total_tokens: 150,
+            context_pct: None,
         }]
     }
 
@@ -5623,6 +5858,7 @@ mod tests {
                 prompt: "compact before reset".into(),
                 reason: "hard quota boundary".into(),
                 resume_after_compaction: true,
+                preempt: true,
                 status: CompactionStatus::Failed("delivery failed".into()),
                 created_at: now - Duration::minutes(2),
             })
@@ -5636,6 +5872,7 @@ mod tests {
             created_at: now - Duration::minutes(1),
             status: ResumeStatus::Scheduled,
             message: None,
+            preempt: true,
         };
         store.insert_resume_marker(&provisional).unwrap();
         let store = SqliteDaemonStore::new(store);
@@ -5800,6 +6037,7 @@ mod tests {
         assert_eq!(markers.len(), 1);
         assert_eq!(markers[0].reason, ResumeReason::AutoDetectedLimit);
         assert_eq!(markers[0].status, ResumeStatus::Scheduled);
+        assert!(markers[0].preempt);
     }
 
     #[tokio::test]

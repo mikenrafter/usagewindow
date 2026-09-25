@@ -70,7 +70,7 @@ pub enum DeliveryOutcome {
 /// usagewindow hasn't necessarily seen via a hook yet. Fields beyond `id`/`cwd` are
 /// best-effort: an adapter fills in whatever its on-disk record actually carries and
 /// leaves the rest `None` rather than guessing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DiscoveredSession {
     pub id: SessionId,
     #[serde(default)]
@@ -79,6 +79,10 @@ pub struct DiscoveredSession {
     pub model: Option<ModelId>,
     pub context_window_size: Option<u64>,
     pub last_known_token_count: Option<u64>,
+    /// Context fill as a percentage, for harnesses that report how full the
+    /// context is without exposing token counts or a window size.
+    #[serde(default)]
+    pub last_known_context_pct: Option<f32>,
     pub first_seen: Option<DateTime<Utc>>,
     pub last_seen: Option<DateTime<Utc>>,
     /// Path to the on-disk record backing this session, if any — lets later reads
@@ -94,7 +98,7 @@ pub struct DiscoveredSession {
 /// Token accounting emitted by a harness for one response. Cached input is a
 /// subset of input tokens; cache-write tokens are reported separately when the
 /// harness exposes them. `reasoning_output_tokens` is a subtype of output.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsageRecord {
     pub at: DateTime<Utc>,
     pub model: Option<ModelId>,
@@ -104,6 +108,10 @@ pub struct TokenUsageRecord {
     pub output_tokens: u64,
     pub reasoning_output_tokens: u64,
     pub total_tokens: u64,
+    /// Context fill as a percentage at this point in the session, for
+    /// harnesses that report a percentage instead of token counts.
+    #[serde(default)]
+    pub context_pct: Option<f32>,
 }
 /// One user- or assistant-authored turn, for a short "remind me what this session was
 /// about" preview — not a full transcript export.

@@ -78,6 +78,7 @@ fn session(id: SessionId) -> SessionSummary {
         state_path: None,
         context_window_size: None,
         last_known_token_count: None,
+        last_known_context_pct: None,
         launch_mode: LaunchMode::Headless,
         pid: None,
         stopped_reason: None,
@@ -140,6 +141,7 @@ async fn observation_and_claimed_resume_cross_the_sqlite_boundary() {
         created_at: now,
         status: ResumeStatus::Scheduled,
         message: Some("what's the state of the project? You have been resumed".into()),
+        preempt: true,
     };
     store.insert_resume_marker(marker.clone()).await.unwrap();
     run_resume_tick(store.as_ref(), &adapters, now)

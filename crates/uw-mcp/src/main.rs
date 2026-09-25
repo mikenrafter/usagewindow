@@ -21,10 +21,12 @@ use std::sync::Mutex;
 #[cfg(test)]
 use uw_core::adapter::HarnessAdapter;
 use uw_core::api::StatusResponse;
+#[cfg(not(test))]
+use uw_core::api::{
+    CompactAskRequest, CompactStatusResponse, ResumeRequest, ResumeResponse, SessionDetail,
+};
 #[cfg(test)]
 use uw_core::api::{ProviderUsageSummary, UsageWindowSummary};
-#[cfg(not(test))]
-use uw_core::api::{CompactAskRequest, CompactStatusResponse, SessionDetail};
 use uw_core::model::*;
 #[cfg(test)]
 use uw_store::Store;
@@ -65,7 +67,8 @@ fn tool_definitions() -> Value {
     json!({"tools":[
         {"name":"get_usage","description":"Read the latest usage-window state.","inputSchema":{"type":"object","properties":{"provider":{"type":"string"},"account":{"type":"string"}}}},
         {"name":"get_resume_state","description":"Read resume markers for the calling session, or a supplied session.","inputSchema":{"type":"object","properties":{"session_id":{"type":["string","null"]}}}},
-        {"name":"request_compaction","description":"Queue an agent-requested compaction for the calling session, or a supplied session, when its harness has a live message transport.","inputSchema":{"type":"object","properties":{"session_id":{"type":["string","null"]},"prompt":{"type":"string"},"reason":{"type":"string"},"resume_after_compaction":{"type":"boolean","description":"Ask usagewindow to queue a policy-scheduled resume after verified compaction."}}}}
+        {"name":"request_compaction","description":"Queue an agent-requested compaction for the calling session, or a supplied session, when its harness has a live message transport.","inputSchema":{"type":"object","properties":{"session_id":{"type":["string","null"]},"prompt":{"type":"string"},"reason":{"type":"string"},"resume_after_compaction":{"type":"boolean","description":"Ask usagewindow to queue a policy-scheduled resume after verified compaction."},"preempt":{"type":"boolean","description":"When resume_after_compaction is set, allow window-reset preempt on the queued resume (default true)."}}}},
+        {"name":"schedule_resume","description":"Queue a manual resume for the calling session, or a supplied session.","inputSchema":{"type":"object","properties":{"session_id":{"type":["string","null"]},"at":{"type":"string","description":"Optional ISO-8601 floor; resume will not fire earlier than this."},"message":{"type":"string"},"preempt":{"type":"boolean","description":"Allow window-reset preempt (default true)."}}}}
     ]})
 }
 
@@ -210,6 +213,7 @@ fn call_tool(
                     .get("resume_after_compaction")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                preempt: args.get("preempt").and_then(Value::as_bool).unwrap_or(true),
                 status: CompactionStatus::Pending,
                 created_at: Utc::now(),
             };
@@ -219,6 +223,45 @@ fn call_tool(
             Ok(tool_result(
                 json!({"supported":true,"queued":true,"request":request}),
             ))
+        }
+        "schedule_resume" => {
+            let session_id = session_id_argument(args, caller_session_id)?;
+            let at = args
+                .get("at")
+                .and_then(Value::as_str)
+                .map(|value| {
+                    value
+                        .parse::<chrono::DateTime<Utc>>()
+                        .map_err(|error| error.to_string())
+                })
+                .transpose()?;
+            let message = args
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let preempt = args.get("preempt").and_then(Value::as_bool).unwrap_or(true);
+            let store = deps
+                .store
+                .lock()
+                .map_err(|_| "store lock poisoned".to_string())?;
+            let marker = ResumeMarker {
+                id: uuid::Uuid::new_v4(),
+                session_id: session_id.clone(),
+                reason: ResumeReason::ManuallyMarked,
+                resume_at: None,
+                requested_at: at,
+                created_at: Utc::now(),
+                status: ResumeStatus::Pending,
+                message,
+                preempt,
+            };
+            store
+                .insert_resume_marker(&marker)
+                .map_err(|e| e.to_string())?;
+            Ok(tool_result(json!({
+                "session_id": session_id.0,
+                "marker": marker,
+            })))
         }
         _ => Err(format!("unknown tool: {name}")),
     }
@@ -249,7 +292,8 @@ fn get_usage(args: &Value, deps: &Deps) -> Result<Value, String> {
     if let Some(account) = account {
         request = request.query(&[("account", account)]);
     }
-    let status: StatusResponse = daemon_request(request.send().map_err(|error| error.to_string())?)?;
+    let status: StatusResponse =
+        daemon_request(request.send().map_err(|error| error.to_string())?)?;
     serde_json::to_value(status).map_err(|error| error.to_string())
 }
 
@@ -293,6 +337,7 @@ fn call_tool(
                     .get("resume_after_compaction")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                preempt: args.get("preempt").and_then(Value::as_bool).unwrap_or(true),
             };
             let status: CompactStatusResponse = daemon_request(
                 deps.client
@@ -308,6 +353,43 @@ fn call_tool(
                 "supported": true,
                 "queued": true,
                 "requests": status.requests
+            })))
+        }
+        "schedule_resume" => {
+            let session_id = session_id_argument(args, caller_session_id)?;
+            let at = args
+                .get("at")
+                .and_then(Value::as_str)
+                .map(|value| {
+                    value
+                        .parse::<chrono::DateTime<chrono::Utc>>()
+                        .map_err(|error| error.to_string())
+                })
+                .transpose()?;
+            let message = args
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let preempt = args.get("preempt").and_then(Value::as_bool).unwrap_or(true);
+            let request = ResumeRequest {
+                session_id: session_id.clone(),
+                at,
+                message,
+                preempt,
+            };
+            let response: ResumeResponse = daemon_request(
+                deps.client
+                    .post(format!(
+                        "{}/api/internal/sessions/{}/resume",
+                        deps.daemon_url, session_id.0
+                    ))
+                    .json(&request)
+                    .send()
+                    .map_err(|error| error.to_string())?,
+            )?;
+            Ok(tool_result(json!({
+                "session_id": session_id.0,
+                "marker": response.marker,
             })))
         }
         _ => Err(format!("unknown tool: {name}")),
@@ -747,6 +829,7 @@ mod tests {
             state_path: None,
             context_window_size: None,
             last_known_token_count: None,
+            last_known_context_pct: None,
             launch_mode: LaunchMode::Headless,
             pid: None,
             stopped_reason: None,
@@ -775,11 +858,68 @@ mod tests {
             &deps(),
         );
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 3);
-        for name in ["get_usage", "get_resume_state", "request_compaction"] {
+        assert_eq!(tools.len(), 4);
+        for name in [
+            "get_usage",
+            "get_resume_state",
+            "request_compaction",
+            "schedule_resume",
+        ] {
             let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
             assert_eq!(tool["inputSchema"]["type"], "object");
         }
+    }
+
+    #[test]
+    fn schedule_resume_defaults_preempt_true_and_accepts_false() {
+        let deps = deps();
+        deps.store
+            .lock()
+            .unwrap()
+            .insert_session(&SessionSummary {
+                id: SessionId("resume-session".into()),
+                lineage: SessionLineage::default(),
+                harness: Provider::ClaudeCode,
+                model: None,
+                account: None,
+                first_seen: Utc::now(),
+                last_seen: Utc::now(),
+                cwd: "/tmp".into(),
+                state_path: None,
+                context_window_size: None,
+                last_known_token_count: None,
+                last_known_context_pct: None,
+                launch_mode: LaunchMode::Headless,
+                pid: None,
+                stopped_reason: None,
+                superseded_stop_reason: None,
+                superseded_stop_reason_at: None,
+                superseded_stop_reason_note: None,
+                resume_marker: None,
+                superseded_by: None,
+                reseeded_from: None,
+            })
+            .unwrap();
+        let defaulted = handle_request(
+            json!({"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"schedule_resume","arguments":{"session_id":"resume-session"}}}),
+            &deps,
+        );
+        let marker = &defaulted["result"]["structuredContent"]["marker"];
+        assert_eq!(marker["preempt"], true);
+
+        deps.store
+            .lock()
+            .unwrap()
+            .cancel_resume_markers(&SessionId("resume-session".into()))
+            .unwrap();
+        let opted_out = handle_request(
+            json!({"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"schedule_resume","arguments":{"session_id":"resume-session","preempt":false}}}),
+            &deps,
+        );
+        assert_eq!(
+            opted_out["result"]["structuredContent"]["marker"]["preempt"],
+            false
+        );
     }
     #[test]
     fn get_usage_returns_seeded_usage_data() {
@@ -1054,7 +1194,7 @@ mod tests {
                 assert_eq!(response.status(), StatusCode::OK);
                 let value = json(response).await;
                 assert_eq!(value["result"]["resultType"], "complete");
-                assert_eq!(value["result"]["tools"].as_array().unwrap().len(), 3);
+                assert_eq!(value["result"]["tools"].as_array().unwrap().len(), 4);
                 assert_eq!(value["result"]["cacheScope"], "public");
             }
 

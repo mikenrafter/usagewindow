@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use std::{path::PathBuf, sync::Arc};
 #[cfg(test)]
 use std::path::Path;
+use std::{path::PathBuf, sync::Arc};
 use uw_core::adapter::{
     AdapterError, AdapterResult, Capabilities, DeliveryOutcome, HarnessAdapter, SeedContext,
     SeedMode, StatusEvent,
@@ -108,7 +108,10 @@ impl T3CodeTransport for T3CodeHttpTransport {
     ) -> AdapterResult<Value> {
         let request = self.authed(
             self.client
-                .post(format!("{}/api/orchestration/threads/{thread_id}/status", self.base_url))
+                .post(format!(
+                    "{}/api/orchestration/threads/{thread_id}/status",
+                    self.base_url
+                ))
                 .json(&json!({ "status": status })),
         );
         self.send(request, "thread status").await
@@ -143,7 +146,10 @@ impl T3CodeAdapter {
     pub fn real(base_url: impl Into<String>, auth: T3CodeAuth) -> Self {
         let state_db = std::env::var_os("UW_T3CODE_STATE_DB")
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".t3/userdata/state.sqlite")));
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".t3/userdata/state.sqlite"))
+            });
         Self {
             transport: Arc::new(T3CodeHttpTransport::new(base_url, auth)),
             state_db,
@@ -174,31 +180,37 @@ impl T3CodeAdapter {
         let Some((provider_name, cursor_key)) = Self::provider_cursor(&session.harness) else {
             return Ok(None);
         };
-        let connection = rusqlite::Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|error| AdapterError::Other(format!("open T3Code state database: {error}")))?;
+        let connection =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|error| {
+                    AdapterError::Other(format!("open T3Code state database: {error}"))
+                })?;
         let mut statement = connection
             .prepare(
                 "SELECT thread_id, resume_cursor_json
                  FROM provider_session_runtime
                  WHERE provider_name = ?1",
             )
-            .map_err(|error| AdapterError::Other(format!("read T3Code ownership table: {error}")))?;
+            .map_err(|error| {
+                AdapterError::Other(format!("read T3Code ownership table: {error}"))
+            })?;
         let rows = statement
             .query_map([provider_name], |row| {
                 let thread_id: String = row.get(0)?;
                 let cursor: String = row.get(1)?;
                 Ok((thread_id, cursor))
             })
-            .map_err(|error| AdapterError::Other(format!("scan T3Code ownership table: {error}")))?;
+            .map_err(|error| {
+                AdapterError::Other(format!("scan T3Code ownership table: {error}"))
+            })?;
         let mut owners = Vec::new();
         for row in rows {
-            let (thread_id, cursor) = row
-                .map_err(|error| AdapterError::Other(format!("read T3Code ownership row: {error}")))?;
-            let cursor: Value = serde_json::from_str(&cursor)
-                .map_err(|error| AdapterError::Other(format!("parse T3Code resume cursor: {error}")))?;
+            let (thread_id, cursor) = row.map_err(|error| {
+                AdapterError::Other(format!("read T3Code ownership row: {error}"))
+            })?;
+            let cursor: Value = serde_json::from_str(&cursor).map_err(|error| {
+                AdapterError::Other(format!("parse T3Code resume cursor: {error}"))
+            })?;
             if let Some(native_id) = cursor.get(cursor_key).and_then(Value::as_str) {
                 owners.push((native_id.to_owned(), SessionId(thread_id)));
             }
@@ -217,7 +229,9 @@ impl T3CodeAdapter {
     async fn owned_thread(&self, session: &SessionSummary) -> AdapterResult<SessionId> {
         let thread_id = match &session.harness {
             Provider::Other(name) if name == "t3code" => session.id.clone(),
-            _ => self.native_owner(session)?.ok_or(AdapterError::Unsupported)?,
+            _ => self
+                .native_owner(session)?
+                .ok_or(AdapterError::Unsupported)?,
         };
         match self.transport.get_thread(&thread_id.0).await {
             Ok(_) => Ok(thread_id),
@@ -449,7 +463,10 @@ mod tests {
     #[async_trait]
     impl T3CodeTransport for FakeTransport {
         async fn post_dispatch(&self, payload: Value) -> AdapterResult<Value> {
-            self.call_times.lock().unwrap().push(std::time::Instant::now());
+            self.call_times
+                .lock()
+                .unwrap()
+                .push(std::time::Instant::now());
             self.calls
                 .lock()
                 .unwrap()
@@ -458,7 +475,10 @@ mod tests {
         }
 
         async fn post_interrupt(&self, payload: Value) -> AdapterResult<Value> {
-            self.call_times.lock().unwrap().push(std::time::Instant::now());
+            self.call_times
+                .lock()
+                .unwrap()
+                .push(std::time::Instant::now());
             self.calls
                 .lock()
                 .unwrap()
@@ -471,7 +491,10 @@ mod tests {
             thread_id: &str,
             status: Option<Value>,
         ) -> AdapterResult<Value> {
-            self.call_times.lock().unwrap().push(std::time::Instant::now());
+            self.call_times
+                .lock()
+                .unwrap()
+                .push(std::time::Instant::now());
             self.calls.lock().unwrap().push((
                 "thread_status".into(),
                 serde_json::json!({"threadId": thread_id, "status": status}),
@@ -480,7 +503,10 @@ mod tests {
         }
 
         async fn get_thread(&self, thread_id: &str) -> AdapterResult<Value> {
-            self.call_times.lock().unwrap().push(std::time::Instant::now());
+            self.call_times
+                .lock()
+                .unwrap()
+                .push(std::time::Instant::now());
             self.calls
                 .lock()
                 .unwrap()
@@ -507,6 +533,7 @@ mod tests {
             state_path: None,
             context_window_size: None,
             last_known_token_count: None,
+            last_known_context_pct: None,
             launch_mode: LaunchMode::Interactive,
             pid: None,
             stopped_reason: None,
@@ -572,6 +599,7 @@ mod tests {
             prompt: "/compact\nPreserve the active goal.".into(),
             reason: "test".into(),
             resume_after_compaction: false,
+            preempt: true,
             status: CompactionStatus::Sending,
             created_at: chrono::Utc::now(),
         }
@@ -586,10 +614,8 @@ mod tests {
     }
 
     fn owner_db(rows: &[(&str, &str, &str)]) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "usagewindow-t3-owner-{}.db",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("usagewindow-t3-owner-{}.db", uuid::Uuid::new_v4()));
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
             .execute_batch(
@@ -616,7 +642,8 @@ mod tests {
 
     #[tokio::test]
     async fn resume_resolves_native_claude_id_to_its_t3_thread_owner() {
-        let path = std::env::temp_dir().join(format!("usagewindow-t3-owner-{}.db", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("usagewindow-t3-owner-{}.db", uuid::Uuid::new_v4()));
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
             .execute_batch(
@@ -649,9 +676,18 @@ mod tests {
             .unwrap();
 
         let calls = transport.calls.lock().unwrap();
-        assert_eq!(calls[0], ("get_thread".into(), Value::String("d02b9d75-f564-4cbd-8dcd-62bb445b28c6".into())));
+        assert_eq!(
+            calls[0],
+            (
+                "get_thread".into(),
+                Value::String("d02b9d75-f564-4cbd-8dcd-62bb445b28c6".into())
+            )
+        );
         assert_eq!(calls[1].0, "dispatch");
-        assert_eq!(calls[1].1["threadId"], "d02b9d75-f564-4cbd-8dcd-62bb445b28c6");
+        assert_eq!(
+            calls[1].1["threadId"],
+            "d02b9d75-f564-4cbd-8dcd-62bb445b28c6"
+        );
         fs::remove_file(path).unwrap();
     }
 

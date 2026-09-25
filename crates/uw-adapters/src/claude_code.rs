@@ -80,10 +80,7 @@ fn transcript_has_quota_error(content: &str) -> bool {
                         .is_some_and(quota_limit_text)
             }
             Some("assistant")
-                if record
-                    .get("isApiErrorMessage")
-                    .and_then(Value::as_bool)
-                    == Some(true) =>
+                if record.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) =>
             {
                 record
                     .get("message")
@@ -838,6 +835,7 @@ fn scan_transcript(path: &str, content: &str) -> Option<DiscoveredSession> {
                 output_tokens: output,
                 reasoning_output_tokens: 0,
                 total_tokens: total,
+                context_pct: None,
             });
         }
     }
@@ -864,6 +862,7 @@ fn scan_transcript(path: &str, content: &str) -> Option<DiscoveredSession> {
         model,
         context_window_size,
         last_known_token_count,
+        last_known_context_pct: None,
         first_seen,
         last_seen,
         state_path: Some(path.to_owned()),
@@ -1341,6 +1340,7 @@ mod tests {
                     prompt: "actual prompt".into(),
                     reason: "ignored routing metadata".into(),
                     resume_after_compaction: false,
+                    preempt: true,
                     status: CompactionStatus::Pending,
                     created_at: Utc::now(),
                 },
@@ -1375,6 +1375,7 @@ mod tests {
             state_path: None,
             context_window_size: None,
             last_known_token_count: None,
+            last_known_context_pct: None,
             launch_mode: mode,
             pid: None,
             stopped_reason: None,
@@ -1572,11 +1573,13 @@ mod tests {
                 r#"{{"type":"assistant","sessionId":"{id}","isApiErrorMessage":true,"message":{{"role":"assistant","content":[{{"type":"text","text":"You've hit your monthly spend limit. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue."}}]}}}}"#
             ),
         }));
-        assert!(adapter
-            .detect_stop_with_usage(&SessionId(id.into()), Some(&near_limit_sample(Utc::now())))
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            adapter
+                .detect_stop_with_usage(&SessionId(id.into()), Some(&near_limit_sample(Utc::now())))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

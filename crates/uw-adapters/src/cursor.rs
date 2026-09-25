@@ -126,6 +126,7 @@ fn scan_cursor_transcript(
         model: None,
         context_window_size: None,
         last_known_token_count: None,
+        last_known_context_pct: None,
         first_seen: seen,
         last_seen: seen,
         state_path: Some(path.to_owned()),

@@ -225,6 +225,7 @@ mod tests {
             prompt: "/compact".into(),
             reason: "test".into(),
             resume_after_compaction: false,
+            preempt: true,
             status: CompactionStatus::Sending,
             created_at: now,
         }
@@ -244,6 +245,7 @@ mod tests {
             state_path: None,
             context_window_size: None,
             last_known_token_count: None,
+            last_known_context_pct: None,
             launch_mode: LaunchMode::Headless,
             pid: None,
             stopped_reason: None,

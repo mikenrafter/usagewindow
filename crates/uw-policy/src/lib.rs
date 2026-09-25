@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use uw_core::adapter::Capabilities;
 use uw_core::adapter::TokenUsageRecord;
 use uw_core::model::{
-    AccountId, IdleCompactConfig, Provider, ReseedAutoConfig, Severity, ThresholdProfile,
-    UsageSample, WindowKind, WindowKey,
+    AccountId, IdleCompactConfig, Provider, ReseedAutoConfig, SessionId, Severity,
+    ThresholdProfile, UsageSample, WindowKey, WindowKind,
 };
 
 const ROLLOVER_TOLERANCE: Duration = Duration::minutes(2);
@@ -99,10 +99,7 @@ pub fn burn_rate_lookback(provider: &Provider) -> Duration {
 /// Lookback for status/UI burn-rate display for a provider and window.
 /// Cursor uses 24h for every window; weekly and other long windows use 24h for
 /// other providers, while short session windows use 30m.
-pub fn burn_rate_display_lookback_for_provider(
-    provider: &Provider,
-    kind: &WindowKind,
-) -> Duration {
+pub fn burn_rate_display_lookback_for_provider(provider: &Provider, kind: &WindowKind) -> Duration {
     if matches!(provider, Provider::Cursor) {
         return Duration::hours(24);
     }
@@ -252,7 +249,13 @@ fn burn_rate_between(
 }
 
 fn pct_delta_between(block: &WindowBlock, anchor: Anchor) -> Option<(f32, f32)> {
-    let Anchor { first_index, first_at, first_pct, last_at, last_pct } = anchor;
+    let Anchor {
+        first_index,
+        first_at,
+        first_pct,
+        last_at,
+        last_pct,
+    } = anchor;
     if first_at >= last_at
         || !same_window_instance(
             block
@@ -395,25 +398,33 @@ pub fn resume_lead_minutes(
     )
 }
 
+/// Harnesses that report token counts take the token-tier path. Harnesses
+/// that only expose a context-fill percentage (Cursor) take an independent
+/// percent-threshold path rather than having a token count guessed for them.
+#[allow(clippy::too_many_arguments)]
 pub fn should_idle_compact(
     idle_for: Duration,
     cache_ttl: Duration,
     last_known_token_count: u64,
     context_window_size: Option<u64>,
+    last_known_context_pct: Option<f32>,
     config: &IdleCompactConfig,
     caps: &Capabilities,
 ) -> bool {
     caps.can_trigger_compaction
-        && caps.reports_token_counts
         && idle_for >= cache_ttl - config.margin
-        && match context_window_size {
-            Some(size) => config
-                .tiers
-                .iter()
-                .filter(|tier| tier.window_size_floor <= size)
-                .max_by_key(|tier| tier.window_size_floor)
-                .is_some_and(|tier| last_known_token_count >= tier.token_threshold),
-            None => last_known_token_count >= config.unknown_context_token_threshold,
+        && if caps.reports_token_counts {
+            match context_window_size {
+                Some(size) => config
+                    .tiers
+                    .iter()
+                    .filter(|tier| tier.window_size_floor <= size)
+                    .max_by_key(|tier| tier.window_size_floor)
+                    .is_some_and(|tier| last_known_token_count >= tier.token_threshold),
+                None => last_known_token_count >= config.unknown_context_token_threshold,
+            }
+        } else {
+            last_known_context_pct.is_some_and(|pct| pct >= config.percent_threshold_pct)
         }
 }
 
@@ -473,14 +484,250 @@ pub fn should_reask(
         && last_asked_pct.is_none_or(|last| current_pct - last >= profile.reask_delta_pct)
 }
 
+/// Remaining plan budget at or below which a window blocks a queued resume from
+/// firing: the resume has to wait for that window to reset.
+pub const RESUME_BLOCKING_REMAINING_PCT: f32 = 15.0;
+
+/// One window bar as the status view shows it, for attributing scheduled
+/// sessions to the bar whose reset actually wakes them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowResetSlot {
+    pub kind: WindowKind,
+    pub pct: f32,
+    pub resets_at: Option<DateTime<Utc>>,
+}
+
+/// A session carrying an active (pending or scheduled) resume marker.
+/// `resume_at` is `None` while a manually queued resume is still unresolved.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScheduledResume {
+    pub session_id: SessionId,
+    pub resume_at: Option<DateTime<Utc>>,
+}
+
+/// When a resume with no resolved `resume_at` will actually trigger: the
+/// soonest reset among the windows that currently block it, or — when every
+/// window blocks it — the last of those resets, since the resume cannot fire
+/// until the final blocking window frees up. `now` when nothing blocks it.
+pub fn pending_resume_wake_time(
+    windows: &[WindowResetSlot],
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let blocking = |slot: &WindowResetSlot| 100.0 - slot.pct <= RESUME_BLOCKING_REMAINING_PCT;
+    let resets: Vec<DateTime<Utc>> = windows
+        .iter()
+        .filter(|slot| blocking(slot))
+        .filter_map(|slot| slot.resets_at)
+        .collect();
+    if resets.is_empty() {
+        return Some(now);
+    }
+    let every_window_blocks = windows
+        .iter()
+        .filter(|slot| slot.resets_at.is_some())
+        .all(blocking);
+    if every_window_blocks {
+        resets.into_iter().max()
+    } else {
+        resets.into_iter().min()
+    }
+}
+
+/// The time a scheduled session will actually wake: its resolved `resume_at`
+/// when it has one, otherwise the pending-resume wake time.
+pub fn effective_wake_time(
+    resume_at: Option<DateTime<Utc>>,
+    windows: &[WindowResetSlot],
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    resume_at.or_else(|| pending_resume_wake_time(windows, now))
+}
+
+/// The single window a wake time belongs to: the soonest reset on or after it.
+pub fn attribute_wake_to_window(
+    wake: DateTime<Utc>,
+    windows: &[WindowResetSlot],
+) -> Option<WindowKind> {
+    windows
+        .iter()
+        .filter_map(|slot| slot.resets_at.map(|resets_at| (resets_at, &slot.kind)))
+        .filter(|(resets_at, _)| *resets_at >= wake)
+        .min_by_key(|(resets_at, _)| *resets_at)
+        .map(|(_, kind)| kind.clone())
+}
+
+/// Counts of scheduled sessions per window, in the order `windows` was given.
+/// Every session lands in at most one window.
+pub fn scheduled_sessions_per_window(
+    resumes: &[ScheduledResume],
+    windows: &[WindowResetSlot],
+    now: DateTime<Utc>,
+) -> Vec<u32> {
+    let mut counts = vec![0u32; windows.len()];
+    for resume in resumes {
+        let Some(wake) = effective_wake_time(resume.resume_at, windows, now) else {
+            continue;
+        };
+        let Some(kind) = attribute_wake_to_window(wake, windows) else {
+            continue;
+        };
+        if let Some(index) = windows.iter().position(|slot| slot.kind == kind) {
+            counts[index] += 1;
+        }
+    }
+    counts
+}
+
+/// One observation of a session's context fill.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContextSizeSample {
+    pub at: DateTime<Utc>,
+    pub context_tokens: u64,
+}
+
+/// One observation of a plan window's consumed percentage.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlanUsageSample {
+    pub at: DateTime<Utc>,
+    pub pct: f32,
+}
+
+/// Total context growth across a session's lifetime. Only increases count:
+/// a drop is a compaction, not negative work.
+pub fn positive_context_growth_tokens(samples: &[ContextSizeSample]) -> u64 {
+    let mut ordered: Vec<&ContextSizeSample> = samples.iter().collect();
+    ordered.sort_by_key(|sample| sample.at);
+    ordered
+        .windows(2)
+        .map(|pair| {
+            pair[1]
+                .context_tokens
+                .saturating_sub(pair[0].context_tokens)
+        })
+        .sum()
+}
+
+/// Plan percentage consumed across the same interval, counting only increases
+/// so a window reset does not subtract from the total.
+pub fn positive_plan_pct_growth(samples: &[PlanUsageSample]) -> f32 {
+    let mut ordered: Vec<&PlanUsageSample> = samples.iter().collect();
+    ordered.sort_by_key(|sample| sample.at);
+    ordered
+        .windows(2)
+        .map(|pair| (pair[1].pct - pair[0].pct).max(0.0))
+        .sum()
+}
+
+/// Observed cache-write cost, in plan percent per 1k context tokens written.
+pub fn learned_cache_write_pct_per_1k_context(
+    context: &[ContextSizeSample],
+    plan: &[PlanUsageSample],
+) -> Option<f32> {
+    let tokens = positive_context_growth_tokens(context);
+    let pct = positive_plan_pct_growth(plan);
+    if tokens == 0 || pct <= 0.0 {
+        return None;
+    }
+    Some(pct / (tokens as f32 / 1_000.0))
+}
+
+/// Plan percentage that writing `context_tokens` back into the cache will cost,
+/// using an observed per-1k rate, clamped to the same bounds as
+/// `estimate_cache_write_pct`.
+pub fn estimate_cache_write_pct_from_context_growth(
+    context_tokens: u64,
+    pct_per_1k: f32,
+    profile: &ThresholdProfile,
+) -> f32 {
+    let _ = profile;
+    ((context_tokens as f32 / 1_000.0) * pct_per_1k).clamp(CACHE_WRITE_MIN_PCT, CACHE_WRITE_MAX_PCT)
+}
+
+/// Longest a preempt resume may run before its window resets. Preempting is a
+/// last-few-minutes move: spend budget that is about to expire anyway.
+pub const PREEMPT_MAX_LEAD_MINUTES: f32 = 5.0;
+
+/// Ceiling on how many sessions one window reset may preempt.
+pub const PREEMPT_MAX_SESSIONS: usize = 2;
+
+/// A session already scheduled to resume at or after a window reset, which
+/// could instead be woken on the budget that reset is about to discard.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreemptCandidate {
+    pub session_id: SessionId,
+    /// Where the resume is currently scheduled.
+    pub resume_at: DateTime<Utc>,
+    /// This session's own tempo, already separated from concurrent sessions.
+    pub burn_pct_per_minute: f32,
+    /// Context that has to be written back to the cache on resume.
+    pub context_tokens: u64,
+}
+
+/// A session chosen for an early resume, with the time it should move to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreemptSelection {
+    pub session_id: SessionId,
+    pub resume_at: DateTime<Utc>,
+    pub lead_minutes: f32,
+    pub estimated_cost_pct: f32,
+}
+
+/// Picks the sessions worth resuming on a window's expiring budget. Highest
+/// tempo first, each charged its cache-write cost plus the burn it will do
+/// before the reset, and never more than `PREEMPT_MAX_SESSIONS`. The advisory,
+/// keepalive and plan-pressure thresholds deliberately play no part here: the
+/// budget is about to be discarded either way.
+pub fn select_preempt_resumes(
+    candidates: &[PreemptCandidate],
+    remaining_pct: f32,
+    resets_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    cache_write_pct_per_1k: f32,
+) -> Vec<PreemptSelection> {
+    if resets_at <= now {
+        return Vec::new();
+    }
+    let lead_minutes = (resets_at - now).num_milliseconds() as f32 / 60_000.0;
+    if lead_minutes > PREEMPT_MAX_LEAD_MINUTES {
+        return Vec::new();
+    }
+    let mut ordered: Vec<&PreemptCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.burn_pct_per_minute > 0.0 && candidate.resume_at >= resets_at)
+        .collect();
+    ordered.sort_by(|a, b| {
+        b.burn_pct_per_minute
+            .partial_cmp(&a.burn_pct_per_minute)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut budget = remaining_pct;
+    let mut selected = Vec::new();
+    for candidate in ordered {
+        if selected.len() >= PREEMPT_MAX_SESSIONS {
+            break;
+        }
+        let cache_write_pct = (candidate.context_tokens as f32 / 1_000.0) * cache_write_pct_per_1k;
+        let cost = cache_write_pct + candidate.burn_pct_per_minute * lead_minutes;
+        if cost > budget {
+            continue;
+        }
+        budget -= cost;
+        selected.push(PreemptSelection {
+            session_id: candidate.session_id.clone(),
+            resume_at: now,
+            lead_minutes,
+            estimated_cost_pct: cost,
+        });
+    }
+    selected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
     use std::collections::HashMap;
-    use uw_core::model::{
-        ModelId, Provider, TokenTier, UsageSource, UsageWindowState, WindowKind,
-    };
+    use uw_core::model::{ModelId, Provider, TokenTier, UsageSource, UsageWindowState, WindowKind};
 
     #[test]
     fn cursor_burn_rate_uses_the_last_24_hours() {
@@ -491,19 +738,31 @@ mod tests {
     #[test]
     fn display_lookback_is_24h_for_weekly_and_long_rolling_windows() {
         assert_eq!(
-            burn_rate_display_lookback_for_provider(&Provider::Codex, &WindowKind::WeeklyModel(ModelId("claude".into()))),
+            burn_rate_display_lookback_for_provider(
+                &Provider::Codex,
+                &WindowKind::WeeklyModel(ModelId("claude".into()))
+            ),
             Duration::hours(24)
         );
         assert_eq!(
-            burn_rate_display_lookback_for_provider(&Provider::Codex, &WindowKind::Rolling { minutes: 10_080 }),
+            burn_rate_display_lookback_for_provider(
+                &Provider::Codex,
+                &WindowKind::Rolling { minutes: 10_080 }
+            ),
             Duration::hours(24)
         );
         assert_eq!(
-            burn_rate_display_lookback_for_provider(&Provider::Codex, &WindowKind::Rolling { minutes: 300 }),
+            burn_rate_display_lookback_for_provider(
+                &Provider::Codex,
+                &WindowKind::Rolling { minutes: 300 }
+            ),
             Duration::minutes(30)
         );
         assert_eq!(
-            burn_rate_display_lookback_for_provider(&Provider::Cursor, &WindowKind::Rolling { minutes: 300 }),
+            burn_rate_display_lookback_for_provider(
+                &Provider::Cursor,
+                &WindowKind::Rolling { minutes: 300 }
+            ),
             Duration::hours(24)
         );
     }
@@ -610,6 +869,7 @@ mod tests {
             output_tokens: output,
             reasoning_output_tokens: 0,
             total_tokens: input.saturating_add(output),
+            context_pct: None,
         }
     }
 
@@ -822,6 +1082,7 @@ mod tests {
             ],
             margin: Duration::minutes(1),
             unknown_context_token_threshold: 150_000,
+            percent_threshold_pct: 65.0,
         };
         let caps = caps();
         assert!(should_idle_compact(
@@ -829,6 +1090,7 @@ mod tests {
             Duration::minutes(5),
             200_000,
             Some(210_000),
+            None,
             &c,
             &caps
         ));
@@ -837,6 +1099,7 @@ mod tests {
             Duration::minutes(5),
             150_000,
             Some(210_000),
+            None,
             &c,
             &caps
         ));
@@ -845,6 +1108,7 @@ mod tests {
             Duration::minutes(5),
             99_999,
             Some(200_000),
+            None,
             &c,
             &caps
         ));
@@ -862,6 +1126,7 @@ mod tests {
             Duration::minutes(5),
             149_999,
             None,
+            None,
             &config,
             &caps
         ));
@@ -869,6 +1134,7 @@ mod tests {
             Duration::minutes(4),
             Duration::minutes(5),
             150_000,
+            None,
             None,
             &config,
             &caps
@@ -1030,6 +1296,7 @@ mod tests {
             Duration::minutes(5),
             200_000,
             Some(210_000),
+            None,
             &IdleCompactConfig {
                 tiers: vec![TokenTier {
                     window_size_floor: 0,
@@ -1037,6 +1304,7 @@ mod tests {
                 }],
                 margin: Duration::minutes(1),
                 unknown_context_token_threshold: 150_000,
+                percent_threshold_pct: 65.0,
             },
             &codex
         ));
@@ -1160,6 +1428,7 @@ mod tests {
             Duration::minutes(5),
             150_000,
             Some(200_000),
+            None,
             c,
             &caps
         ));
@@ -1168,6 +1437,7 @@ mod tests {
             Duration::minutes(5),
             150_000,
             Some(200_000),
+            None,
             c,
             &caps
         ));

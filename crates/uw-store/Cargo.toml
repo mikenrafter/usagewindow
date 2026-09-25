@@ -18,3 +18,8 @@ serde.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+tempfile = "3"
+rusqlite = { version = "0.40", features = ["bundled", "chrono", "uuid"] }
+uuid.workspace = true
+chrono.workspace = true
+uw-core.workspace = true

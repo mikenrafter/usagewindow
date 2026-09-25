@@ -159,10 +159,7 @@ pub fn app_with_shared_store_and_auth(
         .route("/api/sessions/{id}/compact/cancel", post(cancel_compact))
         .route("/api/sessions/{id}/compact/status", get(compact_status))
         .route("/api/sessions/{id}/keepalive", post(keepalive))
-        .route(
-            "/api/sessions/{id}/supersede-stop",
-            post(supersede_stop),
-        )
+        .route("/api/sessions/{id}/supersede-stop", post(supersede_stop))
         .route(
             "/api/provider-status/non-blocking",
             post(set_provider_non_blocking),
@@ -180,10 +177,8 @@ pub fn app_with_shared_store_and_auth(
         // the database, so MCP must use the daemon even when web auth is on.
         .route("/api/internal/status", get(status))
         .route("/api/internal/sessions/{id}", get(session))
-        .route(
-            "/api/internal/sessions/{id}/compact/ask",
-            post(compact_ask),
-        )
+        .route("/api/internal/sessions/{id}/compact/ask", post(compact_ask))
+        .route("/api/internal/sessions/{id}/resume", post(resume))
         .merge(protected)
         .fallback(static_asset)
         .with_state(AppState {
@@ -367,6 +362,7 @@ async fn hook_ingress(
             state_path: transcript_path,
             context_window_size: None,
             last_known_token_count: None,
+            last_known_context_pct: None,
             launch_mode: LaunchMode::Interactive,
             pid,
             stopped_reason: None,
@@ -531,19 +527,17 @@ struct StatusQuery {
     account: Option<String>,
 }
 
-fn status_marker_thresholds(
-    store: &Store,
-    provider: &Provider,
-) -> anyhow::Result<(f32, f32, f32)> {
+fn status_marker_thresholds(store: &Store, provider: &Provider) -> anyhow::Result<(f32, f32, f32)> {
     let mut profile = ThresholdProfile::default();
-    for (field, value) in store.threshold_values(None)?.into_iter().chain(
-        store
-            .threshold_values(Some(&ThresholdScope {
-                provider: provider.clone(),
-                model: None,
-                session: None,
-            }))?,
-    ) {
+    for (field, value) in store
+        .threshold_values(None)?
+        .into_iter()
+        .chain(store.threshold_values(Some(&ThresholdScope {
+            provider: provider.clone(),
+            model: None,
+            session: None,
+        }))?)
+    {
         let value = value.trim_matches('"');
         match field.as_str() {
             "closing_pct" => profile.closing_pct = value.parse()?,
@@ -552,7 +546,11 @@ fn status_marker_thresholds(
             _ => {}
         }
     }
-    Ok((profile.closing_pct, profile.compact_pct, profile.plan_pressure_pct))
+    Ok((
+        profile.closing_pct,
+        profile.compact_pct,
+        profile.plan_pressure_pct,
+    ))
 }
 
 async fn status(
@@ -923,6 +921,7 @@ async fn create_session(
             state_path: None,
             context_window_size: None,
             last_known_token_count: None,
+            last_known_context_pct: None,
             launch_mode: LaunchMode::Interactive,
             pid: None,
             stopped_reason: None,
@@ -1019,6 +1018,7 @@ async fn resume(
                 created_at: Utc::now(),
                 status: ResumeStatus::Pending,
                 message: request.message.clone(),
+                preempt: request.preempt,
             };
             store.insert_resume_marker(&marker)?;
             Ok(ResumeResponse {
@@ -1085,6 +1085,7 @@ async fn compact_ask(
                 prompt: request.reason.clone().unwrap_or_default(),
                 reason: request.reason.unwrap_or_else(|| "manual request".into()),
                 resume_after_compaction: request.resume_after_compaction,
+                preempt: request.preempt,
                 status: CompactionStatus::Pending,
                 created_at: Utc::now(),
             };
@@ -1159,9 +1160,7 @@ async fn supersede_stop(
     let id = session_id(id);
     read(state.clone(), {
         let id = id.clone();
-        move |store| {
-            Ok(store.supersede_stop_reason(&id, request.note.as_deref(), Utc::now())?)
-        }
+        move |store| Ok(store.supersede_stop_reason(&id, request.note.as_deref(), Utc::now())?)
     })
     .await?;
     Ok(Json(read(state, move |store| detail(store, &id)).await?))
@@ -1348,10 +1347,9 @@ async fn actions_recent(
                     if event.started_at < cutoff {
                         continue;
                     }
-                    if compaction_requests
-                        .iter()
-                        .any(|request| completed_event_for_request(request, std::slice::from_ref(&event)).is_some())
-                    {
+                    if compaction_requests.iter().any(|request| {
+                        completed_event_for_request(request, std::slice::from_ref(&event)).is_some()
+                    }) {
                         continue;
                     }
                     actions.push(RecentAction {
@@ -1522,6 +1520,7 @@ mod tests {
             state_path: None,
             context_window_size: None,
             last_known_token_count: None,
+            last_known_context_pct: None,
             launch_mode: LaunchMode::Headless,
             pid: None,
             stopped_reason: None,
@@ -1546,6 +1545,7 @@ mod tests {
                 prompt: "/compact".into(),
                 reason: "test".into(),
                 resume_after_compaction: false,
+                preempt: true,
                 status: CompactionStatus::Failed("adapter error".into()),
                 created_at: Utc::now(),
             })
@@ -1702,6 +1702,7 @@ mod tests {
                     output_tokens: 20,
                     reasoning_output_tokens: 0,
                     total_tokens: 120,
+                    context_pct: None,
                 }],
             )
             .unwrap();
@@ -1717,6 +1718,7 @@ mod tests {
                     output_tokens: 20,
                     reasoning_output_tokens: 0,
                     total_tokens: 100,
+                    context_pct: None,
                 }],
             )
             .unwrap();
@@ -1732,12 +1734,17 @@ mod tests {
                     output_tokens: 20,
                     reasoning_output_tokens: 0,
                     total_tokens: 100,
+                    context_pct: None,
                 }],
             )
             .unwrap();
         let current_at = Utc::now();
         for (at, pct, source) in [
-            (current_at - Duration::hours(1), 40.0, UsageSource::LocalEstimate),
+            (
+                current_at - Duration::hours(1),
+                40.0,
+                UsageSource::LocalEstimate,
+            ),
             (current_at, 42.0, UsageSource::ProviderReported),
         ] {
             store
@@ -1776,7 +1783,13 @@ mod tests {
         // from 40.0 -> 42.0), not that rate extrapolated out to a full 24h
         // window — see burn_pct_available.
         assert!((window.tempo_pct - 2.0).abs() < 0.01);
-        assert!((window.active_burn_pct - 1.0909).abs() < 0.01, "active={} inactive={} rate={:?}", window.active_burn_pct, window.inactive_burn_pct, window.burn_rate_pct_per_hour);
+        assert!(
+            (window.active_burn_pct - 1.0909).abs() < 0.01,
+            "active={} inactive={} rate={:?}",
+            window.active_burn_pct,
+            window.inactive_burn_pct,
+            window.burn_rate_pct_per_hour
+        );
         assert!((window.inactive_burn_pct - 0.9090).abs() < 0.01);
         assert_eq!(window.keptalive_burn_pct, 0.0);
     }
@@ -2011,6 +2024,7 @@ mod tests {
             prompt: "compact".into(),
             reason: "near limit".into(),
             resume_after_compaction: false,
+            preempt: true,
             status: CompactionStatus::Pending,
             created_at: Utc::now(),
         };
@@ -2151,6 +2165,7 @@ mod tests {
             session_id: SessionId("session-1".into()),
             at: None,
             message: None,
+            preempt: true,
         };
         let response = router
             .clone()
@@ -2163,10 +2178,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let no_preempt = ResumeRequest {
+            session_id: SessionId("session-1".into()),
+            at: None,
+            message: None,
+            preempt: false,
+        };
+        // Cancel the first marker so a second resume can be queued.
+        let _ = router
+            .clone()
+            .oneshot(
+                Request::post("/api/sessions/session-1/resume/cancel")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/sessions/session-1/resume")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&no_preempt).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let resume_response: ResumeResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!resume_response.marker.unwrap().preempt);
         let ask = CompactAskRequest {
             session_id: SessionId("session-1".into()),
             reason: Some("test".into()),
             resume_after_compaction: false,
+            preempt: true,
         };
         let response = router
             .clone()
@@ -2228,6 +2276,7 @@ mod tests {
                 prompt: "compact".into(),
                 reason: "manual".into(),
                 resume_after_compaction: false,
+                preempt: true,
                 status: CompactionStatus::Pending,
                 created_at: Utc::now(),
             })
@@ -2289,6 +2338,7 @@ mod tests {
                             session_id: SessionId("session-1".into()),
                             reason: None,
                             resume_after_compaction: false,
+                            preempt: true,
                         })
                         .unwrap(),
                     ))
@@ -2486,6 +2536,7 @@ mod tests {
                     output_tokens: 1,
                     reasoning_output_tokens: 0,
                     total_tokens: 11,
+                    context_pct: None,
                 }],
             )
             .unwrap();
@@ -2625,6 +2676,7 @@ mod tests {
                 prompt: "compact".into(),
                 reason: "hard quota boundary".into(),
                 resume_after_compaction: true,
+                preempt: true,
                 status: CompactionStatus::Sent,
                 created_at: Utc::now(),
             })
@@ -2662,6 +2714,7 @@ mod tests {
                 prompt: "compact".into(),
                 reason: "test".into(),
                 resume_after_compaction: false,
+                preempt: true,
                 status: CompactionStatus::Sent,
                 created_at: requested_at,
             })
@@ -2715,6 +2768,7 @@ mod tests {
                     prompt: "compact".into(),
                     reason: "test".into(),
                     resume_after_compaction: false,
+                    preempt: true,
                     status: CompactionStatus::Sent,
                     created_at,
                 })
@@ -2746,10 +2800,11 @@ mod tests {
                 id: uuid::Uuid::new_v4(),
                 session_id: SessionId("session-1".into()),
                 kind: CompactionKind::AgentRequested,
-            prompt: "compact".into(),
-            reason: "hard quota boundary".into(),
-            resume_after_compaction: true,
-            status: CompactionStatus::Failed("provider rejected compaction".into()),
+                prompt: "compact".into(),
+                reason: "hard quota boundary".into(),
+                resume_after_compaction: true,
+                preempt: true,
+                status: CompactionStatus::Failed("provider rejected compaction".into()),
                 created_at: Utc::now(),
             })
             .unwrap();

@@ -863,6 +863,7 @@ async function selectSession(id) {
     <form id="resume-form" class="edit" style="display:none">
       <input name="at" type="datetime-local" placeholder="resume no earlier than (optional)">
       <textarea name="message" placeholder="resume message" rows="2"></textarea>
+      <label class="chk"><input type="checkbox" name="preempt" checked> Allow window-reset preempt</label>
       <div class="btnrow"><button class="action primary" type="submit">Send</button></div>
     </form>
 
@@ -916,7 +917,12 @@ async function selectSession(id) {
       await api('/api/sessions/' + encodeURIComponent(id) + '/resume', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ session_id: id, at, message: fd.get('message') || null }),
+        body: JSON.stringify({
+          session_id: id,
+          at,
+          message: fd.get('message') || null,
+          preempt: fd.get('preempt') === 'on',
+        }),
       });
       await selectSession(id);
     } catch (err) { alert('Resume failed: ' + err.message); }
