@@ -4226,6 +4226,139 @@ mod tests {
         assert_eq!(*enqueues.lock().unwrap(), 2);
     }
 
+    #[tokio::test]
+    async fn idle_compact_percent_only_cursor_style_session_enqueues_via_percent_path() {
+        // A Cursor-shaped session never has token counts, only a context-fill
+        // percent; it must still be able to reach `should_idle_compact`'s
+        // percent path instead of bailing out before the policy call runs.
+        let now = Utc::now();
+        let enqueues = Arc::new(StdMutex::new(0));
+        let percent_session = SessionSummary {
+            last_known_token_count: None,
+            context_window_size: None,
+            last_known_context_pct: Some(70.0),
+            ..session()
+        };
+        let store = FakeStore {
+            request: StdMutex::new(None),
+            owner: percent_session.clone(),
+            claim: true,
+            status: StdMutex::new(vec![]),
+            samples: vec![],
+            enqueues: enqueues.clone(),
+            active_resume: None,
+            resolved: Arc::new(StdMutex::new(vec![])),
+        };
+        let mut capabilities = caps(true, false, false);
+        capabilities.reports_token_counts = false;
+        let adapter = FakeAdapter {
+            capabilities,
+            compacted: Arc::new(StdMutex::new(0)),
+            advised: Arc::new(StdMutex::new(0)),
+        };
+        let mut tracker = IdleEpisodeTracker::new();
+        let mut profile = ThresholdProfile::default();
+        profile.idle_compact.percent_threshold_pct = 65.0;
+
+        let enqueued = tracker
+            .tick(
+                &store,
+                &percent_session,
+                now,
+                true,
+                Duration::minutes(1),
+                &profile,
+                &adapter,
+            )
+            .await
+            .unwrap();
+
+        assert!(enqueued);
+        assert_eq!(*enqueues.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_compact_percent_only_cursor_style_session_below_threshold_does_not_enqueue() {
+        let now = Utc::now();
+        let enqueues = Arc::new(StdMutex::new(0));
+        let percent_session = SessionSummary {
+            last_known_token_count: None,
+            context_window_size: None,
+            last_known_context_pct: Some(50.0),
+            ..session()
+        };
+        let store = FakeStore {
+            request: StdMutex::new(None),
+            owner: percent_session.clone(),
+            claim: true,
+            status: StdMutex::new(vec![]),
+            samples: vec![],
+            enqueues: enqueues.clone(),
+            active_resume: None,
+            resolved: Arc::new(StdMutex::new(vec![])),
+        };
+        let mut capabilities = caps(true, false, false);
+        capabilities.reports_token_counts = false;
+        let adapter = FakeAdapter {
+            capabilities,
+            compacted: Arc::new(StdMutex::new(0)),
+            advised: Arc::new(StdMutex::new(0)),
+        };
+        let mut tracker = IdleEpisodeTracker::new();
+        let mut profile = ThresholdProfile::default();
+        profile.idle_compact.percent_threshold_pct = 65.0;
+
+        let enqueued = tracker
+            .tick(
+                &store,
+                &percent_session,
+                now,
+                true,
+                Duration::minutes(1),
+                &profile,
+                &adapter,
+            )
+            .await
+            .unwrap();
+
+        assert!(!enqueued);
+        assert_eq!(*enqueues.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn discovered_session_upsert_persists_last_known_context_pct() {
+        let inner = Store::open_memory().unwrap();
+        let sqlite_store = SqliteDaemonStore::new(inner);
+        let discovered = DiscoveredSession {
+            id: SessionId("cursor-composer-session".into()),
+            lineage: SessionLineage::default(),
+            cwd: "/tmp".into(),
+            model: None,
+            context_window_size: None,
+            last_known_token_count: None,
+            last_known_context_pct: Some(66.2),
+            first_seen: Some(Utc::now()),
+            last_seen: Some(Utc::now()),
+            state_path: None,
+            token_usage: vec![],
+            title: None,
+        };
+
+        sqlite_store
+            .upsert_discovered_session(Provider::Cursor, discovered.clone(), None, Utc::now())
+            .await
+            .unwrap();
+
+        let persisted = sqlite_store
+            .inner
+            .lock()
+            .unwrap()
+            .read_session(&SessionId("cursor-composer-session".into()))
+            .unwrap();
+
+        assert_eq!(persisted.last_known_context_pct, Some(66.2));
+    }
+
     struct ResumeFake {
         active: Option<ResumeMarker>,
         inserts: StdMutex<u32>,

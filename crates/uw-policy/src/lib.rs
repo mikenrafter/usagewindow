@@ -876,6 +876,103 @@ mod tests {
     }
 
     #[test]
+    fn idle_compact_percent_path_triggers_without_token_reporting() {
+        let mut config = profile().idle_compact;
+        config.percent_threshold_pct = 65.0;
+        let mut caps = caps();
+        caps.reports_token_counts = false;
+        assert!(should_idle_compact(
+            Duration::minutes(4),
+            Duration::minutes(5),
+            0,
+            None,
+            Some(70.0),
+            &config,
+            &caps
+        ));
+    }
+
+    #[test]
+    fn idle_compact_percent_path_does_not_trigger_below_threshold() {
+        let mut config = profile().idle_compact;
+        config.percent_threshold_pct = 65.0;
+        let mut caps = caps();
+        caps.reports_token_counts = false;
+        assert!(!should_idle_compact(
+            Duration::minutes(4),
+            Duration::minutes(5),
+            0,
+            None,
+            Some(50.0),
+            &config,
+            &caps
+        ));
+    }
+
+    #[test]
+    fn idle_compact_percent_path_still_requires_compaction_capability() {
+        let mut config = profile().idle_compact;
+        config.percent_threshold_pct = 65.0;
+        let mut caps = caps();
+        caps.reports_token_counts = false;
+        caps.can_trigger_compaction = false;
+        assert!(!should_idle_compact(
+            Duration::minutes(4),
+            Duration::minutes(5),
+            0,
+            None,
+            Some(90.0),
+            &config,
+            &caps
+        ));
+    }
+
+    #[test]
+    fn idle_compact_percent_path_still_requires_idle_duration_gate() {
+        let mut config = profile().idle_compact;
+        config.percent_threshold_pct = 65.0;
+        let mut caps = caps();
+        caps.reports_token_counts = false;
+        caps.can_trigger_compaction = true;
+        assert!(!should_idle_compact(
+            Duration::minutes(1),
+            Duration::minutes(5),
+            0,
+            None,
+            Some(90.0),
+            &config,
+            &caps
+        ));
+    }
+
+    #[test]
+    fn idle_compact_percent_path_uses_the_default_threshold() {
+        // `IdleCompactConfig::default()`'s margin is zero, so idle_for must
+        // fully cover cache_ttl to clear the shared idle-duration gate.
+        let config = IdleCompactConfig::default();
+        let mut caps = caps();
+        caps.reports_token_counts = false;
+        assert!(should_idle_compact(
+            Duration::minutes(5),
+            Duration::minutes(5),
+            0,
+            None,
+            Some(70.0),
+            &config,
+            &caps
+        ));
+        assert!(!should_idle_compact(
+            Duration::minutes(5),
+            Duration::minutes(5),
+            0,
+            None,
+            Some(60.0),
+            &config,
+            &caps
+        ));
+    }
+
+    #[test]
     fn reseed_requires_every_gate() {
         let c = ReseedAutoConfig {
             enabled: true,

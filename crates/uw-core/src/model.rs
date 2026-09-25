@@ -690,6 +690,79 @@ mod tests {
     }
 
     #[test]
+    fn session_has_recent_token_activity_counts_a_nonzero_context_pct_with_zero_tokens() {
+        use crate::adapter::TokenUsageRecord;
+        let now = Utc::now();
+        let records = vec![TokenUsageRecord {
+            at: now - Duration::minutes(5),
+            model: None,
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 0,
+            context_pct: Some(12.0),
+        }];
+        assert!(session_has_recent_token_activity(&records, now));
+    }
+
+    #[test]
+    fn session_has_recent_token_activity_ignores_a_zero_context_pct() {
+        use crate::adapter::TokenUsageRecord;
+        let now = Utc::now();
+        let records = vec![TokenUsageRecord {
+            at: now - Duration::minutes(5),
+            model: None,
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 0,
+            context_pct: Some(0.0),
+        }];
+        assert!(!session_has_recent_token_activity(&records, now));
+    }
+
+    #[test]
+    fn session_has_recent_token_activity_still_respects_the_lookback_window_for_context_pct() {
+        use crate::adapter::TokenUsageRecord;
+        let now = Utc::now();
+        let records = vec![TokenUsageRecord {
+            at: now - Duration::minutes(SESSION_ACTIVE_TOKEN_LOOKBACK_MINUTES + 1),
+            model: None,
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 0,
+            context_pct: Some(12.0),
+        }];
+        assert!(!session_has_recent_token_activity(&records, now));
+    }
+
+    #[test]
+    fn idle_compact_config_percent_threshold_defaults_to_65() {
+        assert_eq!(IdleCompactConfig::default().percent_threshold_pct, 65.0);
+    }
+
+    #[test]
+    fn idle_compact_config_percent_threshold_defaults_when_older_json_omits_it() {
+        let config = IdleCompactConfig::default();
+        let mut encoded = serde_json::to_value(&config).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("percent_threshold_pct");
+
+        let decoded: IdleCompactConfig = serde_json::from_value(encoded).unwrap();
+
+        assert_eq!(decoded.percent_threshold_pct, 65.0);
+    }
+
+    #[test]
     fn percentage_constructor_clamps() {
         assert_eq!(
             UsageWindowState::new(150.0, false, true, None, None).pct,

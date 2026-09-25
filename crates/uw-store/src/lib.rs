@@ -1464,6 +1464,121 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_pre_context_pct_database_adds_the_context_pct_columns() {
+        let path = std::env::temp_dir().join(format!(
+            "usagewindow-pre-context-pct-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let old_schema = SCHEMA
+            .replace(",last_known_context_pct REAL", "")
+            .replace(",context_pct REAL", "");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(&old_schema).unwrap();
+        drop(connection);
+
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        let id = SessionId("legacy-context-pct-session".into());
+        let mut legacy = session(&id);
+        legacy.last_known_context_pct = Some(77.0);
+        store.insert_session(&legacy).unwrap();
+        store
+            .insert_token_usage_records(
+                &id,
+                &[TokenUsageRecord {
+                    at: Utc::now(),
+                    model: None,
+                    input_tokens: 0,
+                    cached_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 0,
+                    reasoning_output_tokens: 0,
+                    total_tokens: 0,
+                    context_pct: Some(77.0),
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.read_session(&id).unwrap().last_known_context_pct,
+            Some(77.0)
+        );
+        assert_eq!(
+            store.token_usage_for_session(&id).unwrap()[0].context_pct,
+            Some(77.0)
+        );
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn last_known_context_pct_round_trips_through_upsert_session() {
+        let store = Store::open_memory().unwrap();
+        let id = SessionId("context-pct-session".into());
+        let mut with_pct = session(&id);
+        with_pct.last_known_context_pct = Some(42.5);
+        store.upsert_session(&with_pct).unwrap();
+
+        assert_eq!(
+            store.read_session(&id).unwrap().last_known_context_pct,
+            Some(42.5)
+        );
+    }
+
+    #[test]
+    fn context_pct_round_trips_per_record_through_token_usage_history() {
+        let s = Store::open_memory().unwrap();
+        let sid = SessionId("context-pct-token-session".into());
+        s.insert_session(&session(&sid)).unwrap();
+        let records = vec![
+            TokenUsageRecord {
+                at: Utc::now(),
+                model: None,
+                input_tokens: 100,
+                cached_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                output_tokens: 20,
+                reasoning_output_tokens: 0,
+                total_tokens: 120,
+                context_pct: None,
+            },
+            TokenUsageRecord {
+                at: Utc::now() + Duration::seconds(1),
+                model: None,
+                input_tokens: 0,
+                cached_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                output_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 0,
+                context_pct: Some(66.2),
+            },
+        ];
+
+        s.insert_token_usage_records(&sid, &records).unwrap();
+
+        assert_eq!(s.token_usage_for_session(&sid).unwrap(), records);
+    }
+
+    #[test]
+    fn discovered_session_upsert_does_not_regress_newer_context_pct_observation() {
+        let s = Store::open_memory().unwrap();
+        let id = SessionId("context-pct-discovery-order".into());
+        let mut newest = session(&id);
+        newest.last_seen = Utc::now();
+        newest.last_known_context_pct = Some(70.0);
+        s.insert_session(&newest).unwrap();
+
+        let mut stale = newest.clone();
+        stale.last_seen -= chrono::Duration::minutes(20);
+        stale.last_known_context_pct = Some(10.0);
+        s.upsert_session(&stale).unwrap();
+
+        let updated = s.read_session(&id).unwrap();
+        assert_eq!(updated.last_seen, newest.last_seen);
+        assert_eq!(updated.last_known_context_pct, Some(70.0));
+    }
+
+    #[test]
     fn new_provider_snapshot_removes_obsolete_window_identities() {
         let s = Store::open_memory().unwrap();
         let at = Utc::now();
