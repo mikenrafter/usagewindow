@@ -68,6 +68,7 @@ impl HarnessAdapter for FakeAdapter {
 fn session(id: SessionId) -> SessionSummary {
     SessionSummary {
         id,
+        lineage: SessionLineage::default(),
         harness: Provider::Codex,
         model: Some(ModelId("gpt".into())),
         account: None,

@@ -244,6 +244,7 @@ mod tests {
         round_trip(SessionDetail {
             summary: SessionSummary {
                 id: SessionId("s".into()),
+                lineage: SessionLineage::default(),
                 harness: Provider::Codex,
                 model: None,
                 account: None,

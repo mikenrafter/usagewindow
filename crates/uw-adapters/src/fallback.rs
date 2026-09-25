@@ -234,6 +234,7 @@ mod tests {
         let now = chrono::Utc::now();
         SessionSummary {
             id: SessionId("thread".into()),
+            lineage: SessionLineage::default(),
             harness: Provider::Codex,
             model: None,
             account: None,

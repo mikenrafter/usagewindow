@@ -193,13 +193,22 @@ impl T3CodeAdapter {
                 Ok((thread_id, cursor))
             })
             .map_err(|error| AdapterError::Other(format!("scan T3Code ownership table: {error}")))?;
+        let mut owners = Vec::new();
         for row in rows {
             let (thread_id, cursor) = row
                 .map_err(|error| AdapterError::Other(format!("read T3Code ownership row: {error}")))?;
             let cursor: Value = serde_json::from_str(&cursor)
                 .map_err(|error| AdapterError::Other(format!("parse T3Code resume cursor: {error}")))?;
-            if cursor.get(cursor_key).and_then(Value::as_str) == Some(session.id.0.as_str()) {
-                return Ok(Some(SessionId(thread_id)));
+            if let Some(native_id) = cursor.get(cursor_key).and_then(Value::as_str) {
+                owners.push((native_id.to_owned(), SessionId(thread_id)));
+            }
+        }
+        for candidate in session.lineage.ownership_candidates(&session.id) {
+            if let Some((_, thread_id)) = owners
+                .iter()
+                .find(|(native_id, _)| native_id == &candidate.0)
+            {
+                return Ok(Some(thread_id.clone()));
             }
         }
         Ok(None)
@@ -488,6 +497,7 @@ mod tests {
         let now = chrono::Utc::now();
         SessionSummary {
             id: SessionId("3cfef86e-7ab8-4bb1-8410-f54e9c135ea4".into()),
+            lineage: SessionLineage::default(),
             harness: Provider::Other("t3code".into()),
             model: None,
             account: None,

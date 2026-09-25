@@ -180,9 +180,44 @@ mod window_map {
             .collect()
     }
 }
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLineage {
+    #[serde(default)]
+    pub parent: Option<SessionId>,
+    #[serde(default)]
+    pub root: Option<SessionId>,
+    #[serde(default)]
+    pub related: Vec<SessionId>,
+}
+
+impl SessionLineage {
+    pub fn is_empty(&self) -> bool {
+        self.parent.is_none() && self.root.is_none() && self.related.is_empty()
+    }
+
+    /// Native session ids that may identify the same logical execution, ordered
+    /// from the most specific id to the least specific relationship.
+    pub fn ownership_candidates<'a>(&'a self, requested: &'a SessionId) -> Vec<&'a SessionId> {
+        let mut candidates = vec![requested];
+        for candidate in self
+            .parent
+            .iter()
+            .chain(self.root.iter())
+            .chain(self.related.iter())
+        {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+        candidates
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: SessionId,
+    #[serde(default)]
+    pub lineage: SessionLineage,
     pub harness: Provider,
     pub model: Option<ModelId>,
     pub account: Option<AccountId>,
@@ -493,6 +528,7 @@ mod tests {
     fn session_and_threshold_profiles_round_trip_through_serde() {
         let session = SessionSummary {
             id: SessionId("s".into()),
+            lineage: SessionLineage::default(),
             harness: Provider::Codex,
             model: None,
             account: None,
@@ -521,6 +557,60 @@ mod tests {
             profile,
             serde_json::from_str(&serde_json::to_string(&profile).unwrap()).unwrap()
         );
+    }
+
+    #[test]
+    fn session_lineage_defaults_when_older_json_omits_it() {
+        let session = SessionSummary {
+            id: SessionId("legacy-session".into()),
+            lineage: SessionLineage::default(),
+            harness: Provider::Codex,
+            model: None,
+            account: None,
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+            cwd: "/tmp".into(),
+            state_path: None,
+            context_window_size: None,
+            last_known_token_count: None,
+            launch_mode: LaunchMode::Headless,
+            pid: None,
+            stopped_reason: None,
+            superseded_stop_reason: None,
+            superseded_stop_reason_at: None,
+            superseded_stop_reason_note: None,
+            resume_marker: None,
+            superseded_by: None,
+            reseeded_from: None,
+        };
+        let mut encoded = serde_json::to_value(session).unwrap();
+        encoded.as_object_mut().unwrap().remove("lineage");
+
+        let decoded: SessionSummary = serde_json::from_value(encoded).unwrap();
+
+        assert_eq!(decoded.lineage, SessionLineage::default());
+    }
+
+    #[test]
+    fn session_lineage_orders_and_deduplicates_ownership_candidates() {
+        let requested = SessionId("requested".into());
+        let lineage = SessionLineage {
+            parent: Some(SessionId("parent".into())),
+            root: Some(SessionId("root".into())),
+            related: vec![
+                SessionId("parent".into()),
+                SessionId("related".into()),
+                SessionId("requested".into()),
+            ],
+        };
+
+        let candidates = lineage
+            .ownership_candidates(&requested)
+            .into_iter()
+            .map(|id| id.0.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(candidates, ["requested", "parent", "root", "related"]);
     }
 
     #[test]
@@ -562,6 +652,7 @@ mod tests {
         let now = Utc::now();
         let mut session = SessionSummary {
             id: SessionId("s".into()),
+            lineage: SessionLineage::default(),
             harness: Provider::ClaudeCode,
             model: None,
             account: None,

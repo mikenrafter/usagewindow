@@ -89,6 +89,7 @@ impl Store {
             "ALTER TABLE sessions ADD COLUMN superseded_stop_reason TEXT",
             "ALTER TABLE sessions ADD COLUMN superseded_stop_reason_at TEXT",
             "ALTER TABLE sessions ADD COLUMN superseded_stop_reason_note TEXT",
+            "ALTER TABLE sessions ADD COLUMN lineage_json TEXT",
             "ALTER TABLE sessions ADD COLUMN last_seen_missing INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE provider_fetch_status ADD COLUMN non_blocking INTEGER NOT NULL DEFAULT 0",
         ] {
@@ -287,12 +288,17 @@ impl Store {
     }
     pub fn read_session(&self, id: &SessionId) -> StoreResult<SessionSummary> {
         let r = self.connection.query_row(
-            "SELECT id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,superseded_by,reseeded_from,superseded_stop_reason,superseded_stop_reason_at,superseded_stop_reason_note FROM sessions WHERE id=?",
+            "SELECT id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,superseded_by,reseeded_from,superseded_stop_reason,superseded_stop_reason_at,superseded_stop_reason_note,lineage_json FROM sessions WHERE id=?",
             [id.0.as_str()],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?, row.get(4)?, row.get(5)?, row.get::<_, Option<i64>>(6)?, row.get::<_, Option<i64>>(7)?, row.get::<_, String>(8)?, row.get::<_, Option<i64>>(9)?, row.get(10)?, row.get(11)?, row.get::<_, Option<String>>(12)?, row.get::<_, Option<String>>(13)?, row.get::<_, Option<String>>(14)?, row.get::<_, Option<String>>(15)?, row.get::<_, Option<DateTime<Utc>>>(16)?, row.get::<_, Option<String>>(17)?)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?, row.get(4)?, row.get(5)?, row.get::<_, Option<i64>>(6)?, row.get::<_, Option<i64>>(7)?, row.get::<_, String>(8)?, row.get::<_, Option<i64>>(9)?, row.get(10)?, row.get(11)?, row.get::<_, Option<String>>(12)?, row.get::<_, Option<String>>(13)?, row.get::<_, Option<String>>(14)?, row.get::<_, Option<String>>(15)?, row.get::<_, Option<DateTime<Utc>>>(16)?, row.get::<_, Option<String>>(17)?, row.get::<_, Option<String>>(18)?)),
         ).optional()?.ok_or(StoreError::NotFound)?;
         Ok(SessionSummary {
             id: SessionId(r.0),
+            lineage: r
+                .18
+                .map(|value| serde_json::from_str(&value))
+                .transpose()?
+                .unwrap_or_default(),
             harness: serde_json::from_str(&r.1)?,
             model: r.2.map(|x| serde_json::from_str(&x)).transpose()?,
             account: r.3.map(|x| serde_json::from_str(&x)).transpose()?,
@@ -452,13 +458,13 @@ impl Store {
         Ok(())
     }
     pub fn insert_session(&self, s: &SessionSummary) -> StoreResult<()> {
-        self.connection.execute("INSERT INTO sessions(id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,stopped_window_kind,superseded_by,reseeded_from) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![s.id.0,json(&s.harness)?,opt_json(&s.model)?,opt_json(&s.account)?,s.cwd,s.state_path,s.context_window_size.map(|x|x as i64),s.last_known_token_count.map(|x|x as i64),json(&s.launch_mode)?,s.pid.map(|x|x as i64),s.first_seen,s.last_seen,opt_json(&s.stopped_reason)?,Option::<String>::None,s.superseded_by.as_ref().map(|x|&x.0),s.reseeded_from.as_ref().map(|x|&x.0)])?;
+        self.connection.execute("INSERT INTO sessions(id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,stopped_window_kind,superseded_by,reseeded_from,lineage_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![s.id.0,json(&s.harness)?,opt_json(&s.model)?,opt_json(&s.account)?,s.cwd,s.state_path,s.context_window_size.map(|x|x as i64),s.last_known_token_count.map(|x|x as i64),json(&s.launch_mode)?,s.pid.map(|x|x as i64),s.first_seen,s.last_seen,opt_json(&s.stopped_reason)?,Option::<String>::None,s.superseded_by.as_ref().map(|x|&x.0),s.reseeded_from.as_ref().map(|x|&x.0),lineage_json(&s.lineage)?])?;
         Ok(())
     }
     pub fn upsert_session(&self, s: &SessionSummary) -> StoreResult<()> {
         self.connection.execute(
-            "INSERT INTO sessions(id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,stopped_window_kind,superseded_by,reseeded_from) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET harness=excluded.harness,model=COALESCE(excluded.model,sessions.model),account=COALESCE(excluded.account,sessions.account),cwd=excluded.cwd,state_path=COALESCE(excluded.state_path,sessions.state_path),context_window_size=CASE WHEN excluded.last_seen > sessions.last_seen THEN COALESCE(excluded.context_window_size,sessions.context_window_size) ELSE sessions.context_window_size END,last_known_token_count=CASE WHEN excluded.last_seen > sessions.last_seen THEN COALESCE(excluded.last_known_token_count,sessions.last_known_token_count) ELSE sessions.last_known_token_count END,pid=COALESCE(excluded.pid,sessions.pid),last_seen=MAX(sessions.last_seen,excluded.last_seen)",
-            params![s.id.0,json(&s.harness)?,opt_json(&s.model)?,opt_json(&s.account)?,s.cwd,s.state_path,s.context_window_size.map(|x|x as i64),s.last_known_token_count.map(|x|x as i64),json(&s.launch_mode)?,s.pid.map(|x|x as i64),s.first_seen,s.last_seen,opt_json(&s.stopped_reason)?,Option::<String>::None,s.superseded_by.as_ref().map(|x|&x.0),s.reseeded_from.as_ref().map(|x|&x.0)],
+            "INSERT INTO sessions(id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,stopped_window_kind,superseded_by,reseeded_from,lineage_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET harness=excluded.harness,model=COALESCE(excluded.model,sessions.model),account=COALESCE(excluded.account,sessions.account),cwd=excluded.cwd,state_path=COALESCE(excluded.state_path,sessions.state_path),context_window_size=CASE WHEN excluded.last_seen > sessions.last_seen THEN COALESCE(excluded.context_window_size,sessions.context_window_size) ELSE sessions.context_window_size END,last_known_token_count=CASE WHEN excluded.last_seen > sessions.last_seen THEN COALESCE(excluded.last_known_token_count,sessions.last_known_token_count) ELSE sessions.last_known_token_count END,pid=COALESCE(excluded.pid,sessions.pid),last_seen=MAX(sessions.last_seen,excluded.last_seen),lineage_json=COALESCE(excluded.lineage_json,sessions.lineage_json)",
+            params![s.id.0,json(&s.harness)?,opt_json(&s.model)?,opt_json(&s.account)?,s.cwd,s.state_path,s.context_window_size.map(|x|x as i64),s.last_known_token_count.map(|x|x as i64),json(&s.launch_mode)?,s.pid.map(|x|x as i64),s.first_seen,s.last_seen,opt_json(&s.stopped_reason)?,Option::<String>::None,s.superseded_by.as_ref().map(|x|&x.0),s.reseeded_from.as_ref().map(|x|&x.0),lineage_json(&s.lineage)?],
         )?;
         Ok(())
     }
@@ -1098,6 +1104,13 @@ fn json<T: serde::Serialize>(x: &T) -> Result<String, serde_json::Error> {
 fn opt_json<T: serde::Serialize>(x: &Option<T>) -> Result<Option<String>, serde_json::Error> {
     x.as_ref().map(json).transpose()
 }
+fn lineage_json(lineage: &SessionLineage) -> Result<Option<String>, serde_json::Error> {
+    if lineage.is_empty() {
+        Ok(None)
+    } else {
+        json(lineage).map(Some)
+    }
+}
 fn boolean(x: bool) -> i64 {
     if x { 1 } else { 0 }
 }
@@ -1270,7 +1283,7 @@ fn decode_compaction_event_row(row: &rusqlite::Row) -> rusqlite::Result<Compacti
         completed_at: row.get(9)?,
     })
 }
-const SCHEMA: &str = r#"PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS usage_samples(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,account TEXT,window_kind TEXT NOT NULL,window_scope_value TEXT NOT NULL,pct REAL NOT NULL,resets_at TEXT,exceeded INTEGER NOT NULL,active INTEGER NOT NULL,source TEXT NOT NULL,at TEXT NOT NULL,fetched_at TEXT,credits_json TEXT,plan TEXT);CREATE INDEX IF NOT EXISTS usage_samples_window_at ON usage_samples(provider,window_kind,window_scope_value,at);CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,harness TEXT NOT NULL,model TEXT,account TEXT,cwd TEXT NOT NULL,state_path TEXT,context_window_size INTEGER,last_known_token_count INTEGER,launch_mode TEXT NOT NULL,pid INTEGER,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,stopped_reason TEXT,stopped_window_kind TEXT,superseded_by TEXT,reseeded_from TEXT,title TEXT,superseded_stop_reason TEXT,superseded_stop_reason_at TEXT,superseded_stop_reason_note TEXT);CREATE TABLE IF NOT EXISTS session_token_usage(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),at TEXT NOT NULL,model TEXT,input_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_write_input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,UNIQUE(session_id,at,total_tokens,input_tokens,output_tokens));CREATE INDEX IF NOT EXISTS session_token_usage_session_at ON session_token_usage(session_id,at);CREATE TABLE IF NOT EXISTS resume_markers(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),reason TEXT NOT NULL,resume_at TEXT,requested_at TEXT,created_at TEXT NOT NULL,status TEXT NOT NULL,status_detail TEXT,message TEXT);CREATE INDEX IF NOT EXISTS resume_markers_session_status ON resume_markers(session_id,status);CREATE UNIQUE INDEX IF NOT EXISTS resume_markers_active ON resume_markers(session_id) WHERE status IN ('pending','scheduled');CREATE TABLE IF NOT EXISTS compaction_requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL,prompt TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS compaction_requests_session_status ON compaction_requests(session_id,status);CREATE TABLE IF NOT EXISTS threshold_overrides(id TEXT PRIMARY KEY,scope_kind TEXT NOT NULL,provider TEXT NOT NULL,model_value TEXT,session_value TEXT,field TEXT NOT NULL,value_json TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS threshold_overrides_key ON threshold_overrides(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field);CREATE TABLE IF NOT EXISTS idle_reseed_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,source_model TEXT NOT NULL,summary_text TEXT NOT NULL,token_count_before INTEGER NOT NULL,token_count_after INTEGER NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS keepalive_config(session_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL,last_ping_at TEXT,ping_day TEXT,ping_count INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS hook_messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,text TEXT NOT NULL,created_at TEXT NOT NULL,delivered_at TEXT);CREATE INDEX IF NOT EXISTS hook_messages_delivery ON hook_messages(session_id,event,delivered_at,created_at);CREATE TABLE IF NOT EXISTS hook_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,created_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS hook_events_session_created ON hook_events(session_id,created_at);CREATE TABLE IF NOT EXISTS provider_fetch_status(provider TEXT NOT NULL,account TEXT,last_attempt_at TEXT NOT NULL,last_success_at TEXT,last_error TEXT,consecutive_failures INTEGER NOT NULL DEFAULT 0,non_blocking INTEGER NOT NULL DEFAULT 0);CREATE UNIQUE INDEX IF NOT EXISTS provider_fetch_status_key ON provider_fetch_status(provider,COALESCE(account,''));CREATE TABLE IF NOT EXISTS compaction_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),source TEXT NOT NULL,trigger TEXT,context_pct_before REAL,usage_window_pct_before REAL,tokens_before INTEGER,tokens_after INTEGER,started_at TEXT NOT NULL,completed_at TEXT);CREATE INDEX IF NOT EXISTS compaction_events_session_started ON compaction_events(session_id,started_at);CREATE INDEX IF NOT EXISTS compaction_events_started ON compaction_events(started_at);"#;
+const SCHEMA: &str = r#"PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS usage_samples(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,account TEXT,window_kind TEXT NOT NULL,window_scope_value TEXT NOT NULL,pct REAL NOT NULL,resets_at TEXT,exceeded INTEGER NOT NULL,active INTEGER NOT NULL,source TEXT NOT NULL,at TEXT NOT NULL,fetched_at TEXT,credits_json TEXT,plan TEXT);CREATE INDEX IF NOT EXISTS usage_samples_window_at ON usage_samples(provider,window_kind,window_scope_value,at);CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,harness TEXT NOT NULL,model TEXT,account TEXT,cwd TEXT NOT NULL,state_path TEXT,context_window_size INTEGER,last_known_token_count INTEGER,launch_mode TEXT NOT NULL,pid INTEGER,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,stopped_reason TEXT,stopped_window_kind TEXT,superseded_by TEXT,reseeded_from TEXT,title TEXT,superseded_stop_reason TEXT,superseded_stop_reason_at TEXT,superseded_stop_reason_note TEXT,lineage_json TEXT);CREATE TABLE IF NOT EXISTS session_token_usage(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),at TEXT NOT NULL,model TEXT,input_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_write_input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,UNIQUE(session_id,at,total_tokens,input_tokens,output_tokens));CREATE INDEX IF NOT EXISTS session_token_usage_session_at ON session_token_usage(session_id,at);CREATE TABLE IF NOT EXISTS resume_markers(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),reason TEXT NOT NULL,resume_at TEXT,requested_at TEXT,created_at TEXT NOT NULL,status TEXT NOT NULL,status_detail TEXT,message TEXT);CREATE INDEX IF NOT EXISTS resume_markers_session_status ON resume_markers(session_id,status);CREATE UNIQUE INDEX IF NOT EXISTS resume_markers_active ON resume_markers(session_id) WHERE status IN ('pending','scheduled');CREATE TABLE IF NOT EXISTS compaction_requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL,prompt TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS compaction_requests_session_status ON compaction_requests(session_id,status);CREATE TABLE IF NOT EXISTS threshold_overrides(id TEXT PRIMARY KEY,scope_kind TEXT NOT NULL,provider TEXT NOT NULL,model_value TEXT,session_value TEXT,field TEXT NOT NULL,value_json TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS threshold_overrides_key ON threshold_overrides(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field);CREATE TABLE IF NOT EXISTS idle_reseed_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,source_model TEXT NOT NULL,summary_text TEXT NOT NULL,token_count_before INTEGER NOT NULL,token_count_after INTEGER NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS keepalive_config(session_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL,last_ping_at TEXT,ping_day TEXT,ping_count INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS hook_messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,text TEXT NOT NULL,created_at TEXT NOT NULL,delivered_at TEXT);CREATE INDEX IF NOT EXISTS hook_messages_delivery ON hook_messages(session_id,event,delivered_at,created_at);CREATE TABLE IF NOT EXISTS hook_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,created_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS hook_events_session_created ON hook_events(session_id,created_at);CREATE TABLE IF NOT EXISTS provider_fetch_status(provider TEXT NOT NULL,account TEXT,last_attempt_at TEXT NOT NULL,last_success_at TEXT,last_error TEXT,consecutive_failures INTEGER NOT NULL DEFAULT 0,non_blocking INTEGER NOT NULL DEFAULT 0);CREATE UNIQUE INDEX IF NOT EXISTS provider_fetch_status_key ON provider_fetch_status(provider,COALESCE(account,''));CREATE TABLE IF NOT EXISTS compaction_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),source TEXT NOT NULL,trigger TEXT,context_pct_before REAL,usage_window_pct_before REAL,tokens_before INTEGER,tokens_after INTEGER,started_at TEXT NOT NULL,completed_at TEXT);CREATE INDEX IF NOT EXISTS compaction_events_session_started ON compaction_events(session_id,started_at);CREATE INDEX IF NOT EXISTS compaction_events_started ON compaction_events(started_at);"#;
 
 #[cfg(test)]
 mod tests {
@@ -1280,6 +1293,7 @@ mod tests {
     fn session(id: &SessionId) -> SessionSummary {
         SessionSummary {
             id: id.clone(),
+            lineage: SessionLineage::default(),
             harness: Provider::Codex,
             model: None,
             account: None,
@@ -1395,6 +1409,58 @@ mod tests {
         };
         let id = s.insert_usage_sample(&sample).unwrap();
         assert_eq!(s.read_usage_sample(id).unwrap(), sample);
+    }
+
+    #[test]
+    fn session_lineage_round_trips_through_the_store() {
+        let store = Store::open_memory().unwrap();
+        let id = SessionId("child-session".into());
+        let mut encoded = serde_json::to_value(session(&id)).unwrap();
+        encoded["lineage"] = serde_json::json!({
+            "parent": "parent-session",
+            "root": "root-session",
+            "related": ["related-session"]
+        });
+        let lineage_session: SessionSummary = serde_json::from_value(encoded).unwrap();
+
+        store.insert_session(&lineage_session).unwrap();
+
+        let mut later_observation = session(&id);
+        later_observation.last_seen += chrono::Duration::minutes(1);
+        store.upsert_session(&later_observation).unwrap();
+
+        let stored = serde_json::to_value(store.read_session(&id).unwrap()).unwrap();
+        assert_eq!(
+            stored["lineage"],
+            serde_json::json!({
+                "parent": "parent-session",
+                "root": "root-session",
+                "related": ["related-session"]
+            })
+        );
+    }
+
+    #[test]
+    fn opening_a_pre_lineage_database_adds_the_lineage_column() {
+        let path = std::env::temp_dir().join(format!(
+            "usagewindow-pre-lineage-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let old_schema = SCHEMA.replace(",lineage_json TEXT", "");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(&old_schema).unwrap();
+        drop(connection);
+
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        let id = SessionId("legacy-session".into());
+        store.insert_session(&session(&id)).unwrap();
+
+        assert_eq!(
+            store.read_session(&id).unwrap().lineage,
+            SessionLineage::default()
+        );
+        drop(store);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

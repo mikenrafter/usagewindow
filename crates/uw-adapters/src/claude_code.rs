@@ -859,6 +859,7 @@ fn scan_transcript(path: &str, content: &str) -> Option<DiscoveredSession> {
     });
     Some(DiscoveredSession {
         id: SessionId(id),
+        lineage: SessionLineage::default(),
         cwd: cwd.unwrap_or_else(|| ".".into()),
         model,
         context_window_size,
@@ -1364,6 +1365,7 @@ mod tests {
     fn session(mode: LaunchMode) -> SessionSummary {
         SessionSummary {
             id: SessionId("3507fe61-2d6b-4aae-a0b6-4fe4eec12b40".into()),
+            lineage: SessionLineage::default(),
             harness: Provider::ClaudeCode,
             model: None,
             account: None,

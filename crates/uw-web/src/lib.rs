@@ -357,6 +357,7 @@ async fn hook_ingress(
     let messages = read(state, move |store| {
         store.upsert_session(&SessionSummary {
             id: id.clone(),
+            lineage: SessionLineage::default(),
             harness: provider,
             model,
             account: None,
@@ -909,6 +910,7 @@ async fn create_session(
         let now = Utc::now();
         Ok(store.insert_session(&SessionSummary {
             id: request.id,
+            lineage: SessionLineage::default(),
             harness: request.harness,
             model: request.model,
             account: None,
@@ -1507,6 +1509,7 @@ mod tests {
     fn session() -> SessionSummary {
         SessionSummary {
             id: SessionId("session-1".into()),
+            lineage: SessionLineage::default(),
             harness: Provider::Codex,
             model: Some(ModelId("gpt".into())),
             account: None,

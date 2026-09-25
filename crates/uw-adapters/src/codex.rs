@@ -791,6 +791,7 @@ fn scan_rollout(path: &std::path::Path) -> Option<DiscoveredSession> {
     }
     Some(DiscoveredSession {
         id: SessionId(id.to_owned()),
+        lineage: SessionLineage::default(),
         cwd,
         model,
         context_window_size,
@@ -1199,6 +1200,7 @@ done
             a.compact(
                 &SessionSummary {
                     id: id.clone(),
+                    lineage: SessionLineage::default(),
                     harness: Provider::Codex,
                     model: None,
                     account: None,
@@ -1347,6 +1349,7 @@ done
         let a = CodexAdapter::new(Arc::new(Rpc)).with_spawner(Arc::new(Recorder(record.clone())));
         let session = SessionSummary {
             id: SessionId("uuid".into()),
+            lineage: SessionLineage::default(),
             harness: Provider::Codex,
             model: None,
             account: None,
@@ -1620,6 +1623,7 @@ done
     fn session_summary(id: &str) -> SessionSummary {
         SessionSummary {
             id: SessionId(id.into()),
+            lineage: SessionLineage::default(),
             harness: Provider::Codex,
             model: None,
             account: None,

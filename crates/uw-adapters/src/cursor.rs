@@ -121,6 +121,7 @@ fn scan_cursor_transcript(
     let seen = modified.map(DateTime::<Utc>::from);
     Some(DiscoveredSession {
         id: SessionId(id),
+        lineage: SessionLineage::default(),
         cwd,
         model: None,
         context_window_size: None,

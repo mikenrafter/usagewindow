@@ -736,6 +736,7 @@ mod tests {
     fn session(id: &str, harness: Provider) -> SessionSummary {
         SessionSummary {
             id: SessionId(id.into()),
+            lineage: SessionLineage::default(),
             harness,
             model: None,
             account: None,

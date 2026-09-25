@@ -673,6 +673,7 @@ impl ObservationStore for SqliteDaemonStore {
             let last_seen_missing = found.last_seen.is_none();
             let session = SessionSummary {
                 id: found.id.clone(),
+                lineage: found.lineage,
                 harness: provider,
                 model: found.model,
                 account,
@@ -909,6 +910,7 @@ pub async fn run_reseed(
     store
         .insert_reseeded_session(SessionSummary {
             id: new_id.clone(),
+            lineage: SessionLineage::default(),
             harness: adapter.provider(),
             model: Some(cheap_model),
             account: session.account.clone(),
@@ -2822,6 +2824,7 @@ mod tests {
     fn session() -> SessionSummary {
         SessionSummary {
             id: SessionId("s".into()),
+            lineage: SessionLineage::default(),
             harness: Provider::ClaudeCode,
             model: None,
             account: None,

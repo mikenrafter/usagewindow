@@ -73,6 +73,8 @@ pub enum DeliveryOutcome {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveredSession {
     pub id: SessionId,
+    #[serde(default)]
+    pub lineage: SessionLineage,
     pub cwd: String,
     pub model: Option<ModelId>,
     pub context_window_size: Option<u64>,
