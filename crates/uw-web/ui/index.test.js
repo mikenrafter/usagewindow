@@ -40,6 +40,20 @@ test('threshold opacity uses each threshold remaining budget independently', () 
   assert.ok(opacity(25, 90) < opacity(25, 85));
 });
 
+test('zero tempo shows idle label instead of 0% per window', () => {
+  const output = renderContext.renderUsageBar('Test', {
+    pct: 80,
+    tempo_pct: 0,
+    active_burn_pct: 0,
+    keptalive_burn_pct: 0,
+    inactive_burn_pct: 0,
+    window: {},
+  });
+
+  assert.match(output, />idle 30m</);
+  assert.doesNotMatch(output, /0% per 30m/);
+});
+
 test('added reset time uses the tempo shade', () => {
   const output = renderContext.renderUsageBar('Test', {
     pct: 80,

@@ -630,7 +630,9 @@ function renderUsageBar(provider, w) {
   const timeRemainingMarkup = exhaustedIn && resetAfterExhaustion
     ? `<span class="added-time" style="color:${tempoColor}">${escapeHtml(exhaustedIn)}</span> + ${escapeHtml(resetAfterExhaustion)}`
     : escapeHtml(timeRemaining);
-  const tempoLabel = `${burnPct} per ${burnLabel}`;
+  const tempoLabel = burnRounded === 0
+    ? `idle ${burnLabel}`
+    : `${burnPct} per ${burnLabel}`;
   return `
     <div class="barrow">
       <div class="title">
