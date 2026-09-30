@@ -696,6 +696,46 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         })
     }
 
+    async fn session_activity(
+        &self,
+        session: &SessionSummary,
+    ) -> AdapterResult<uw_core::activity::SessionActivity> {
+        use uw_core::activity::SessionActivity;
+        let path = match &session.state_path {
+            Some(path) => Some(path.clone()),
+            None => self
+                .transcript_fs
+                .jsonl_files()
+                .await
+                .ok()
+                .and_then(|paths| {
+                    paths.into_iter().find(|path| {
+                        std::path::Path::new(path)
+                            .file_stem()
+                            .and_then(|name| name.to_str())
+                            == Some(session.id.0.as_str())
+                    })
+                }),
+        };
+        let Some(path) = path else {
+            return Ok(SessionActivity::Unknown);
+        };
+        if std::path::Path::new(&path)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            != Some(session.id.0.as_str())
+        {
+            return Ok(SessionActivity::Unknown);
+        }
+        let Ok(content) = self.transcript_fs.read_to_string(&path).await else {
+            return Ok(SessionActivity::Unknown);
+        };
+        let id = session.id.clone();
+        tokio::task::spawn_blocking(move || transcript_activity(&content, &id))
+            .await
+            .map_err(|error| AdapterError::Other(error.to_string()))
+    }
+
     async fn export_transcript(&self, session: &SessionSummary) -> AdapterResult<String> {
         let mut matching = Vec::new();
         for path in self.transcript_fs.jsonl_files().await? {
@@ -895,6 +935,133 @@ fn validate_session_owner(session: &SessionSummary) -> AdapterResult<()> {
     }
     Ok(())
 }
+/// Reconstruct outstanding work from the raw root-session transcript.
+pub fn transcript_activity(
+    content: &str,
+    session_id: &SessionId,
+) -> uw_core::activity::SessionActivity {
+    use uw_core::activity::{ActivityEvent, ActivityTracker, SessionActivity};
+    let mut tracker = ActivityTracker::default();
+    let mut calls = HashMap::<String, String>::new();
+    let mut finished = std::collections::HashSet::new();
+    let mut identified = false;
+    let mut notification_turn = false;
+    for line in content.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            return SessionActivity::Unknown;
+        };
+        if record.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        if let Some(id) = record.get("sessionId").and_then(Value::as_str) {
+            if id != session_id.0 {
+                return SessionActivity::Unknown;
+            }
+            identified = true;
+        }
+        let kind = record.get("type").and_then(Value::as_str);
+        if kind == Some("system")
+            && record.get("subtype").and_then(Value::as_str) == Some("turn_duration")
+        {
+            notification_turn = false;
+        }
+        if !matches!(kind, Some("assistant" | "user")) {
+            continue;
+        }
+        let Some(content) = record.pointer("/message/content") else {
+            return SessionActivity::Unknown;
+        };
+        if kind == Some("user")
+            && let Some(text) = content.as_str()
+        {
+            let text = text.trim();
+            if text.starts_with("<task-notification>") && text.ends_with("</task-notification>") {
+                notification_turn = true;
+                let terminal = ["completed", "failed", "stopped"]
+                    .iter()
+                    .any(|status| text.contains(&format!("<status>{status}</status>")));
+                if terminal {
+                    for part in text.split("<task-id>").skip(1) {
+                        if let Some((id, _)) = part.split_once("</task-id>") {
+                            tracker
+                                .observe(ActivityEvent::BackgroundFinished(id.trim().to_owned()));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        let Some(parts) = content.as_array() else {
+            if content.is_string() {
+                continue;
+            }
+            return SessionActivity::Unknown;
+        };
+        for part in parts {
+            match (kind, part.get("type").and_then(Value::as_str)) {
+                (Some("assistant"), Some("tool_use")) => {
+                    let (Some(id), Some(name)) = (
+                        part.get("id").and_then(Value::as_str),
+                        part.get("name").and_then(Value::as_str),
+                    ) else {
+                        return SessionActivity::Unknown;
+                    };
+                    calls
+                        .entry(id.to_owned())
+                        .or_insert_with(|| name.to_owned());
+                    if !finished.contains(id) {
+                        tracker.observe(ActivityEvent::ToolStarted(id.to_owned()));
+                    }
+                }
+                (Some("user"), Some("tool_result")) => {
+                    let Some(id) = part.get("tool_use_id").and_then(Value::as_str) else {
+                        return SessionActivity::Unknown;
+                    };
+                    if !calls.contains_key(id) {
+                        return SessionActivity::Unknown;
+                    }
+                    if !finished.insert(id.to_owned()) {
+                        continue;
+                    }
+                    tracker.observe(ActivityEvent::ToolFinished(id.to_owned()));
+                    if part.get("is_error").and_then(Value::as_bool) == Some(true) {
+                        continue;
+                    }
+                    if let Some(text) = part.get("content").and_then(Value::as_str) {
+                        let task = match calls.get(id).map(String::as_str) {
+                            Some("Bash") => text
+                                .strip_prefix("Command running in background with ID: ")
+                                .and_then(|rest| {
+                                    rest.split_once(". Output is being written to:")
+                                        .map(|(id, _)| id)
+                                }),
+                            Some("Monitor") => text
+                                .strip_prefix("Monitor started (task ")
+                                .and_then(|rest| {
+                                    rest.split_once(", expires in ").map(|(id, _)| id)
+                                }),
+                            _ => None,
+                        };
+                        if let Some(task) = task
+                            .filter(|task| !task.is_empty() && !task.contains(char::is_whitespace))
+                        {
+                            tracker.observe(ActivityEvent::BackgroundStarted(task.to_owned()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if !identified {
+        SessionActivity::Unknown
+    } else if notification_turn {
+        SessionActivity::Busy
+    } else {
+        tracker.activity()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

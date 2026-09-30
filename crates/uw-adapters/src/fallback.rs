@@ -142,6 +142,12 @@ impl HarnessAdapter for FallbackCompactionAdapter {
     ) -> AdapterResult<()> {
         self.native.resume_session(session, message).await
     }
+    async fn session_activity(
+        &self,
+        session: &SessionSummary,
+    ) -> AdapterResult<uw_core::activity::SessionActivity> {
+        self.native.session_activity(session).await
+    }
     async fn export_transcript(&self, session: &SessionSummary) -> AdapterResult<String> {
         self.native.export_transcript(session).await
     }
@@ -176,6 +182,12 @@ mod tests {
 
     #[async_trait]
     impl HarnessAdapter for Fake {
+        async fn session_activity(
+            &self,
+            _: &SessionSummary,
+        ) -> AdapterResult<uw_core::activity::SessionActivity> {
+            Ok(uw_core::activity::SessionActivity::Busy)
+        }
         fn provider(&self) -> Provider {
             Provider::Codex
         }
@@ -274,6 +286,20 @@ mod tests {
             superseded_by: None,
             reseeded_from: None,
         }
+    }
+
+    #[tokio::test]
+    async fn fallback_preserves_native_outstanding_work() {
+        let native = Fake {
+            can_trigger_compaction: false,
+            compact_result: Arc::new(Mutex::new(None)),
+            compact_calls: Arc::new(Mutex::new(0)),
+        };
+        let adapter = FallbackCompactionAdapter::new(Arc::new(native.clone()), Arc::new(native));
+        assert_eq!(
+            adapter.session_activity(&session()).await.unwrap(),
+            uw_core::activity::SessionActivity::Busy
+        );
     }
 
     #[tokio::test]

@@ -261,3 +261,46 @@ section.
 codex mcp --help describes MCP as external-server management with list, get, add, remove, login, and logout. codex doctor reported zero MCP servers configured on this machine. codex plugin --help describes plugin installation and marketplace management; it does not expose a session-specific MCP scope flag.
 
 The local research found no Codex-specific MCP registration that would limit a server to usagewindow-managed sessions. A user-level MCP server should therefore be assumed to load into every Codex session where that config is active. If a future usagewindow MCP server is installed globally, gate its behavior on an adapter-set environment marker or session id and keep its tools read-only by default. The hook path is a better fit for short status injection because it can target SessionStart(source=compact) without adding an MCP tool schema to unrelated sessions.
+
+## Command activity (read-only verification, 2026-09-30)
+
+Inspected existing local rollout files without starting or attaching a Codex
+process. The rollout
+`rollout-2026-09-23T18-57-24-01a0d0ea-cf20-71a1-83bf-82d7f6d71f5b.jsonl`
+contains `response_item` payloads with `custom_tool_call` /
+`custom_tool_call_output` paired by `call_id`. The output is an array of
+`input_text` blocks. One block contains a JSON command result with
+`session_id:31178`, `chunk_id`, `wall_time_seconds`, and `output`, with no
+`exit_code`. The command remains running after its outer orchestration call
+returns. A subsequent `custom_tool_call` invokes `tools.write_stdin` with
+that session ID. Other local rollouts also contain `function_call` /
+`function_call_output` payloads.
+
+The parser must retain outstanding tool calls and yielded command sessions
+separately. Structured command results with a session ID and no terminal exit
+code establish ongoing work. A completed outer tool call or `task_complete`
+turn event alone cannot clear that work. A command's exit result can clear it
+only when correlated to the same session. Arbitrary JavaScript orchestration
+cannot always be correlated safely; retain protection if correlation cannot be
+proved. Output suppression can hide nested command results, so unrecognized
+command orchestration provides unknown activity rather than proof of idleness.
+These rollout shapes are diagnostic storage, not a stable public hook API;
+new shapes must fail closed until verified.
+
+Activity reads use the raw rollout rather than transcript exports, validate the
+filename and `session_meta` identity, and accept the existing discovery parser's
+`session_id` metadata alternative only when it agrees with any `id` field.
+An uncorrelated terminal result cannot clear a yielded command. Local inspection
+found no native `function_call` / `write_stdin` sample proving its arguments-to-exit
+correlation, so this parser leaves such older command sessions protected unless
+the structured terminal result includes their ID. A complete outer call with
+opaque or suppressed command output provides unknown activity. This is a
+conservative limitation pending verified native-call fixtures.
+
+A further read-only sample from
+`rollout-2026-09-30T02-35-35-01a0f174-737e-7301-8f6f-426cf2060558.jsonl`,
+call `call_9KrS4W6mQPDIUVpqDUYKQDJ6`, verifies the exact custom input wrapper
+`text(await tools.write_stdin({...}));` with literal arguments containing
+`session_id:38134`. Its output contains a JSON result with `exit_code:101`
+and no session ID. The parser can correlate this narrow single-helper form by
+validating literal arguments; extra JavaScript and expressions remain ambiguous.

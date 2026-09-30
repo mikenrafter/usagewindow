@@ -235,3 +235,51 @@ record if a future Claude release emits one.
   `claude --resume` for compaction and therefore does not create a copy. The mapping
   uses `PASEO_HOME` (falling back to `$HOME/.paseo`) and `UW_PASEO_CLI` can override
   the CLI executable.
+
+## Command activity and manual keepalive (read-only verification, 2026-09-30)
+
+Inspected the existing Claude Code 2.1.285 transcript for session
+`006d12d4-5826-495b-a799-c2998da1451c`; no messages were sent and no process
+was attached, resumed, or interrupted. At 23:12:01 UTC the assistant called
+`Bash` with `run_in_background:true` and command `sleep 270 && echo keepalive`.
+Its user-role `tool_result` carried the same `tool_use_id` and the text
+`Command running in background with ID: boaguqs47. Output is being written to:`
+followed by the task output path. The assistant ended the turn while the task ran.
+
+At 23:16:31 a user-role string `message.content` contained a
+`<task-notification>` with `<task-id>boaguqs47</task-id>` and
+`<status>completed</status>`. At 23:16:33 a second Bash call returned the same
+background-result shape with ID `bzarj83i7`. At 23:17:06 usagewindow sent its
+`idle cache expiry` preservation instruction while that task was outstanding.
+At 23:17:11 a notification listed several `<task-id>` elements, including
+`bzarj83i7`, and `<status>stopped</status>`. The transcript then recorded
+`/compact`. This establishes that a turn end or Stop hook does not prove that
+background work has finished.
+
+Activity observation pairs `message.content` tool-use IDs with tool-result IDs.
+A tool call without its result protects foreground commands and blocking output
+monitors regardless of tool name. The verified background-result prefix starts
+a separate task lifetime; only an explicit terminal task notification ends it.
+Command text, skill names, and an arbitrary silence timeout do not establish
+completion. Notifications can contain multiple task IDs. Plain user text quoting
+a notification must not be interpreted as a harness notification unless the
+content itself is the notification envelope. Unreadable or malformed transcripts
+provide unknown activity, not proof of idleness.
+
+The same transcript also verifies asynchronous `Monitor` launches. At 22:25:17
+UTC, `Monitor` returned `Monitor started (task b44939cpf, expires in 10m unless
+the source ends first; ...). You will be notified on each event.` The result
+completed the tool call, but the monitor remained a separate background task.
+Later monitors used IDs `bdbnilvvq` and `bx1jjzb8j`. The eventual stopped
+notification included `b44939cpf` and `bx1jjzb8j`. A launch's advertised expiry
+is not a verified completion record; do not use it to infer that monitoring ended.
+
+The captured transcript also records `system` / `turn_duration` after the final
+assistant message of a turn. A terminal task notification ends the task but
+starts another assistant turn; activity remains protected until that turn's
+`turn_duration` record. This closes the interval between a keepalive expiry
+notification and its next tool call when the last external hook is still Stop.
+Duplicate tool-use records are idempotent; a repeated streaming record cannot
+reopen a tool call whose matching result already arrived. Root activity ignores
+`isSidechain:true` records. The parser was checked read-only against the original
+session transcript up to 23:17:06 UTC and reports busy at the interruption point.

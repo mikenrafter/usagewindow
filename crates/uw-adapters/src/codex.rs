@@ -550,6 +550,43 @@ impl HarnessAdapter for CodexAdapter {
         Ok(found)
     }
 
+    async fn session_activity(
+        &self,
+        session: &SessionSummary,
+    ) -> AdapterResult<uw_core::activity::SessionActivity> {
+        let known_path = session.state_path.clone();
+        let id = session.id.clone();
+        let root = self.resolved_sessions_root();
+        tokio::task::spawn_blocking(move || {
+            use uw_core::activity::SessionActivity;
+            let path = known_path.map(PathBuf::from).or_else(|| {
+                rollout_files(&root).into_iter().find(|path| {
+                    path.file_stem()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.ends_with(&format!("-{}", id.0)))
+                })
+            });
+            let Some(path) = path else {
+                return SessionActivity::Unknown;
+            };
+            if !path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("rollout-") && name.ends_with(&format!("-{}", id.0))
+                })
+            {
+                return SessionActivity::Unknown;
+            }
+            match std::fs::read_to_string(path) {
+                Ok(content) => rollout_activity(&content, &id),
+                Err(_) => SessionActivity::Unknown,
+            }
+        })
+        .await
+        .map_err(|error| AdapterError::Other(error.to_string()))
+    }
+
     async fn session_preview(&self, session: &SessionSummary) -> AdapterResult<Vec<TurnPreview>> {
         let known_path = session.state_path.clone();
         let id = session.id.0.clone();
@@ -875,6 +912,156 @@ fn rollout_turn_preview(path: &std::path::Path) -> Option<Vec<TurnPreview>> {
         }
     }
     Some(preview)
+}
+
+/// Recognize only the verified single-helper wrapper with literal JSON-like arguments.
+/// Anything with extra JavaScript, expressions, or calls remains uncorrelated.
+fn single_write_stdin_session(call: &Value) -> Option<String> {
+    if !matches!(
+        call.get("name").and_then(Value::as_str),
+        Some("exec" | "functions.exec")
+    ) {
+        return None;
+    }
+    let source = call.get("input")?.as_str()?.trim();
+    let args = source
+        .strip_prefix("text(await tools.write_stdin(")?
+        .strip_suffix("));")?;
+    // The captured wrapper leaves these two keys bare; its other keys are JSON.
+    let args = args
+        .replace("session_id:", "\"session_id\":")
+        .replace("chars:", "\"chars\":");
+    let args: Value = serde_json::from_str(&args).ok()?;
+    let object = args.as_object()?;
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "session_id" | "chars" | "yield_time_ms" | "max_output_tokens"
+        )
+    }) {
+        return None;
+    }
+    if object.get("chars").is_some_and(|value| !value.is_string())
+        || ["yield_time_ms", "max_output_tokens"]
+            .iter()
+            .any(|key| object.get(*key).is_some_and(|value| !value.is_u64()))
+    {
+        return None;
+    }
+    Some(object.get("session_id")?.as_u64()?.to_string())
+}
+
+/// Reconstruct work from verified rollout tool envelopes and structured command results.
+pub fn rollout_activity(
+    content: &str,
+    session_id: &SessionId,
+) -> uw_core::activity::SessionActivity {
+    use uw_core::activity::{ActivityEvent, ActivityTracker, SessionActivity};
+    let mut tracker = ActivityTracker::default();
+    let mut calls = std::collections::HashMap::<String, Value>::new();
+    let mut finished = std::collections::HashSet::new();
+    let mut identified = false;
+    let mut uncertain = false;
+    for line in content.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            return SessionActivity::Unknown;
+        };
+        let Some(payload) = record.get("payload") else {
+            return SessionActivity::Unknown;
+        };
+        match record.get("type").and_then(Value::as_str) {
+            Some("session_meta") => {
+                let primary = payload.get("id").and_then(Value::as_str);
+                let alternate = payload.get("session_id").and_then(Value::as_str);
+                if primary.or(alternate) != Some(session_id.0.as_str())
+                    || primary.zip(alternate).is_some_and(|(a, b)| a != b)
+                {
+                    return SessionActivity::Unknown;
+                }
+                identified = true;
+            }
+            Some("response_item") => match payload.get("type").and_then(Value::as_str) {
+                Some("custom_tool_call" | "function_call") => {
+                    let Some(id) = payload.get("call_id").and_then(Value::as_str) else {
+                        return SessionActivity::Unknown;
+                    };
+                    calls
+                        .entry(id.to_owned())
+                        .or_insert_with(|| payload.clone());
+                    if !finished.contains(id) {
+                        tracker.observe(ActivityEvent::ToolStarted(id.to_owned()));
+                    }
+                }
+                Some("custom_tool_call_output" | "function_call_output") => {
+                    let Some(id) = payload.get("call_id").and_then(Value::as_str) else {
+                        return SessionActivity::Unknown;
+                    };
+                    if !finished.insert(id.to_owned()) {
+                        continue;
+                    }
+                    let Some(call) = calls.get(id) else {
+                        return SessionActivity::Unknown;
+                    };
+                    tracker.observe(ActivityEvent::ToolFinished(id.to_owned()));
+                    let Some(output) = payload.get("output") else {
+                        return SessionActivity::Unknown;
+                    };
+                    let texts: Vec<&str> = if let Some(text) = output.as_str() {
+                        vec![text]
+                    } else if let Some(parts) = output.as_array() {
+                        parts
+                            .iter()
+                            .filter_map(|part| part.get("text").and_then(Value::as_str))
+                            .collect()
+                    } else {
+                        return SessionActivity::Unknown;
+                    };
+                    let mut recognized = false;
+                    for text in texts {
+                        let Ok(result) = serde_json::from_str::<Value>(text) else {
+                            continue;
+                        };
+                        let command_id = result
+                            .get("session_id")
+                            .filter(|id| id.is_number() || id.is_string())
+                            .map(Value::to_string);
+                        if result.get("exit_code").is_some_and(Value::is_number) {
+                            recognized = true;
+                            if let Some(command_id) =
+                                command_id.or_else(|| single_write_stdin_session(call))
+                            {
+                                tracker.observe(ActivityEvent::BackgroundFinished(command_id));
+                            }
+                            // Arbitrary orchestration cannot correlate a terminal result by source text.
+                        } else if let Some(command_id) = command_id {
+                            recognized = true;
+                            tracker.observe(ActivityEvent::BackgroundStarted(command_id));
+                        }
+                    }
+                    // Suppressed or arbitrary JavaScript output cannot prove its nested commands finished.
+                    if !recognized
+                        && matches!(
+                            call.get("name").and_then(Value::as_str),
+                            Some("exec" | "functions.exec" | "exec_command" | "write_stdin")
+                        )
+                    {
+                        uncertain = true;
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    if !identified {
+        SessionActivity::Unknown
+    } else if tracker.activity() == SessionActivity::Busy {
+        SessionActivity::Busy
+    } else if uncertain {
+        SessionActivity::Unknown
+    } else {
+        SessionActivity::Idle
+    }
 }
 
 #[cfg(test)]
