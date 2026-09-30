@@ -131,6 +131,18 @@ pub trait HarnessAdapter: Send + Sync {
     fn provider(&self) -> Provider;
     fn capabilities(&self) -> Capabilities;
     async fn fetch_usage(&self, account: Option<&AccountId>) -> AdapterResult<UsageSample>;
+    /// Requests fresher local cache data for time-sensitive polling. Adapters
+    /// without a cache can use the default implementation. Existing stale-data
+    /// fallback on transient errors may still return an older reading; this does
+    /// not control how often the provider updates its underlying usage data.
+    async fn fetch_usage_with_max_age(
+        &self,
+        account: Option<&AccountId>,
+        _max_age: std::time::Duration,
+    ) -> AdapterResult<UsageSample> {
+        self.fetch_usage(account).await
+    }
+
     async fn detect_stop(&self, session_id: &SessionId) -> AdapterResult<Option<StopReason>>;
     /// Check for a stop using a provider sample already fetched in this tick.
     /// Adapters that need a separate signal may fall back to `detect_stop`.
