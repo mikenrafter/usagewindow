@@ -52,6 +52,13 @@ impl SequenceAdapter {
 
 #[async_trait]
 impl HarnessAdapter for SequenceAdapter {
+    async fn session_activity(
+        &self,
+        _: &SessionSummary,
+    ) -> uw_core::adapter::AdapterResult<uw_core::activity::SessionActivity> {
+        // This fixture has no commands; its liveness transition controls idle timing.
+        Ok(uw_core::activity::SessionActivity::Idle)
+    }
     fn provider(&self) -> Provider {
         self.sample.provider.clone()
     }

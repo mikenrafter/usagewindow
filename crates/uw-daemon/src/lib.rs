@@ -1137,7 +1137,7 @@ pub async fn run_reseed_auto_tick(
         &profile.reseed_auto,
         &adapter.capabilities(),
     );
-    if should {
+    if should && activity_is_idle(adapter, session).await {
         Ok(Some(
             run_reseed(session, cheap_model, adapter, summarizer, store).await?,
         ))
@@ -1187,7 +1187,7 @@ where
             &profile.reseed_auto,
             &adapter.capabilities(),
         );
-        if !should_reseed {
+        if !should_reseed || !activity_is_idle(adapter.as_ref(), session).await {
             continue;
         }
         let request = CompactionRequest {
@@ -1205,8 +1205,36 @@ where
         if !store.claim_compaction(request.id).await? {
             continue;
         }
+        let current = match store.compaction_owner(&session.id).await {
+            Ok(current) => current,
+            Err(error) => {
+                store
+                    .update_compaction(
+                        request.id,
+                        CompactionStatus::Failed(format!(
+                            "post-claim session observation failed: {error}"
+                        )),
+                    )
+                    .await?;
+                continue;
+            }
+        };
+        if current.harness != session.harness
+            || current.superseded_by.is_some()
+            || !activity_is_idle(adapter.as_ref(), &current).await
+        {
+            store
+                .update_compaction(
+                    request.id,
+                    CompactionStatus::Failed(
+                        "session activity or identity changed after claim".into(),
+                    ),
+                )
+                .await?;
+            continue;
+        }
         match run_reseed(
-            session,
+            &current,
             runtime.cheap_model.clone(),
             adapter.as_ref(),
             runtime.summarizer.as_ref(),
@@ -1439,6 +1467,15 @@ pub async fn run_keepalive_tick(
     Ok(sent)
 }
 
+/// Automatic idle actions require a verified work-free session. Missing or hung
+/// observations fail closed without holding the daemon's other polling work.
+async fn activity_is_idle(adapter: &dyn HarnessAdapter, session: &SessionSummary) -> bool {
+    matches!(
+        tokio::time::timeout(StdDuration::from_secs(1), adapter.session_activity(session)).await,
+        Ok(Ok(uw_core::activity::SessionActivity::Idle))
+    )
+}
+
 pub async fn run_compaction_tick(
     store: &dyn DaemonStore,
     adapters: &HashMap<Provider, Arc<dyn HarnessAdapter>>,
@@ -1461,10 +1498,16 @@ pub async fn run_compaction_tick(
                 .await?;
             continue;
         };
+        let automatic = matches!(
+            request.kind,
+            CompactionKind::OpportunisticIdle | CompactionKind::AltModelReseed
+        );
+        let idle = liveness.is_idle(&session).await
+            && (!automatic || activity_is_idle(adapter.as_ref(), &session).await);
         match plan_compaction_tick(
             &request,
             &adapter.capabilities(),
-            liveness.is_idle(&session).await,
+            idle,
             &session,
             is_cache_warm(session.last_seen, Utc::now()),
         ) {
@@ -1478,6 +1521,48 @@ pub async fn run_compaction_tick(
                 if !store.claim_compaction(request.id).await? {
                     continue;
                 }
+                // Claiming prevents duplicate delivery; it does not freeze session
+                // work. Re-read identity and readiness before the destructive send.
+                let session = if automatic {
+                    let current = match store.compaction_owner(&request.session_id).await {
+                        Ok(current) => current,
+                        Err(error) => {
+                            store
+                                .update_compaction(
+                                    request.id,
+                                    CompactionStatus::Failed(format!(
+                                        "post-claim session observation failed: {error}"
+                                    )),
+                                )
+                                .await?;
+                            continue;
+                        }
+                    };
+                    let idle = activity_is_idle(adapter.as_ref(), &current).await
+                        && liveness.is_idle(&current).await;
+                    if current.harness != session.harness
+                        || plan_compaction_tick(
+                            &request,
+                            &adapter.capabilities(),
+                            idle,
+                            &current,
+                            is_cache_warm(current.last_seen, Utc::now()),
+                        ) != CompactionPlan::ClaimAndSend
+                    {
+                        store
+                            .update_compaction(
+                                request.id,
+                                CompactionStatus::Failed(
+                                    "session activity or readiness changed after claim".into(),
+                                ),
+                            )
+                            .await?;
+                        continue;
+                    }
+                    current
+                } else {
+                    session
+                };
                 let result = adapter.compact(&session, &request).await;
                 let status = match result {
                     Ok(DeliveryOutcome::Delivered | DeliveryOutcome::QueuedForNextIdle) => {
@@ -1840,7 +1925,7 @@ impl IdleEpisodeTracker {
         profile: &ThresholdProfile,
         adapter: &dyn HarnessAdapter,
     ) -> anyhow::Result<bool> {
-        if !idle {
+        if !idle || !activity_is_idle(adapter, session).await {
             self.enqueued.remove(&session.id);
             return Ok(false);
         }
@@ -3489,6 +3574,12 @@ mod tests {
     static RESUME_CALLS: AtomicUsize = AtomicUsize::new(0);
     #[async_trait]
     impl HarnessAdapter for FakeAdapter {
+        async fn session_activity(
+            &self,
+            _: &SessionSummary,
+        ) -> AdapterResult<uw_core::activity::SessionActivity> {
+            Ok(uw_core::activity::SessionActivity::Idle)
+        }
         fn provider(&self) -> Provider {
             Provider::ClaudeCode
         }
@@ -3525,6 +3616,449 @@ mod tests {
             Ok(())
         }
     }
+    struct ActivityAdapter {
+        activity: Option<uw_core::activity::SessionActivity>,
+        after_first: Option<Option<uw_core::activity::SessionActivity>>,
+        observations: AtomicUsize,
+        hangs: bool,
+        compacted: Arc<StdMutex<u32>>,
+    }
+    #[async_trait]
+    impl HarnessAdapter for ActivityAdapter {
+        fn provider(&self) -> Provider {
+            Provider::ClaudeCode
+        }
+        fn capabilities(&self) -> Capabilities {
+            let mut capabilities = caps(true, true, true);
+            capabilities.seed_modes = vec![SeedMode::InitialPrompt];
+            capabilities
+        }
+        async fn session_activity(
+            &self,
+            _: &SessionSummary,
+        ) -> AdapterResult<uw_core::activity::SessionActivity> {
+            if self.hangs {
+                std::future::pending::<()>().await;
+            }
+            let calls = self.observations.fetch_add(1, Ordering::SeqCst);
+            let activity = if calls > 0 {
+                self.after_first.unwrap_or(self.activity)
+            } else {
+                self.activity
+            };
+            activity.ok_or_else(|| AdapterError::Transient("unreadable activity".into()))
+        }
+        async fn fetch_usage(&self, _: Option<&AccountId>) -> AdapterResult<UsageSample> {
+            Err(AdapterError::Unsupported)
+        }
+        async fn detect_stop(&self, _: &SessionId) -> AdapterResult<Option<StopReason>> {
+            Ok(None)
+        }
+        async fn emit_status(
+            &self,
+            _: &SessionId,
+            _: StatusEvent,
+        ) -> AdapterResult<DeliveryOutcome> {
+            Ok(DeliveryOutcome::Delivered)
+        }
+        async fn advise(&self, _: &SessionId, _: &str) -> AdapterResult<DeliveryOutcome> {
+            Ok(DeliveryOutcome::Delivered)
+        }
+        async fn compact(
+            &self,
+            _: &SessionSummary,
+            _: &CompactionRequest,
+        ) -> AdapterResult<DeliveryOutcome> {
+            *self.compacted.lock().unwrap() += 1;
+            Ok(DeliveryOutcome::Delivered)
+        }
+        async fn resume_session(&self, _: &SessionSummary, _: Option<&str>) -> AdapterResult<()> {
+            Ok(())
+        }
+    }
+    fn activity_store(kind: CompactionKind) -> FakeStore {
+        let mut req = request();
+        req.kind = kind;
+        FakeStore {
+            request: StdMutex::new(Some(req)),
+            owner: session(),
+            claim: true,
+            status: StdMutex::new(vec![]),
+            samples: vec![],
+            enqueues: Arc::new(StdMutex::new(0)),
+            active_resume: None,
+            resolved: Arc::new(StdMutex::new(vec![])),
+        }
+    }
+    #[tokio::test]
+    async fn automatic_compaction_preserves_work_even_if_stop_hook_says_idle() {
+        use uw_core::activity::SessionActivity;
+        for activity in [
+            Some(SessionActivity::Busy),
+            Some(SessionActivity::Unknown),
+            None,
+        ] {
+            for kind in [
+                CompactionKind::OpportunisticIdle,
+                CompactionKind::AltModelReseed,
+            ] {
+                let store = activity_store(kind);
+                let compacted = Arc::new(StdMutex::new(0));
+                let adapter = Arc::new(ActivityAdapter {
+                    activity,
+                    after_first: None,
+                    observations: AtomicUsize::new(0),
+                    hangs: false,
+                    compacted: compacted.clone(),
+                });
+                run_compaction_tick(
+                    &store,
+                    &HashMap::from([(Provider::ClaudeCode, adapter as Arc<dyn HarnessAdapter>)]),
+                    &AlwaysIdle,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    *compacted.lock().unwrap(),
+                    0,
+                    "outstanding work must not receive compaction"
+                );
+                assert!(
+                    store.status.lock().unwrap().is_empty(),
+                    "request must remain pending"
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn agent_requested_compaction_is_allowed_while_activity_is_busy() {
+        let store = activity_store(CompactionKind::AgentRequested);
+        let compacted = Arc::new(StdMutex::new(0));
+        let adapter = Arc::new(ActivityAdapter {
+            activity: Some(uw_core::activity::SessionActivity::Busy),
+            after_first: None,
+            observations: AtomicUsize::new(0),
+            hangs: false,
+            compacted: compacted.clone(),
+        });
+        run_compaction_tick(
+            &store,
+            &HashMap::from([(Provider::ClaudeCode, adapter as Arc<dyn HarnessAdapter>)]),
+            &AlwaysIdle,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*compacted.lock().unwrap(), 1);
+    }
+    #[tokio::test]
+    async fn idle_episode_does_not_enqueue_while_activity_is_busy_unknown_or_unreadable() {
+        use uw_core::activity::SessionActivity;
+        for activity in [
+            Some(SessionActivity::Busy),
+            Some(SessionActivity::Unknown),
+            None,
+        ] {
+            let store = activity_store(CompactionKind::OpportunisticIdle);
+            let adapter = ActivityAdapter {
+                activity,
+                after_first: None,
+                observations: AtomicUsize::new(0),
+                hangs: false,
+                compacted: Arc::new(StdMutex::new(0)),
+            };
+            let mut tracker = IdleEpisodeTracker::new();
+            assert!(
+                !tracker
+                    .tick(
+                        &store,
+                        &session(),
+                        Utc::now(),
+                        true,
+                        Duration::minutes(1),
+                        &ThresholdProfile::default(),
+                        &adapter
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(*store.enqueues.lock().unwrap(), 0);
+        }
+    }
+    #[tokio::test]
+    async fn adapter_without_activity_support_cannot_qualify_for_automatic_idle() {
+        let store = activity_store(CompactionKind::OpportunisticIdle);
+        let adapter = Arc::new(BoundaryAdapter {
+            advised: StdMutex::new(vec![]),
+            resume_calls: AtomicUsize::new(0),
+        });
+        assert_eq!(
+            adapter.session_activity(&session()).await.unwrap(),
+            uw_core::activity::SessionActivity::Unknown
+        );
+        run_compaction_tick(
+            &store,
+            &HashMap::from([(
+                Provider::ClaudeCode,
+                adapter.clone() as Arc<dyn HarnessAdapter>,
+            )]),
+            &AlwaysIdle,
+        )
+        .await
+        .unwrap();
+        assert!(store.status.lock().unwrap().is_empty());
+        assert!(
+            !IdleEpisodeTracker::new()
+                .tick(
+                    &store,
+                    &session(),
+                    Utc::now(),
+                    true,
+                    Duration::minutes(1),
+                    &ThresholdProfile::default(),
+                    adapter.as_ref()
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(*store.enqueues.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn command_work_resets_idle_episode_even_if_idle_hook_is_unchanged() {
+        let store = activity_store(CompactionKind::OpportunisticIdle);
+        let mut adapter = ActivityAdapter {
+            activity: Some(uw_core::activity::SessionActivity::Idle),
+            after_first: None,
+            observations: AtomicUsize::new(0),
+            hangs: false,
+            compacted: Arc::new(StdMutex::new(0)),
+        };
+        let mut tracker = IdleEpisodeTracker::new();
+        for (activity, expected) in [
+            (uw_core::activity::SessionActivity::Idle, true),
+            (uw_core::activity::SessionActivity::Busy, false),
+            (uw_core::activity::SessionActivity::Idle, true),
+        ] {
+            adapter.activity = Some(activity);
+            assert_eq!(
+                tracker
+                    .tick(
+                        &store,
+                        &session(),
+                        Utc::now(),
+                        true,
+                        Duration::minutes(1),
+                        &ThresholdProfile::default(),
+                        &adapter
+                    )
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(*store.enqueues.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_rechecks_activity_after_claim() {
+        use uw_core::activity::SessionActivity;
+        for activity in [
+            Some(SessionActivity::Busy),
+            Some(SessionActivity::Unknown),
+            None,
+        ] {
+            let store = activity_store(CompactionKind::OpportunisticIdle);
+            let compacted = Arc::new(StdMutex::new(0));
+            let adapter = ActivityAdapter {
+                activity: Some(SessionActivity::Idle),
+                after_first: Some(activity),
+                observations: AtomicUsize::new(0),
+                hangs: false,
+                compacted: compacted.clone(),
+            };
+            run_compaction_tick(
+                &store,
+                &HashMap::from([(
+                    Provider::ClaudeCode,
+                    Arc::new(adapter) as Arc<dyn HarnessAdapter>,
+                )]),
+                &AlwaysIdle,
+            )
+            .await
+            .unwrap();
+            assert_eq!(*compacted.lock().unwrap(), 0);
+            assert!(matches!(
+                store.status.lock().unwrap().as_slice(),
+                [CompactionStatus::Failed(_)]
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn hung_activity_observation_does_not_hold_compaction_polling() {
+        let store = activity_store(CompactionKind::OpportunisticIdle);
+        let compacted = Arc::new(StdMutex::new(0));
+        let adapter = ActivityAdapter {
+            activity: Some(uw_core::activity::SessionActivity::Idle),
+            after_first: None,
+            observations: AtomicUsize::new(0),
+            hangs: true,
+            compacted: compacted.clone(),
+        };
+        tokio::time::timeout(
+            StdDuration::from_secs(2),
+            run_compaction_tick(
+                &store,
+                &HashMap::from([(
+                    Provider::ClaudeCode,
+                    Arc::new(adapter) as Arc<dyn HarnessAdapter>,
+                )]),
+                &AlwaysIdle,
+            ),
+        )
+        .await
+        .expect("activity checks must be bounded")
+        .unwrap();
+        assert_eq!(*compacted.lock().unwrap(), 0);
+        assert!(store.status.lock().unwrap().is_empty());
+    }
+
+    #[async_trait]
+    impl ReseedStore for FakeStore {
+        async fn insert_reseed_summary(&self, _: ReseedSummary) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn insert_reseeded_session(&self, _: SessionSummary) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn last_reseed_at(&self, _: &SessionId) -> anyhow::Result<Option<DateTime<Utc>>> {
+            Ok(None)
+        }
+        async fn link_reseeded_session(&self, _: &SessionId, _: &SessionId) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    struct CountingSummarizer(AtomicUsize);
+    #[async_trait]
+    impl Summarizer for CountingSummarizer {
+        async fn summarize(
+            &self,
+            _: &str,
+            _: &SummarizeTemplate,
+        ) -> Result<String, uw_core::summarizer::SummarizerError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok("summary".into())
+        }
+    }
+    #[tokio::test]
+    async fn automatic_reseed_entrypoints_skip_busy_unknown_or_unreadable_before_export() {
+        use uw_core::activity::SessionActivity;
+        for activity in [
+            Some(SessionActivity::Busy),
+            Some(SessionActivity::Unknown),
+            None,
+        ] {
+            let store = activity_store(CompactionKind::AltModelReseed);
+            let adapter = Arc::new(ActivityAdapter {
+                activity,
+                after_first: None,
+                observations: AtomicUsize::new(0),
+                hangs: false,
+                compacted: Arc::new(StdMutex::new(0)),
+            });
+            let mut profile = ThresholdProfile::default();
+            profile.reseed_auto.enabled = true;
+            profile
+                .cache_ttl_by_provider
+                .insert(Provider::ClaudeCode, Duration::seconds(1));
+            let summarizer = Arc::new(CountingSummarizer(AtomicUsize::new(0)));
+            assert_eq!(
+                run_reseed_auto_tick(
+                    &session(),
+                    ModelId("cheap".into()),
+                    adapter.as_ref(),
+                    summarizer.as_ref(),
+                    &store,
+                    Utc::now(),
+                    Duration::seconds(1),
+                    1.0,
+                    10.0,
+                    Duration::hours(1),
+                    &profile
+                )
+                .await
+                .unwrap(),
+                None
+            );
+            let runtime = AutoReseedRuntime {
+                cheap_model: ModelId("cheap".into()),
+                summarizer: summarizer.clone(),
+                estimated_reseed_cost_usd: 1.0,
+                estimated_wait_for_reset_cost_usd: 10.0,
+            };
+            assert_eq!(
+                run_auto_reseed_ticks(
+                    &store,
+                    &HashMap::from([(Provider::ClaudeCode, adapter as Arc<dyn HarnessAdapter>)]),
+                    &[session()],
+                    &HashMap::from([(session().id, profile)]),
+                    &runtime,
+                    Utc::now()
+                )
+                .await
+                .unwrap(),
+                0
+            );
+            assert_eq!(*store.enqueues.lock().unwrap(), 0);
+            assert_eq!(summarizer.0.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_reseed_rechecks_activity_after_claim_before_export() {
+        let store = activity_store(CompactionKind::AltModelReseed);
+        let adapter = ActivityAdapter {
+            activity: Some(uw_core::activity::SessionActivity::Idle),
+            after_first: Some(Some(uw_core::activity::SessionActivity::Busy)),
+            observations: AtomicUsize::new(0),
+            hangs: false,
+            compacted: Arc::new(StdMutex::new(0)),
+        };
+        let mut profile = ThresholdProfile::default();
+        profile.reseed_auto.enabled = true;
+        profile
+            .cache_ttl_by_provider
+            .insert(Provider::ClaudeCode, Duration::seconds(1));
+        let summarizer = Arc::new(CountingSummarizer(AtomicUsize::new(0)));
+        let runtime = AutoReseedRuntime {
+            cheap_model: ModelId("cheap".into()),
+            summarizer: summarizer.clone(),
+            estimated_reseed_cost_usd: 1.0,
+            estimated_wait_for_reset_cost_usd: 10.0,
+        };
+        assert_eq!(
+            run_auto_reseed_ticks(
+                &store,
+                &HashMap::from([(
+                    Provider::ClaudeCode,
+                    Arc::new(adapter) as Arc<dyn HarnessAdapter>
+                )]),
+                &[session()],
+                &HashMap::from([(session().id, profile)]),
+                &runtime,
+                Utc::now()
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(*store.enqueues.lock().unwrap(), 1);
+        assert_eq!(summarizer.0.load(Ordering::SeqCst), 0);
+        assert!(
+            matches!(store.status.lock().unwrap().as_slice(), [CompactionStatus::Failed(reason)] if reason.contains("activity"))
+        );
+    }
+
     struct AlwaysIdle;
     #[async_trait]
     impl SessionLivenessChecker for AlwaysIdle {

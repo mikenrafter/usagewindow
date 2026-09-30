@@ -372,6 +372,34 @@ gives pending delivery another chance while the cache is warm. A policy wake dis
 its newly queued compactions immediately through the existing claim-before-send path.
 Provider observation and transcript discovery must not block these delivery deadlines.
 
+### Outstanding command work
+
+A Stop hook records the end of a model turn. It does not prove that the session
+has finished its commands or stopped monitoring their output. `HarnessAdapter`
+exposes a read-only `session_activity` observation as `Idle`, `Busy`, or `Unknown`.
+Adapters translate verified harness records into provider-neutral tool-start,
+tool-finish, background-start, and background-finish events. The core tracker
+keeps separate sets of outstanding tool calls and background tasks. It knows
+nothing about tool names, command text, keepalive skills, or providers.
+
+Opportunistic idle compaction requires both the existing idle signal and an
+`Idle` activity observation before enqueueing. Delivery checks activity again,
+including after the atomic claim and before sending. Active or unknown work
+blocks automatic idle compaction and automatic idle reseeding. A failed
+or timed-out observation fails closed; activity reads have a one-second bound.
+A request blocked before claim stays pending. If readiness changes after claim,
+the claimed request fails without delivery or retry. Delivery also rechecks
+liveness, session identity, and cache warmth after claiming. Explicit agent-requested and quota-boundary actions
+retain their existing policy distinction. A background task remains protected
+between output polls and across turn ends until its own completion is observed;
+quiet time is not a completion signal.
+
+Activity is reconstructed from current read-only harness state so daemon
+restarts do not forget outstanding work. Unsupported adapters return `Unknown`
+and cannot qualify for automatic idle actions until they supply verified
+activity data. Meta-harness fallback decorators delegate observation to the
+native adapter. They must not discard its protection when routing delivery.
+
 ## Trigger policies (Phase 3 target)
 
 - **Burn-rate-scaled near-limit trigger**: `effective_threshold = 100 -
