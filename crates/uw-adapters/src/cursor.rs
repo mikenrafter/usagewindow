@@ -637,18 +637,19 @@ impl CursorAdapter {
             return;
         };
         session.last_known_context_pct = Some(usage.context_pct);
-        let at = usage.last_updated_at.unwrap_or_else(|| (self.now)());
-        session.token_usage.push(TokenUsageRecord {
-            at,
-            model: None,
-            input_tokens: 0,
-            cached_input_tokens: 0,
-            cache_write_input_tokens: 0,
-            output_tokens: 0,
-            reasoning_output_tokens: 0,
-            total_tokens: 0,
-            context_pct: Some(usage.context_pct),
-        });
+        if let Some(at) = usage.last_updated_at.or(session.last_seen) {
+            session.token_usage.push(TokenUsageRecord {
+                at,
+                model: None,
+                input_tokens: 0,
+                cached_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                output_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 0,
+                context_pct: Some(usage.context_pct),
+            });
+        }
         if let Some(name) = usage.name {
             session.title = Some(name);
         }
@@ -1462,6 +1463,173 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(global_db);
+    }
+
+    struct CursorActivityFixture {
+        root: std::path::PathBuf,
+        global_db: std::path::PathBuf,
+        transcript: std::path::PathBuf,
+        clock: Arc<std::sync::Mutex<DateTime<Utc>>>,
+        adapter: CursorAdapter,
+    }
+
+    impl CursorActivityFixture {
+        fn new(composer: Value, modified: Option<DateTime<Utc>>) -> Self {
+            let id = "e709ae76-56ea-41a4-b098-d6ff7413c320";
+            let root =
+                std::env::temp_dir().join(format!("uw-cursor-activity-{}", uuid::Uuid::new_v4()));
+            let transcript = root
+                .join("project/agent-transcripts")
+                .join(id)
+                .join(format!("{id}.jsonl"));
+            let content = cursor_transcript_line("user", "hello");
+            if let Some(modified) = modified {
+                std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+                std::fs::write(&transcript, &content).unwrap();
+                std::fs::File::open(&transcript)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(modified.into()))
+                    .unwrap();
+            }
+            let global_db = global_storage_db_with_composer(id, composer);
+            let clock = Arc::new(std::sync::Mutex::new(fixed_now()));
+            let read_clock = clock.clone();
+            let adapter = CursorAdapter::new(Arc::new(FakeTransport(json!({}))))
+                .with_transcript_fs(Arc::new(FixtureTranscriptFs(vec![(
+                    transcript.to_str().unwrap().into(),
+                    content,
+                )])))
+                .with_global_storage_db(global_db.clone())
+                .with_chat_metadata_root(root.join("absent-chats"))
+                .with_clock(Arc::new(move || *read_clock.lock().unwrap()));
+            Self {
+                root,
+                global_db,
+                transcript,
+                clock,
+                adapter,
+            }
+        }
+
+        fn set_modified(&self, modified: DateTime<Utc>) {
+            std::fs::File::open(&self.transcript)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(modified.into()))
+                .unwrap();
+        }
+    }
+
+    impl Drop for CursorActivityFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = std::fs::remove_file(&self.global_db);
+        }
+    }
+
+    fn fixed_now() -> DateTime<Utc> {
+        Utc.timestamp_millis_opt(1_790_000_000_000)
+            .single()
+            .unwrap()
+    }
+
+    fn composer_without_usable_update_times() -> Vec<Value> {
+        vec![
+            json!({"contextUsagePercent": 66.0}),
+            json!({"contextUsagePercent": 66.0, "lastUpdatedAt": null}),
+            json!({"contextUsagePercent": 66.0, "lastUpdatedAt": "invalid"}),
+        ]
+    }
+
+    #[tokio::test]
+    async fn composer_activity_old_transcript_stays_inactive_on_cached_polls() {
+        let old = fixed_now() - chrono::Duration::hours(2);
+        for composer in composer_without_usable_update_times() {
+            let fixture = CursorActivityFixture::new(composer, Some(old));
+            for elapsed in [0, 10, 60] {
+                let now = fixed_now() + chrono::Duration::minutes(elapsed);
+                *fixture.clock.lock().unwrap() = now;
+                let discovered = fixture.adapter.discover_sessions().await.unwrap();
+                let session = &discovered[0];
+                assert!(!uw_core::model::session_has_recent_token_activity(
+                    &session.token_usage,
+                    now
+                ));
+                assert_eq!(session.last_known_context_pct, Some(66.0));
+                assert_eq!(session.last_seen, Some(old));
+                assert_eq!(session.token_usage.len(), 1);
+                assert_eq!(session.token_usage[0].at, old);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn composer_activity_recent_transcript_is_active_without_update_time() {
+        let recent = fixed_now() - chrono::Duration::minutes(2);
+        for composer in composer_without_usable_update_times() {
+            let fixture = CursorActivityFixture::new(composer, Some(recent));
+            let discovered = fixture.adapter.discover_sessions().await.unwrap();
+            let session = &discovered[0];
+            assert!(uw_core::model::session_has_recent_token_activity(
+                &session.token_usage,
+                fixed_now()
+            ));
+            assert_eq!(session.token_usage[0].at, recent);
+        }
+    }
+
+    #[tokio::test]
+    async fn composer_activity_updated_transcript_is_active_after_cached_discovery() {
+        let fixture = CursorActivityFixture::new(
+            json!({"contextUsagePercent": 66.0}),
+            Some(fixed_now() - chrono::Duration::hours(2)),
+        );
+        fixture.adapter.discover_sessions().await.unwrap();
+        fixture.adapter.discover_sessions().await.unwrap();
+        let recent = fixed_now() - chrono::Duration::minutes(1);
+        fixture.set_modified(recent);
+        let discovered = fixture.adapter.discover_sessions().await.unwrap();
+        let session = &discovered[0];
+        assert!(uw_core::model::session_has_recent_token_activity(
+            &session.token_usage,
+            fixed_now()
+        ));
+        assert_eq!(session.last_seen, Some(recent));
+        assert_eq!(session.token_usage[0].at, recent);
+    }
+
+    #[tokio::test]
+    async fn composer_activity_valid_recent_update_keeps_old_transcript_active() {
+        let recent = fixed_now() - chrono::Duration::minutes(2);
+        let fixture = CursorActivityFixture::new(
+            json!({"contextUsagePercent": 66.0, "lastUpdatedAt": recent.timestamp_millis()}),
+            Some(fixed_now() - chrono::Duration::hours(2)),
+        );
+        for _ in 0..2 {
+            let discovered = fixture.adapter.discover_sessions().await.unwrap();
+            let session = &discovered[0];
+            assert!(uw_core::model::session_has_recent_token_activity(
+                &session.token_usage,
+                fixed_now()
+            ));
+            assert_eq!(session.token_usage[0].at, recent);
+            assert_eq!(session.last_seen, Some(recent));
+        }
+    }
+
+    #[tokio::test]
+    async fn composer_activity_without_any_timestamp_retains_percent_without_activity() {
+        for composer in composer_without_usable_update_times() {
+            let fixture = CursorActivityFixture::new(composer, None);
+            let discovered = fixture.adapter.discover_sessions().await.unwrap();
+            let session = &discovered[0];
+            assert!(session.token_usage.is_empty());
+            assert!(!uw_core::model::session_has_recent_token_activity(
+                &session.token_usage,
+                fixed_now()
+            ));
+            assert_eq!(session.last_known_context_pct, Some(66.0));
+            assert_eq!(session.last_seen, None);
+        }
     }
 
     #[tokio::test]

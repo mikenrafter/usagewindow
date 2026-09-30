@@ -158,6 +158,32 @@ token count — `uw-policy::should_idle_compact` gets an independent
 percent-threshold path (`IdleCompactConfig.percent_threshold_pct`, default
 `65.0`) instead of estimating tokens from a percentage.
 
+## Activity timestamp fallback (verified 2026-09-30)
+
+Read the local global `state.vscdb` in SQLite read-only mode for session
+`e709ae76-56ea-41a4-b098-d6ff7413c320`. Its `composerData` record has
+`contextUsagePercent: 22.768` and `createdAt: 1779406059386`, but no usable
+`lastUpdatedAt`. The primary transcript mtime is `2026-09-28T05:39:32Z`;
+a second transcript for the same ID under a parent session's `subagents`
+directory has mtime `2026-05-21T23:31:48Z`.
+
+The running daemon nevertheless persisted thousands of zero-token context
+records dated at discovery time through September 30. This matches
+`apply_composer_usage` substituting its polling clock when `lastUpdatedAt`
+is absent. Reading an old context percentage does not establish fresh activity.
+
+Use a valid composer `lastUpdatedAt` for the context record timestamp; otherwise
+use the transcript mtime already captured as `DiscoveredSession.last_seen`.
+If neither timestamp is available, retain the context percentage and title
+without creating an activity record. Apply this rule on cache hits too. A recent
+transcript remains evidence of activity when composer timestamps are absent.
+
+Existing Cursor context-only records dated after their session's persisted
+`last_seen` came from the old polling-clock fallback: a valid composer timestamp
+was also written to `last_seen`. Remove those inconsistent records when opening
+the store, retaining the session's last known percentage. Preserve records at or
+before `last_seen`, records with actual token counts, and other providers' records.
+
 ## Compaction TODO
 
 Status: usage polling is implemented. Native Cursor compaction delivery remains disabled
