@@ -128,6 +128,15 @@ pub enum TurnRole {
 
 #[async_trait]
 pub trait HarnessAdapter: Send + Sync {
+    /// Read whether the session has outstanding tools or background work.
+    /// Return `Unknown` when records are missing or incomplete. Destructive
+    /// idle compaction requires confirmed `Idle` activity.
+    async fn session_activity(
+        &self,
+        _session: &SessionSummary,
+    ) -> AdapterResult<crate::activity::SessionActivity> {
+        Ok(crate::activity::SessionActivity::Unknown)
+    }
     fn provider(&self) -> Provider;
     fn capabilities(&self) -> Capabilities;
     async fn fetch_usage(&self, account: Option<&AccountId>) -> AdapterResult<UsageSample>;

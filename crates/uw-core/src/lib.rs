@@ -10,3 +10,5 @@ pub mod compaction;
 pub mod model;
 pub mod summarizer;
 pub mod threshold;
+
+pub mod activity;
