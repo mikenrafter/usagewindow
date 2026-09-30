@@ -1,6 +1,10 @@
 //! Polling and delivery orchestration. Decisions are kept separate from I/O so
 //! policy behavior can be tested with synthetic state and fake adapters/stores.
 
+mod cadence;
+#[cfg(test)]
+mod cadence_regression_tests;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use std::collections::{HashMap, HashSet};
@@ -747,38 +751,175 @@ impl ObservationStore for SqliteDaemonStore {
     }
 }
 
-/// Polls each registered provider once, then checks every tracked session for a
-/// structured stop signal. Adapter failures are isolated so one provider cannot
-/// prevent the others from being observed on the same cadence.
+/// Shared observation state. The guard is released even if a fetch is cancelled.
+#[derive(Default)]
+struct ObservationRuntime {
+    samples: Mutex<HashMap<(Provider, Option<AccountId>), UsageSample>>,
+    fetching: Mutex<HashSet<Provider>>,
+    completed: Mutex<HashMap<Provider, Instant>>,
+    changed: tokio::sync::Notify,
+    dirty: Mutex<HashSet<Provider>>,
+}
+impl ObservationRuntime {
+    fn samples(&self) -> Vec<UsageSample> {
+        self.samples
+            .lock()
+            .expect("observation cache poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+}
+struct FetchGuard<'a> {
+    runtime: &'a ObservationRuntime,
+    provider: Provider,
+}
+impl Drop for FetchGuard<'_> {
+    fn drop(&mut self) {
+        self.runtime
+            .fetching
+            .lock()
+            .expect("fetch guard poisoned")
+            .remove(&self.provider);
+        self.runtime
+            .completed
+            .lock()
+            .expect("fetch clock poisoned")
+            .insert(self.provider.clone(), Instant::now());
+        self.runtime.changed.notify_one();
+    }
+}
+async fn poll_provider(
+    store: &dyn ObservationStore,
+    adapter: &dyn HarnessAdapter,
+    runtime: &ObservationRuntime,
+    max_age: Option<StdDuration>,
+    timeout: Option<StdDuration>,
+) -> anyhow::Result<(ObservationReport, Option<UsageSample>)> {
+    let provider = adapter.provider();
+    if !runtime
+        .fetching
+        .lock()
+        .expect("fetch guard poisoned")
+        .insert(provider.clone())
+    {
+        return Ok((
+            ObservationReport::default(),
+            runtime
+                .samples()
+                .into_iter()
+                .find(|s| s.provider == provider),
+        ));
+    }
+    let _guard = FetchGuard {
+        runtime,
+        provider: provider.clone(),
+    };
+    let fetch = async {
+        match max_age {
+            Some(age) => adapter.fetch_usage_with_max_age(None, age).await,
+            None => adapter.fetch_usage(None).await,
+        }
+    };
+    let result = match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, fetch)
+            .await
+            .unwrap_or_else(|_| Err(AdapterError::Transient("usage poll timed out".into()))),
+        None => fetch.await,
+    };
+    let mut report = ObservationReport::default();
+    match result {
+        Ok(sample) => {
+            store
+                .record_fetch_result(provider.clone(), sample.account.clone(), Ok(()), Utc::now())
+                .await?;
+            let key = (provider, sample.account.clone());
+            let changed = runtime
+                .samples
+                .lock()
+                .expect("observation cache poisoned")
+                .get(&key)
+                != Some(&sample);
+            if changed {
+                store.record_usage(sample.clone()).await?;
+                report.samples_recorded = 1;
+            }
+            // Commit cache changes only after persistence succeeds. A failed
+            // write must retain the last known quota for scheduling protection.
+            let mut cache = runtime.samples.lock().expect("observation cache poisoned");
+            cache.retain(|(cached_provider, account), _| {
+                cached_provider != &sample.provider || account == &sample.account
+            });
+            cache.insert(key, sample.clone());
+            if changed {
+                runtime
+                    .dirty
+                    .lock()
+                    .expect("observation updates poisoned")
+                    .insert(sample.provider.clone());
+            }
+            Ok((report, Some(sample)))
+        }
+        Err(error) => {
+            store
+                .record_fetch_result(provider, None, Err(error.to_string()), Utc::now())
+                .await?;
+            report.adapter_errors = 1;
+            tracing::warn!(%error, "usage poll failed");
+            Ok((report, None))
+        }
+    }
+}
+/// Fetches quota only; it never discovers sessions or scans transcripts for stops.
+pub async fn run_usage_observation_tick(
+    store: &dyn ObservationStore,
+    adapters: &HashMap<Provider, Arc<dyn HarnessAdapter>>,
+    max_age: StdDuration,
+) -> anyhow::Result<ObservationReport> {
+    let runtime = ObservationRuntime::default();
+    let mut total = ObservationReport::default();
+    for adapter in adapters.values() {
+        let (report, _) =
+            poll_provider(store, adapter.as_ref(), &runtime, Some(max_age), None).await?;
+        total.samples_recorded += report.samples_recorded;
+        total.adapter_errors += report.adapter_errors;
+    }
+    Ok(total)
+}
+
 pub async fn run_observation_tick(
     store: &dyn ObservationStore,
     adapters: &HashMap<Provider, Arc<dyn HarnessAdapter>>,
+) -> anyhow::Result<ObservationReport> {
+    run_observation_tick_cached(
+        store,
+        adapters,
+        &ObservationRuntime::default(),
+        &HashMap::new(),
+        None,
+    )
+    .await
+}
+
+async fn run_observation_tick_cached(
+    store: &dyn ObservationStore,
+    adapters: &HashMap<Provider, Arc<dyn HarnessAdapter>>,
+    runtime: &ObservationRuntime,
+    intervals: &HashMap<Provider, StdDuration>,
+    timeout: Option<StdDuration>,
 ) -> anyhow::Result<ObservationReport> {
     let known = store.tracked_sessions().await?;
     let mut report = ObservationReport::default();
     let mut fetched_samples = HashMap::new();
     for adapter in adapters.values() {
-        match adapter.fetch_usage(None).await {
-            Ok(sample) => {
-                fetched_samples.insert(adapter.provider(), sample.clone());
-                store
-                    .record_fetch_result(adapter.provider(), None, Ok(()), Utc::now())
-                    .await?;
-                store.record_usage(sample).await?;
-                report.samples_recorded += 1;
-            }
-            Err(error) => {
-                store
-                    .record_fetch_result(
-                        adapter.provider(),
-                        None,
-                        Err(error.to_string()),
-                        Utc::now(),
-                    )
-                    .await?;
-                report.adapter_errors += 1;
-                tracing::warn!(provider = ?adapter.provider(), %error, "usage poll failed");
-            }
+        let age = intervals.get(&adapter.provider()).copied();
+        let fetch_timeout = timeout.map(|timeout| age.map_or(timeout, |age| timeout.min(age)));
+        let (fetched, sample) =
+            poll_provider(store, adapter.as_ref(), runtime, age, fetch_timeout).await?;
+        report.samples_recorded += fetched.samples_recorded;
+        report.adapter_errors += fetched.adapter_errors;
+        if let Some(sample) = sample {
+            fetched_samples.insert(adapter.provider(), sample);
         }
         match adapter.discover_sessions().await {
             Ok(found) => {
@@ -791,9 +932,13 @@ pub async fn run_observation_tick(
                         .upsert_discovered_session(
                             adapter.provider(),
                             session,
-                            fetched_samples
-                                .get(&adapter.provider())
-                                .and_then(|sample| sample.account.clone()),
+                            fetched_samples.get(&adapter.provider()).and_then(|_| {
+                                runtime
+                                    .samples()
+                                    .into_iter()
+                                    .find(|sample| sample.provider == adapter.provider())
+                                    .and_then(|sample| sample.account)
+                            }),
                             now,
                         )
                         .await?;
@@ -804,6 +949,14 @@ pub async fn run_observation_tick(
                 report.adapter_errors += 1;
                 tracing::warn!(provider = ?adapter.provider(), %error, "session discovery failed");
             }
+        }
+    }
+    // Discovery can wait while fast polls refresh quota or the provider account.
+    // Refresh successful providers only: failed fetches must not acquire stale
+    // stop evidence from the boot cache.
+    for sample in runtime.samples() {
+        if let Some(fetched) = fetched_samples.get_mut(&sample.provider) {
+            *fetched = sample;
         }
     }
     // Re-read so newly discovered sessions get a stop check in this same tick.
@@ -2368,7 +2521,7 @@ pub async fn run_production_ticks(
     liveness: &dyn SessionLivenessChecker,
     interval: std::time::Duration,
 ) -> anyhow::Result<()> {
-    let mut ticker = tokio::time::interval(interval);
+    let interval = interval.max(StdDuration::from_millis(1));
     let mut policy_state = PolicyRuntimeState::default();
     let auto_reseed = auto_reseed_runtime_from_env();
     let observation_interval = env_duration_or("UW_OBSERVATION_INTERVAL_SECS", interval);
@@ -2385,32 +2538,193 @@ pub async fn run_production_ticks(
             }
         });
     let started = Instant::now();
+    let runtime = Arc::new(ObservationRuntime::default());
+    let initial = store
+        .blocking(|store| Ok(store.latest_usage_samples_for(None, None)?))
+        .await?;
+    // SQLite stores one row per window; reassemble whole samples for deduplication.
+    for sample in initial {
+        let key = (sample.provider.clone(), sample.account.clone());
+        let mut cache = runtime.samples.lock().expect("observation cache poisoned");
+        cache
+            .entry(key)
+            .and_modify(|cached| {
+                cached.windows.extend(sample.windows.clone());
+                if sample.at > cached.at {
+                    cached.at = sample.at;
+                    cached.fetched_at = sample.fetched_at;
+                }
+            })
+            .or_insert(sample);
+    }
     let mut last_observation = started - observation_interval;
     let mut last_policy = started - policy_interval;
     let mut last_maintenance = started - maintenance_interval;
+    let mut last_queue = started - interval;
+    let mut sessions = store.tracked_sessions().await?;
+    let mut profiles = HashMap::new();
+    let mut full_running = false;
+    let mut usage_running = HashSet::new();
+    // JoinSet aborts owned work when this loop is cancelled.
+    let mut tasks: tokio::task::JoinSet<(Option<Provider>, anyhow::Result<ObservationReport>)> =
+        tokio::task::JoinSet::new();
+    let mut task_providers = HashMap::new();
+    let mut first = true;
+    let mut force_policy = false;
+    let mut refresh_policy = true;
+    let mut changed_providers = HashSet::new();
     loop {
-        ticker.tick().await;
-        // Explicit compaction requests are destructive and user-directed. Dispatch
-        // them before provider observation, which may block on a harness transport.
-        //
-        // Every step below logs and moves on instead of propagating: this loop is the
-        // entire quota-protection safety net for every tracked session, so one
-        // session's bad state (a stale thread id, a provider hiccup) must never take
-        // the whole daemon down and stop tracking/warning/compacting every session.
-        if let Err(error) = run_compaction_tick(store.as_ref(), adapters, liveness).await {
-            tracing::error!(%error, "compaction tick failed");
+        let now = Instant::now();
+        let wall_now = Utc::now();
+        let samples = runtime.samples();
+        let bands: HashMap<_, _> = adapters
+            .keys()
+            .map(|provider| {
+                (
+                    provider.clone(),
+                    cadence::provider_interval(
+                        observation_interval,
+                        provider,
+                        &samples,
+                        &sessions,
+                        wall_now,
+                    ),
+                )
+            })
+            .collect();
+        let idle_due = cadence::idle_deadline(wall_now, &sessions, &profiles);
+        let idle_at = idle_due.map(|delay| now + delay);
+        let mut wake = (last_queue + interval)
+            .min(last_policy + policy_interval)
+            .min(last_maintenance + maintenance_interval);
+        if !full_running {
+            wake = wake.min(last_observation + observation_interval);
+        }
+        if let Some(delay) = idle_due {
+            wake = wake.min(now + delay);
+        }
+        {
+            let completed = runtime.completed.lock().expect("fetch clock poisoned");
+            let fetching = runtime.fetching.lock().expect("fetch guard poisoned");
+            for (provider, band) in &bands {
+                if *band < observation_interval
+                    && !usage_running.contains(provider)
+                    && !fetching.contains(provider)
+                {
+                    wake = wake.min(completed.get(provider).copied().unwrap_or(started) + *band);
+                }
+            }
+        }
+        if !first && !force_policy && !refresh_policy {
+            tokio::select! {
+                _ = tokio::time::sleep(wake.saturating_duration_since(now)) => {}
+                _ = runtime.changed.notified() => {}
+                result = tasks.join_next_with_id(), if !tasks.is_empty() => {
+                    match result {
+                        Some(Ok((id, (provider, result)))) => {
+                            task_providers.remove(&id);
+                            if let Some(provider) = &provider { usage_running.remove(provider); }
+                            else { full_running = false; last_observation = Instant::now(); refresh_policy = true; }
+                            if let Err(error) = result { tracing::error!(%error, "observation task failed"); }
+                        }
+                        Some(Err(error)) => {
+                            tracing::error!(%error, "observation task panicked");
+                            match task_providers.remove(&error.id()).flatten() {
+                                Some(provider) => { usage_running.remove(&provider); }
+                                None => { full_running = false; last_observation = Instant::now(); }
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
+        first = false;
+        // Quota becomes actionable when its successful fetch is persisted, even
+        // if the full observation is still waiting on transcript discovery.
+        let dirty: Vec<_> = runtime
+            .dirty
+            .lock()
+            .expect("observation updates poisoned")
+            .drain()
+            .collect();
+        if !dirty.is_empty() {
+            force_policy = true;
+            changed_providers.extend(dirty);
         }
         let now = Instant::now();
-        if now.duration_since(last_observation) >= observation_interval {
-            if let Err(error) = bounded_observation(
-                run_observation_tick(store.as_ref(), adapters),
-                observation_timeout,
-            )
-            .await
-            {
-                tracing::error!(%error, "observation tick failed");
+        let queue_due = now.duration_since(last_queue) >= interval;
+        if queue_due {
+            if let Err(error) = run_compaction_tick(store.as_ref(), adapters, liveness).await {
+                tracing::error!(%error, "compaction tick failed");
             }
-            last_observation = now;
+            last_queue = Instant::now();
+        }
+        if !full_running && now.duration_since(last_observation) >= observation_interval {
+            let store = store.clone();
+            let adapters = adapters.clone();
+            let runtime = runtime.clone();
+            let sensitive = bands
+                .iter()
+                .filter(|(_, band)| **band < observation_interval)
+                .map(|(p, b)| (p.clone(), *b))
+                .collect();
+            let task = tasks.spawn(async move {
+                let result = bounded_observation(
+                    run_observation_tick_cached(
+                        store.as_ref(),
+                        &adapters,
+                        &runtime,
+                        &sensitive,
+                        Some(observation_timeout),
+                    ),
+                    observation_timeout,
+                )
+                .await;
+                (None, result)
+            });
+            task_providers.insert(task.id(), None);
+            full_running = true;
+        }
+        for (provider, band) in &bands {
+            let last = runtime
+                .completed
+                .lock()
+                .expect("fetch clock poisoned")
+                .get(provider)
+                .copied()
+                .unwrap_or(started);
+            if *band >= observation_interval
+                || usage_running.contains(provider)
+                || runtime
+                    .fetching
+                    .lock()
+                    .expect("fetch guard poisoned")
+                    .contains(provider)
+                || now.saturating_duration_since(last) < *band
+            {
+                continue;
+            }
+            let store = store.clone();
+            let adapter = adapters[provider].clone();
+            let runtime = runtime.clone();
+            let provider = provider.clone();
+            let band = *band;
+            usage_running.insert(provider.clone());
+            let task_provider = provider.clone();
+            let task = tasks.spawn(async move {
+                let result = poll_provider(
+                    store.as_ref(),
+                    adapter.as_ref(),
+                    &runtime,
+                    Some(band),
+                    Some(observation_timeout.min(band)),
+                )
+                .await
+                .map(|(report, _)| report);
+                (Some(provider), result)
+            });
+            task_providers.insert(task.id(), Some(task_provider));
         }
         if now.duration_since(last_maintenance) >= maintenance_interval {
             let retention_days = std::env::var("UW_RETENTION_DAYS")
@@ -2424,96 +2738,116 @@ pub async fn run_production_ticks(
             {
                 tracing::error!(%error, "usage retention prune failed");
             }
-            last_maintenance = now;
+            last_maintenance = Instant::now();
         }
-        if now.duration_since(last_policy) < policy_interval {
-            let now = Utc::now();
-            let sessions = match store.sessions_for_preempt().await {
-                Ok(sessions) => sessions,
-                Err(error) => {
-                    tracing::error!(%error, "failed to load sessions for preempt tick");
-                    Vec::new()
+        // A checkpoint is due when the deadline used for this wake has elapsed.
+        let checkpoint_due = idle_at.is_some_and(|deadline| now >= deadline);
+        if now.duration_since(last_policy) < policy_interval
+            && !force_policy
+            && !checkpoint_due
+            && !refresh_policy
+        {
+            if queue_due {
+                if let Err(error) = run_preempt_resume_tick(
+                    store.as_ref(),
+                    &sessions,
+                    Utc::now(),
+                    &ThresholdProfile::default(),
+                )
+                .await
+                {
+                    tracing::error!(%error, "preempt resume tick failed");
                 }
-            };
-            if let Err(error) = run_preempt_resume_tick(
-                store.as_ref(),
-                &sessions,
-                now,
-                &ThresholdProfile::default(),
-            )
-            .await
-            {
-                tracing::error!(%error, "preempt resume tick failed");
-            }
-            if let Err(error) = run_resume_tick(store.as_ref(), adapters, now).await {
-                tracing::error!(%error, "resume tick failed");
+                if let Err(error) = run_resume_tick(store.as_ref(), adapters, Utc::now()).await {
+                    tracing::error!(%error, "resume tick failed");
+                }
             }
             continue;
         }
-        last_policy = now;
-        let sessions = match store.tracked_sessions().await {
-            Ok(sessions) => sessions,
-            Err(error) => {
-                tracing::error!(%error, "failed to load tracked sessions for policy tick");
-                continue;
-            }
-        };
-        let mut profiles = HashMap::new();
-        for session in &sessions {
-            let mut profile = ThresholdProfile {
-                keepalive: Some(KeepaliveConfig {
-                    enabled: true,
-                    daily_cap: std::env::var("UW_KEEPALIVE_DAILY_CAP")
-                        .ok()
-                        .and_then(|value| value.parse().ok())
-                        .unwrap_or(24),
-                }),
-                ..Default::default()
+        force_policy = false;
+        let regular_policy =
+            refresh_policy || checkpoint_due || now.duration_since(last_policy) >= policy_interval;
+        refresh_policy = false;
+        if regular_policy {
+            sessions = match store.tracked_sessions().await {
+                Ok(sessions) => sessions,
+                Err(error) => {
+                    tracing::error!(%error, "failed to load tracked sessions for policy tick");
+                    last_policy = Instant::now();
+                    continue;
+                }
             };
-            if let Some(tiers) = &idle_compact_tiers {
-                profile.idle_compact.tiers = tiers.clone();
-            }
-            if matches!(session.harness, Provider::ClaudeCode | Provider::Codex) {
-                // Five minutes is the shared warm-cache approximation for both
-                // harnesses until usagewindow can emit explicit cache-control
-                // markers. Codex has no documented user-facing TTL; this is the
-                // same heuristic, not a researched provider value.
-                profile.cache_ttl_by_provider.insert(
-                    session.harness.clone(),
-                    Duration::minutes(CACHE_WARM_APPROXIMATION_MINUTES),
-                );
-            }
-            if auto_reseed.is_some() {
-                profile.reseed_auto = ReseedAutoConfig {
-                    enabled: true,
-                    min_tokens: std::env::var("UW_RESEED_MIN_TOKENS")
-                        .ok()
-                        .and_then(|value| value.parse().ok())
-                        .unwrap_or(100_000),
-                    cooldown: Duration::minutes(
-                        std::env::var("UW_RESEED_COOLDOWN_MINUTES")
+            profiles.clear();
+            for session in &sessions {
+                let mut profile = ThresholdProfile {
+                    keepalive: Some(KeepaliveConfig {
+                        enabled: true,
+                        daily_cap: std::env::var("UW_KEEPALIVE_DAILY_CAP")
                             .ok()
                             .and_then(|value| value.parse().ok())
-                            .unwrap_or(60),
-                    ),
-                    margin: Duration::minutes(1),
+                            .unwrap_or(24),
+                    }),
+                    ..Default::default()
                 };
-            }
-            match store.resolved_profile(session, profile).await {
-                Ok(resolved) => {
-                    profiles.insert(session.id.clone(), resolved);
+                if let Some(tiers) = &idle_compact_tiers {
+                    profile.idle_compact.tiers = tiers.clone();
                 }
-                Err(error) => {
-                    tracing::error!(session = %session.id.0, %error, "failed to resolve threshold profile");
+                if matches!(session.harness, Provider::ClaudeCode | Provider::Codex) {
+                    // Five minutes is the shared warm-cache approximation for both
+                    // harnesses until usagewindow can emit explicit cache-control
+                    // markers. Codex has no documented user-facing TTL; this is the
+                    // same heuristic, not a researched provider value.
+                    profile.cache_ttl_by_provider.insert(
+                        session.harness.clone(),
+                        Duration::minutes(CACHE_WARM_APPROXIMATION_MINUTES),
+                    );
+                }
+                if auto_reseed.is_some() {
+                    profile.reseed_auto = ReseedAutoConfig {
+                        enabled: true,
+                        min_tokens: std::env::var("UW_RESEED_MIN_TOKENS")
+                            .ok()
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(100_000),
+                        cooldown: Duration::minutes(
+                            std::env::var("UW_RESEED_COOLDOWN_MINUTES")
+                                .ok()
+                                .and_then(|value| value.parse().ok())
+                                .unwrap_or(60),
+                        ),
+                        margin: Duration::minutes(1),
+                    };
+                }
+                match store.resolved_profile(session, profile).await {
+                    Ok(resolved) => {
+                        profiles.insert(session.id.clone(), resolved);
+                    }
+                    Err(error) => {
+                        tracing::error!(session = %session.id.0, %error, "failed to resolve threshold profile");
+                    }
                 }
             }
         }
+        let policy_sessions: Vec<_> = sessions
+            .iter()
+            .filter(|session| {
+                regular_policy
+                    || (session.stopped_reason.is_none()
+                        && session.superseded_by.is_none()
+                        && is_cache_warm(session.last_seen, Utc::now())
+                        && (changed_providers.contains(&session.harness)
+                            || bands
+                                .get(&session.harness)
+                                .is_some_and(|band| *band < observation_interval)))
+            })
+            .cloned()
+            .collect();
         if let Err(error) = run_policy_tick(
             store.as_ref(),
             store.as_ref(),
             adapters,
             liveness,
-            &sessions,
+            &policy_sessions,
             &profiles,
             &mut policy_state,
             Utc::now(),
@@ -2522,7 +2856,15 @@ pub async fn run_production_ticks(
         {
             tracing::error!(%error, "policy tick failed");
         }
-        if let Some(runtime) = &auto_reseed
+        changed_providers.clear();
+        if regular_policy {
+            last_policy = Instant::now();
+        }
+        if let Err(error) = run_compaction_tick(store.as_ref(), adapters, liveness).await {
+            tracing::error!(%error, "compaction tick failed after policy");
+        }
+        if regular_policy
+            && let Some(runtime) = &auto_reseed
             && let Err(error) = run_auto_reseed_ticks(
                 store.as_ref(),
                 adapters,
@@ -2535,18 +2877,20 @@ pub async fn run_production_ticks(
         {
             tracing::error!(%error, "auto-reseed tick failed");
         }
-        if let Err(error) = run_preempt_resume_tick(
-            store.as_ref(),
-            &sessions,
-            Utc::now(),
-            &ThresholdProfile::default(),
-        )
-        .await
-        {
-            tracing::error!(%error, "preempt resume tick failed");
-        }
-        if let Err(error) = run_resume_tick(store.as_ref(), adapters, Utc::now()).await {
-            tracing::error!(%error, "resume tick failed");
+        if regular_policy || queue_due {
+            if let Err(error) = run_preempt_resume_tick(
+                store.as_ref(),
+                &sessions,
+                Utc::now(),
+                &ThresholdProfile::default(),
+            )
+            .await
+            {
+                tracing::error!(%error, "preempt resume tick failed");
+            }
+            if let Err(error) = run_resume_tick(store.as_ref(), adapters, Utc::now()).await {
+                tracing::error!(%error, "resume tick failed");
+            }
         }
     }
 }
@@ -3048,7 +3392,7 @@ mod tests {
         assert_eq!(status["updatedAt"], "2026-09-22T11:23:40.037Z");
         assert_eq!(status["expiresAt"], "2026-09-22T12:23:40.123Z");
     }
-    fn session() -> SessionSummary {
+    pub(super) fn session() -> SessionSummary {
         SessionSummary {
             id: SessionId("s".into()),
             lineage: SessionLineage::default(),
@@ -3671,6 +4015,240 @@ mod tests {
         }
     }
 
+    struct CadenceCountingAdapter {
+        sample: UsageSample,
+        fetches: Arc<AtomicUsize>,
+        discoveries: Arc<AtomicUsize>,
+        stops: Arc<AtomicUsize>,
+        ages: Arc<StdMutex<Vec<StdDuration>>>,
+        fail_fetch: bool,
+    }
+
+    impl CadenceCountingAdapter {
+        fn new(provider: Provider, pct: f32) -> Self {
+            let now = Utc::now();
+            Self {
+                sample: UsageSample {
+                    at: now,
+                    fetched_at: Some(now),
+                    source: UsageSource::ProviderReported,
+                    provider: provider.clone(),
+                    account: None,
+                    plan: None,
+                    windows: HashMap::from([(
+                        WindowKey {
+                            provider,
+                            kind: WindowKind::Rolling { minutes: 300 },
+                        },
+                        UsageWindowState::new(pct, false, true, None, None),
+                    )]),
+                    credits: None,
+                },
+                fetches: Arc::new(AtomicUsize::new(0)),
+                discoveries: Arc::new(AtomicUsize::new(0)),
+                stops: Arc::new(AtomicUsize::new(0)),
+                ages: Arc::new(StdMutex::new(vec![])),
+                fail_fetch: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl HarnessAdapter for CadenceCountingAdapter {
+        fn provider(&self) -> Provider {
+            self.sample.provider.clone()
+        }
+        fn capabilities(&self) -> Capabilities {
+            caps(false, false, false)
+        }
+        async fn fetch_usage(&self, _: Option<&AccountId>) -> AdapterResult<UsageSample> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            if self.fail_fetch {
+                Err(AdapterError::Other("offline".into()))
+            } else {
+                Ok(self.sample.clone())
+            }
+        }
+        async fn fetch_usage_with_max_age(
+            &self,
+            account: Option<&AccountId>,
+            max_age: StdDuration,
+        ) -> AdapterResult<UsageSample> {
+            self.ages.lock().unwrap().push(max_age);
+            self.fetch_usage(account).await
+        }
+        async fn discover_sessions(&self) -> AdapterResult<Vec<DiscoveredSession>> {
+            self.discoveries.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![])
+        }
+        async fn detect_stop(&self, _: &SessionId) -> AdapterResult<Option<StopReason>> {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+        async fn detect_stop_with_usage(
+            &self,
+            id: &SessionId,
+            _: Option<&UsageSample>,
+        ) -> AdapterResult<Option<StopReason>> {
+            self.detect_stop(id).await
+        }
+        async fn emit_status(
+            &self,
+            _: &SessionId,
+            _: StatusEvent,
+        ) -> AdapterResult<DeliveryOutcome> {
+            Err(AdapterError::Unsupported)
+        }
+        async fn advise(&self, _: &SessionId, _: &str) -> AdapterResult<DeliveryOutcome> {
+            Err(AdapterError::Unsupported)
+        }
+        async fn compact(
+            &self,
+            _: &SessionSummary,
+            _: &CompactionRequest,
+        ) -> AdapterResult<DeliveryOutcome> {
+            Err(AdapterError::Unsupported)
+        }
+        async fn resume_session(&self, _: &SessionSummary, _: Option<&str>) -> AdapterResult<()> {
+            Err(AdapterError::Unsupported)
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_only_tick_polls_each_provider_once_without_scraping_sessions() {
+        let store = ObservationFake {
+            sessions: vec![
+                session(),
+                SessionSummary {
+                    id: SessionId("second".into()),
+                    ..session()
+                },
+            ],
+            samples: StdMutex::new(vec![]),
+            stops: StdMutex::new(vec![]),
+            superseded: StdMutex::new(vec![]),
+            last_hook_event: None,
+        };
+        let first = Arc::new(CadenceCountingAdapter::new(Provider::ClaudeCode, 95.0));
+        let second = Arc::new(CadenceCountingAdapter::new(Provider::Codex, 90.0));
+        let adapters = HashMap::from([
+            (
+                Provider::ClaudeCode,
+                first.clone() as Arc<dyn HarnessAdapter>,
+            ),
+            (Provider::Codex, second.clone() as Arc<dyn HarnessAdapter>),
+        ]);
+        let max_age = StdDuration::from_secs(1);
+        let report = run_usage_observation_tick(&store, &adapters, max_age)
+            .await
+            .unwrap();
+        assert_eq!(report.samples_recorded, 2);
+        assert_eq!(store.samples.lock().unwrap().len(), 2);
+        assert_eq!(report.stops_recorded, 0);
+        assert_eq!(report.sessions_discovered, 0);
+        for adapter in [first, second] {
+            assert_eq!(adapter.fetches.load(Ordering::SeqCst), 1);
+            assert_eq!(adapter.discoveries.load(Ordering::SeqCst), 0);
+            assert_eq!(adapter.stops.load(Ordering::SeqCst), 0);
+            assert_eq!(adapter.ages.lock().unwrap().as_slice(), &[max_age]);
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_only_tick_isolates_provider_failures() {
+        let store = ObservationFake {
+            sessions: vec![],
+            samples: StdMutex::new(vec![]),
+            stops: StdMutex::new(vec![]),
+            superseded: StdMutex::new(vec![]),
+            last_hook_event: None,
+        };
+        let mut failing = CadenceCountingAdapter::new(Provider::ClaudeCode, 95.0);
+        failing.fail_fetch = true;
+        let working = Arc::new(CadenceCountingAdapter::new(Provider::Codex, 90.0));
+        let adapters = HashMap::from([
+            (
+                Provider::ClaudeCode,
+                Arc::new(failing) as Arc<dyn HarnessAdapter>,
+            ),
+            (Provider::Codex, working.clone() as Arc<dyn HarnessAdapter>),
+        ]);
+        let report = run_usage_observation_tick(&store, &adapters, StdDuration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(report.adapter_errors, 1);
+        assert_eq!(report.samples_recorded, 1);
+        assert_eq!(working.fetches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn production_sensitive_polling_accelerates_only_the_busy_provider_without_disk_scans() {
+        let path =
+            std::env::temp_dir().join(format!("uw-sensitive-cadence-{}.db", uuid::Uuid::new_v4()));
+        let sensitive_provider = Provider::Other("sensitive-cadence".into());
+        let normal_provider = Provider::Other("normal-cadence".into());
+        let sensitive = Arc::new(CadenceCountingAdapter::new(
+            sensitive_provider.clone(),
+            95.0,
+        ));
+        let normal = Arc::new(CadenceCountingAdapter::new(normal_provider.clone(), 20.0));
+        let inner = Store::open(&path.to_string_lossy()).unwrap();
+        let mut active = session();
+        active.harness = sensitive_provider.clone();
+        active.last_seen = Utc::now();
+        inner.insert_session(&active).unwrap();
+        inner.insert_usage_sample(&sensitive.sample).unwrap();
+        inner.insert_usage_sample(&normal.sample).unwrap();
+        let store = Arc::new(SqliteDaemonStore::new(inner));
+        let adapters = HashMap::from([
+            (
+                sensitive_provider,
+                sensitive.clone() as Arc<dyn HarnessAdapter>,
+            ),
+            (normal_provider, normal.clone() as Arc<dyn HarnessAdapter>),
+        ]);
+        let daemon = tokio::spawn(async move {
+            run_production_ticks(store, &adapters, &AlwaysIdle, StdDuration::from_secs(60)).await
+        });
+        let result = tokio::time::timeout(StdDuration::from_millis(2300), async {
+            while sensitive.fetches.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        })
+        .await;
+        daemon.abort();
+        let _ = daemon.await;
+        let sensitive_samples = Store::open(&path.to_string_lossy())
+            .unwrap()
+            .all_usage_samples()
+            .unwrap()
+            .into_iter()
+            .filter(|sample| sample.provider == sensitive.sample.provider)
+            .count();
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        assert_eq!(
+            sensitive_samples, 1,
+            "cached replies must not append duplicate usage history"
+        );
+        assert!(
+            result.is_ok(),
+            "95% usage with an active session must poll again within 2.3s even with a 60s base interval"
+        );
+        assert_eq!(normal.fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(sensitive.discoveries.load(Ordering::SeqCst), 1);
+        assert_eq!(normal.discoveries.load(Ordering::SeqCst), 1);
+        assert_eq!(sensitive.stops.load(Ordering::SeqCst), 1);
+        assert!(
+            sensitive
+                .ages
+                .lock()
+                .unwrap()
+                .contains(&StdDuration::from_secs(1))
+        );
+    }
+
     #[tokio::test]
     async fn observation_tick_polls_usage_and_records_detected_stops() {
         let now = Utc::now();
@@ -4239,6 +4817,45 @@ mod tests {
         .await;
         assert!(result.is_err(), "the scheduler should keep running");
         assert!(*compacted.lock().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn production_delivers_new_idle_compaction_on_the_same_wake() {
+        let path = std::env::temp_dir().join(format!(
+            "uw-idle-delivery-cadence-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let inner = Store::open(&path.to_string_lossy()).unwrap();
+        let mut idle = session();
+        idle.last_seen = Utc::now() - Duration::seconds(269);
+        inner.insert_session(&idle).unwrap();
+        let store = Arc::new(SqliteDaemonStore::new(inner));
+        let compacted = Arc::new(StdMutex::new(0));
+        let adapter = Arc::new(FakeAdapter {
+            capabilities: caps(true, false, false),
+            compacted: compacted.clone(),
+            advised: Arc::new(StdMutex::new(0)),
+        });
+        let adapters = HashMap::from([(Provider::ClaudeCode, adapter as Arc<dyn HarnessAdapter>)]);
+        let daemon = tokio::spawn(async move {
+            run_production_ticks(store, &adapters, &AlwaysIdle, StdDuration::from_secs(60)).await
+        });
+        let result = tokio::time::timeout(StdDuration::from_secs(2), async {
+            while *compacted.lock().unwrap() == 0 {
+                tokio::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        })
+        .await;
+        daemon.abort();
+        let _ = daemon.await;
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        assert!(
+            result.is_ok(),
+            "an idle compaction queued at 4m29s must be delivered on that wake, while the cache is warm"
+        );
+        assert_eq!(*compacted.lock().unwrap(), 1);
     }
 
     #[tokio::test]

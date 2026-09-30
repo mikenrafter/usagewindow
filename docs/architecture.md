@@ -342,6 +342,36 @@ never touch unrelated entries); Codex requires each hook definition to be trust-
 only helps processes usagewindow itself spawns, not a user's own interactive sessions —
 not a substitute for real installation).
 
+## Polling and delivery timing
+
+The production scheduler uses separate deadlines for quota observation, policy checks,
+queue delivery, and maintenance. The normal observation interval defaults to 60 seconds,
+and the policy interval defaults to 30 seconds. A longer queue interval must not delay a
+policy deadline.
+
+For a provider with a warm, live session, quota polling is capped at 15 seconds at 85%
+usage, 5 seconds at 90%, and 1 second at 95%. An already shorter configured interval
+stays shorter. Account and active-window matching prevent an unrelated account or an
+expired quota window from accelerating polling. The scheduler returns to the normal
+interval when the provider leaves the sensitive band or has no eligible sessions.
+
+Fast quota polls request a matching maximum cache age through `HarnessAdapter`.
+Claude Code normally caches readings for 120 seconds, but honors the shorter age on
+these polls. Transient failures retain the existing stale-reading fallback; authentication
+errors still fail. Fast polling skips session discovery and transcript stop scans. Exact
+duplicate cached readings do not append usage history. Maintenance keeps its independent
+hourly cadence. A newly persisted quota reading wakes policy checks immediately, even
+while background session discovery is still running. Accelerated policy checks reuse
+resolved profiles and cover recently active sessions of affected providers; the normal
+policy cadence still refreshes all tracked sessions.
+
+Idle scheduling also wakes at each session's configured `cache_ttl - margin` deadline
+and at `cache_ttl - 30 seconds`, giving a five-minute cache a final check at 4m30s.
+The default two-minute margin remains an early compaction trigger. The later checkpoint
+gives pending delivery another chance while the cache is warm. A policy wake dispatches
+its newly queued compactions immediately through the existing claim-before-send path.
+Provider observation and transcript discovery must not block these delivery deadlines.
+
 ## Trigger policies (Phase 3 target)
 
 - **Burn-rate-scaled near-limit trigger**: `effective_threshold = 100 -
