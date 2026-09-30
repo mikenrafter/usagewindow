@@ -543,9 +543,19 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         capabilities.can_inject_at_session_start = self.hook.is_some();
         capabilities
     }
-    async fn fetch_usage(&self, _: Option<&AccountId>) -> AdapterResult<UsageSample> {
+    async fn fetch_usage(&self, account: Option<&AccountId>) -> AdapterResult<UsageSample> {
+        self.fetch_usage_with_max_age(account, std::time::Duration::from_secs(120))
+            .await
+    }
+    async fn fetch_usage_with_max_age(
+        &self,
+        _: Option<&AccountId>,
+        max_age: std::time::Duration,
+    ) -> AdapterResult<UsageSample> {
+        let max_age = chrono::Duration::from_std(max_age.min(std::time::Duration::from_secs(120)))
+            .expect("cache age is capped at 120 seconds");
         if let Some(entry) = self.cache.load().await?
-            && (self.now)() - entry.fetched_at < chrono::Duration::seconds(120)
+            && (self.now)() - entry.fetched_at < max_age
         {
             let mut sample = entry.sample;
             if sample.account.is_none()
@@ -1305,6 +1315,101 @@ mod tests {
         );
         assert_eq!(*calls.lock().unwrap(), 0);
     }
+    fn cache_at_age(seconds: i64) -> Arc<Cache> {
+        let at = Utc.timestamp_opt(1_800_000_000 - seconds, 0).unwrap();
+        Arc::new(Cache {
+            entry: Mutex::new(Some(CacheEntry {
+                fetched_at: at,
+                sample: UsageSample {
+                    at,
+                    fetched_at: Some(at),
+                    source: UsageSource::ProviderReported,
+                    provider: Provider::ClaudeCode,
+                    account: Some(AccountId("claude@example.com".into())),
+                    plan: None,
+                    windows: Default::default(),
+                    credits: None,
+                },
+            })),
+        })
+    }
+
+    #[tokio::test]
+    async fn sensitive_fetch_refreshes_a_cache_younger_than_the_normal_ttl() {
+        for max_age in [15, 5, 1] {
+            let calls = Arc::new(Mutex::new(0));
+            let got = adapter(200, cache_at_age(50), calls.clone())
+                .fetch_usage_with_max_age(None, std::time::Duration::from_secs(max_age))
+                .await
+                .unwrap();
+            assert_eq!(*calls.lock().unwrap(), 1, "max_age={max_age}");
+            assert_eq!(got.windows.len(), 2);
+            assert_eq!(
+                got.fetched_at,
+                Some(Utc.timestamp_opt(1_800_000_000, 0).unwrap())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn requested_cache_age_reuses_younger_samples_and_preserves_normal_caching() {
+        for max_age in [15, 5, 1] {
+            let cache = cache_at_age(0);
+            let expected = cache.entry.lock().unwrap().as_ref().unwrap().sample.clone();
+            let calls = Arc::new(Mutex::new(0));
+            assert_eq!(
+                adapter(200, cache, calls.clone())
+                    .fetch_usage_with_max_age(None, std::time::Duration::from_secs(max_age))
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(*calls.lock().unwrap(), 0);
+        }
+        let cache = cache_at_age(50);
+        let expected = cache.entry.lock().unwrap().as_ref().unwrap().sample.clone();
+        let calls = Arc::new(Mutex::new(0));
+        assert_eq!(
+            adapter(200, cache, calls.clone())
+                .fetch_usage(None)
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn requested_cache_age_retains_stale_fallback_on_transient_error() {
+        for status in [429, 503] {
+            let cache = cache_at_age(50);
+            let expected = cache.entry.lock().unwrap().as_ref().unwrap().sample.clone();
+            let calls = Arc::new(Mutex::new(0));
+            assert_eq!(
+                adapter(status, cache, calls.clone())
+                    .fetch_usage_with_max_age(None, std::time::Duration::from_secs(1))
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(*calls.lock().unwrap(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn requested_cache_age_does_not_hide_auth_failure() {
+        for status in [401, 403] {
+            let calls = Arc::new(Mutex::new(0));
+            assert!(matches!(
+                adapter(status, cache_at_age(50), calls.clone())
+                    .fetch_usage_with_max_age(None, std::time::Duration::from_secs(1))
+                    .await,
+                Err(AdapterError::Auth)
+            ));
+            assert_eq!(*calls.lock().unwrap(), 1);
+        }
+    }
+
     #[test]
     fn compact_message_uses_claude_command_shape() {
         assert_eq!(

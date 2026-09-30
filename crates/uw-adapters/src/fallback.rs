@@ -95,6 +95,13 @@ impl HarnessAdapter for FallbackCompactionAdapter {
     async fn fetch_usage(&self, account: Option<&AccountId>) -> AdapterResult<UsageSample> {
         self.native.fetch_usage(account).await
     }
+    async fn fetch_usage_with_max_age(
+        &self,
+        account: Option<&AccountId>,
+        max_age: std::time::Duration,
+    ) -> AdapterResult<UsageSample> {
+        self.native.fetch_usage_with_max_age(account, max_age).await
+    }
     async fn detect_stop(&self, session_id: &SessionId) -> AdapterResult<Option<StopReason>> {
         self.native.detect_stop(session_id).await
     }
@@ -185,6 +192,17 @@ mod tests {
         }
         async fn fetch_usage(&self, _: Option<&AccountId>) -> AdapterResult<UsageSample> {
             Err(AdapterError::Unsupported)
+        }
+        async fn fetch_usage_with_max_age(
+            &self,
+            account: Option<&AccountId>,
+            max_age: std::time::Duration,
+        ) -> AdapterResult<UsageSample> {
+            Err(AdapterError::Other(format!(
+                "native age={} account={}",
+                max_age.as_secs(),
+                account.map_or("none", |id| id.0.as_str())
+            )))
         }
         async fn detect_stop(&self, _: &SessionId) -> AdapterResult<Option<StopReason>> {
             Err(AdapterError::Unsupported)
@@ -300,6 +318,25 @@ mod tests {
 
         adapter.compact(&session(), &request()).await.unwrap();
         assert_eq!(*meta.compact_calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn fallback_preserves_requested_usage_cache_age_and_account() {
+        let native = Fake {
+            can_trigger_compaction: true,
+            compact_result: Arc::new(Mutex::new(None)),
+            compact_calls: Arc::new(Mutex::new(0)),
+        };
+        let adapter = FallbackCompactionAdapter::new(Arc::new(native.clone()), Arc::new(native));
+        let result = adapter
+            .fetch_usage_with_max_age(
+                Some(&AccountId("acct".into())),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AdapterError::Other(message)) if message == "native age=5 account=acct")
+        );
     }
 
     #[tokio::test]

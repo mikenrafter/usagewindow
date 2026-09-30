@@ -21,6 +21,12 @@ DankMaterialShell status-bar plugin (bash+QML). This is ground truth for the Cla
   429/5xx/network failure, fall back to the last cached snapshot even past its TTL
   (stale-but-useful beats erroring). On 401/403, treat as a hard auth failure and do
   NOT trust stale cache (credentials are genuinely invalid).
+- The 120s TTL is a local polling choice, not a provider API requirement. Sensitive
+  quota polling can request a shorter maximum cache age through the same verified
+  OAuth endpoint. Adapter tests cover 15s, 5s, and 1s ages, retaining normal cache
+  reuse, transient-error fallback, and authentication failures. These tests use a
+  synthetic clock and HTTP transport; they do not establish a live provider request
+  budget or guarantee that upstream usage reporting refreshes at that rate.
 - A second, independent signal exists: `~/.claude/projects/*.jsonl` transcripts, whose
   assistant messages carry `message.usage.{input_tokens, output_tokens,
   cache_read_input_tokens, cache_creation_input_tokens}`. This is useful for local
