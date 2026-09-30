@@ -118,7 +118,31 @@ impl Store {
         self.reconcile_obsolete_usage_windows()?;
         self.reconcile_obsolete_provider_accounts()?;
         self.reconcile_session_accounts()?;
+        self.reconcile_cursor_context_activity()?;
         Ok(())
+    }
+
+    /// Older Cursor discovery stamped undated context snapshots with the poll
+    /// time. Only context-only rows newer than the session's actual timestamp
+    /// are unsupported activity; retain every row with token accounting.
+    fn reconcile_cursor_context_activity(&self) -> StoreResult<usize> {
+        Ok(self.connection.execute(
+            "DELETE FROM session_token_usage AS usage
+             WHERE usage.context_pct IS NOT NULL
+               AND usage.input_tokens = 0
+               AND usage.cached_input_tokens = 0
+               AND usage.cache_write_input_tokens = 0
+               AND usage.output_tokens = 0
+               AND usage.reasoning_output_tokens = 0
+               AND usage.total_tokens = 0
+               AND EXISTS (
+                   SELECT 1 FROM sessions AS session
+                   WHERE session.id = usage.session_id
+                     AND session.harness = ?1
+                     AND julianday(usage.at) > julianday(session.last_seen)
+               )",
+            [json(&Provider::Cursor)?],
+        )?)
     }
 
     /// Discovery can predate the first usage poll, so repair accountless rows
@@ -1571,6 +1595,157 @@ mod tests {
         );
         drop(store);
         std::fs::remove_file(path).unwrap();
+    }
+
+    fn cursor_activity_cleanup_fixture(
+        store: &Store,
+        now: DateTime<Utc>,
+    ) -> (SessionId, SessionId, Vec<TokenUsageRecord>) {
+        let cursor_id = SessionId("cursor-fabricated-activity".into());
+        let codex_id = SessionId("codex-real-context-activity".into());
+        let last_seen = now - Duration::hours(2);
+        for (id, harness) in [(&cursor_id, Provider::Cursor), (&codex_id, Provider::Codex)] {
+            let mut summary = session(id);
+            summary.harness = harness;
+            summary.first_seen = last_seen;
+            summary.last_seen = last_seen;
+            summary.last_known_context_pct = Some(66.0);
+            store.insert_session(&summary).unwrap();
+        }
+        let context_record = |at| TokenUsageRecord {
+            at,
+            model: None,
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 0,
+            context_pct: Some(66.0),
+        };
+        let valid = vec![
+            context_record(last_seen - Duration::minutes(1)),
+            context_record(last_seen),
+        ];
+        let mut historical = valid.clone();
+        historical.push(context_record(now));
+        store
+            .insert_token_usage_records(&cursor_id, &historical)
+            .unwrap();
+        store
+            .insert_token_usage_records(&codex_id, &[context_record(now)])
+            .unwrap();
+        (cursor_id, codex_id, valid)
+    }
+
+    #[test]
+    fn reopening_removes_cursor_fabricated_activity_and_preserves_supported_records() {
+        let path = std::env::temp_dir().join(format!(
+            "usagewindow-cursor-activity-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let now = Utc::now();
+        let (cursor_id, codex_id, valid) = {
+            let store = Store::open(path.to_str().unwrap()).unwrap();
+            cursor_activity_cleanup_fixture(&store, now)
+        };
+        let mut reopened = Store::open(path.to_str().unwrap()).unwrap();
+        let codex_records = reopened.token_usage_for_session(&codex_id).unwrap();
+        assert_eq!(codex_records.len(), 1);
+        assert!(session_has_recent_token_activity(&codex_records, now));
+        assert_eq!(
+            reopened
+                .read_session(&cursor_id)
+                .unwrap()
+                .last_known_context_pct,
+            Some(66.0)
+        );
+        let cursor_records = reopened.token_usage_for_session(&cursor_id).unwrap();
+        assert_eq!(cursor_records, valid);
+        assert!(!session_has_recent_token_activity(&cursor_records, now));
+        reopened.create_schema().unwrap();
+        assert_eq!(reopened.token_usage_for_session(&cursor_id).unwrap(), valid);
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reopening_preserves_recent_cursor_context_activity_at_last_seen() {
+        let path = std::env::temp_dir().join(format!(
+            "usagewindow-cursor-recent-activity-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let now = Utc::now();
+        let id = SessionId("cursor-recent-context-activity".into());
+        let record = TokenUsageRecord {
+            at: now,
+            model: None,
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 0,
+            context_pct: Some(66.0),
+        };
+        {
+            let store = Store::open(path.to_str().unwrap()).unwrap();
+            let mut summary = session(&id);
+            summary.harness = Provider::Cursor;
+            summary.last_seen = now;
+            store.insert_session(&summary).unwrap();
+            store
+                .insert_token_usage_records(&id, std::slice::from_ref(&record))
+                .unwrap();
+            // Equivalent timestamps with a different offset must survive the
+            // repair even when their string ordering differs.
+            store
+                .connection()
+                .execute(
+                    "UPDATE sessions SET last_seen = ?1 WHERE id = ?2",
+                    params![
+                        now.with_timezone(&chrono::FixedOffset::west_opt(6 * 3600).unwrap())
+                            .to_rfc3339(),
+                        id.0
+                    ],
+                )
+                .unwrap();
+        }
+        let reopened = Store::open(path.to_str().unwrap()).unwrap();
+        let records = reopened.token_usage_for_session(&id).unwrap();
+        assert_eq!(records, vec![record]);
+        assert!(session_has_recent_token_activity(&records, now));
+        assert!(reopened.session_cache_warm(&id, now).unwrap());
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn schema_reconciliation_preserves_cursor_records_with_real_accounting() {
+        let mut store = Store::open_memory().unwrap();
+        let now = Utc::now();
+        let (cursor_id, _, valid) = cursor_activity_cleanup_fixture(&store, now);
+        let mut accounting_records = Vec::new();
+        for field in 0..6 {
+            let mut record = valid[0].clone();
+            record.at = now + Duration::seconds(field);
+            match field {
+                0 => record.input_tokens = 1,
+                1 => record.cached_input_tokens = 1,
+                2 => record.cache_write_input_tokens = 1,
+                3 => record.output_tokens = 1,
+                4 => record.reasoning_output_tokens = 1,
+                _ => record.total_tokens = 1,
+            }
+            accounting_records.push(record);
+        }
+        store
+            .insert_token_usage_records(&cursor_id, &accounting_records)
+            .unwrap();
+        store.create_schema().unwrap();
+        let mut expected = valid;
+        expected.extend(accounting_records);
+        assert_eq!(store.token_usage_for_session(&cursor_id).unwrap(), expected);
     }
 
     #[test]
