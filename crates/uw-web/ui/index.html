@@ -76,9 +76,19 @@
   .card { background: #0d0f14; border: 1px solid var(--border); border-radius: 8px; padding: 0.8rem; }
   .card .head { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.6rem; }
   .card .prov { font-weight: 600; }
+  .card .identity { flex: 1 1 auto; min-width: 0; }
+  .card .identity .acct { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 0.2rem; }
+  .inhibit-toggle { display: inline-flex; align-items: center; gap: 0.4rem; margin-left: auto; flex: 0 0 auto; cursor: pointer; font-size: 0.8rem; white-space: nowrap; }
+  .inhibit-toggle input { appearance: none; width: 2rem; height: 1.15rem; border-radius: 1rem; background: var(--border); position: relative; cursor: pointer; margin: 0; flex-shrink: 0; }
+  .inhibit-toggle input::before { content: ''; position: absolute; width: 0.85rem; height: 0.85rem; border-radius: 50%; background: var(--text); top: 0.15rem; left: 0.15rem; transition: transform 0.15s; }
+  .inhibit-toggle input:checked { background: var(--accent); }
+  .inhibit-toggle input:checked::before { transform: translateX(0.85rem); }
+  .inhibit-toggle input:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
+  .inhibit-toggle input:disabled { opacity: 0.5; cursor: wait; }
+  .card .stale { display: block; margin-bottom: 0.5rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .acct { color: var(--muted); font-size: 0.8rem; filter: blur(5px); transition: filter 0.15s; cursor: pointer; user-select: none; }
   .acct.revealed { filter: none; }
-  .card .stale { margin-left: auto; }
+
   .barrow { margin-bottom: 0.7rem; }
   .barrow:last-child { margin-bottom: 0; }
   .barrow .title { display: flex; align-items: center; justify-content: space-between; gap: 0.55rem; min-width: 0; font-size: 0.8rem; color: var(--text); font-weight: 600; margin-bottom: 0.35rem; }
@@ -234,6 +244,7 @@
 <header>
   <h1>Usagewindow v__UW_VERSION__</h1>
   <div class="spacer"></div>
+  <span id="global-inhibit"></span>
   <button id="refresh">Refresh</button>
 </header>
 <div id="banner"></div>
@@ -670,6 +681,44 @@ function setBanner(msg) {
   b.textContent = msg;
 }
 
+let actionInhibits = { global: false, providers: [] };
+let inhibitSaving = false;
+let inhibitRevision = 0;
+
+function renderInhibitToggle(provider) {
+  const global = provider === null;
+  const checked = global ? actionInhibits.global : actionInhibits.providers.some(p => JSON.stringify(p) === JSON.stringify(provider));
+  const label = global ? 'Inhibit all' : 'Inhibit';
+  const title = global
+    ? 'Inhibit all active behavior. Usage and log reads continue.'
+    : `Inhibit active behavior for ${providerLabel(provider)} across all accounts.${actionInhibits.global ? ' The global inhibit is also active.' : ''}`;
+  return `<label class="inhibit-toggle" title="${escapeHtml(title)}"><span>${label}</span><input type="checkbox" role="switch" aria-label="${escapeHtml(global ? label : label + ' ' + providerLabel(provider))}" data-inhibit-provider="${escapeHtml(JSON.stringify(provider))}"${checked ? ' checked' : ''}${inhibitSaving ? ' disabled' : ''}></label>`;
+}
+
+function renderGlobalInhibit() {
+  $('#global-inhibit').innerHTML = renderInhibitToggle(null);
+}
+
+async function setActionInhibit(provider, inhibited) {
+  if (inhibitSaving) return;
+  inhibitSaving = true;
+  inhibitRevision += 1;
+  renderGlobalInhibit();
+  renderUsage(lastStatus);
+  try {
+    actionInhibits = await api('/api/action-inhibits', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider, inhibited }),
+    });
+  } catch (error) {
+    setBanner(`Failed to save inhibit: ${error.message}`);
+  } finally {
+    inhibitSaving = false;
+    renderGlobalInhibit();
+    renderUsage(lastStatus);
+  }
+}
+
 function renderUsage(status) {
   const box = $('#usagecards');
   if (!status || !status.usage.length) {
@@ -687,11 +736,14 @@ function renderUsage(status) {
     return `
       <div class="card">
         <div class="head">
-          <span class="prov">${escapeHtml(providerLabel(u.provider))}</span>
-          <span class="acct" title="click to reveal">${escapeHtml(u.account || 'default account')}</span>
-          ${u.plan ? `<span class="pill">${escapeHtml(u.plan)}</span>` : ''}
-          ${staleBadge}
+          <div class="identity">
+            <span class="prov">${escapeHtml(providerLabel(u.provider))}</span>
+            ${u.plan ? `<span class="pill">${escapeHtml(u.plan)}</span>` : ''}
+            <span class="acct" title="click to reveal">${escapeHtml(u.account || 'default account')}</span>
+          </div>
+          ${renderInhibitToggle(u.provider)}
         </div>
+        ${staleBadge}
         ${bars}
       </div>`;
   }).join('');
@@ -699,7 +751,10 @@ function renderUsage(status) {
 
 async function loadStatus() {
   try {
-    const status = await api('/api/status');
+    const revision = inhibitRevision;
+    const [status, inhibits] = await Promise.all([api('/api/status'), api('/api/action-inhibits')]);
+    if (!inhibitSaving && revision === inhibitRevision) actionInhibits = inhibits;
+    renderGlobalInhibit();
     lastStatus = status;
     lastStatusOkAt = Date.now();
     setBanner(null);
@@ -1046,6 +1101,11 @@ $('#create').addEventListener('submit', async e => {
     page = 0;
     await loadSessions();
   } catch (err) { alert('Create failed: ' + err.message); }
+});
+
+document.addEventListener('change', event => {
+  const toggle = event.target.closest('[data-inhibit-provider]');
+  if (toggle) setActionInhibit(JSON.parse(toggle.dataset.inhibitProvider), toggle.checked);
 });
 
 $('#refresh').addEventListener('click', () => { loadStatus(); loadSessions(); loadActions(); });

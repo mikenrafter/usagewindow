@@ -372,3 +372,17 @@ mod tests {
         .unwrap_or_default();
     }
 }
+
+/// Persistent user overrides. Global and provider inhibits combine with OR.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionInhibits {
+    pub global: bool,
+    pub providers: Vec<Provider>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionInhibitRequest {
+    /// None selects the global override.
+    pub provider: Option<Provider>,
+    pub inhibited: bool,
+}

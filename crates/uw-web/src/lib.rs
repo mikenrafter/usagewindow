@@ -147,6 +147,7 @@ pub fn app_with_shared_store_and_auth(
     let auth = Arc::new(WebAuth::new(password_hash)?);
     let protected = Router::new()
         .route("/api/status", get(status))
+        .route("/api/action-inhibits", get(action_inhibits_get).post(action_inhibits_set))
         .route("/api/sessions", get(sessions).post(create_session))
         .route(
             "/api/sessions/{id}",
@@ -1200,6 +1201,22 @@ fn parse_scope(value: Option<&str>) -> Option<ThresholdScope> {
     })
 }
 
+async fn action_inhibits_get(
+    State(state): State<AppState>,
+) -> Result<Json<ActionInhibits>, (StatusCode, String)> {
+    Ok(Json(read(state, |store| Ok(store.action_inhibits()?)).await?))
+}
+
+async fn action_inhibits_set(
+    State(state): State<AppState>,
+    Json(request): Json<ActionInhibitRequest>,
+) -> Result<Json<ActionInhibits>, (StatusCode, String)> {
+    Ok(Json(read(state, move |store| {
+        store.set_action_inhibit(request.provider.as_ref(), request.inhibited)?;
+        Ok(store.action_inhibits()?)
+    }).await?))
+}
+
 async fn thresholds_get(
     State(state): State<AppState>,
     Query(query): Query<ScopeQuery>,
@@ -1529,6 +1546,28 @@ mod tests {
             superseded_by: None,
             reseeded_from: None,
         }
+    }
+
+    #[tokio::test]
+    async fn action_inhibit_api_updates_scopes_independently() {
+        let shared = Arc::new(Mutex::new(Store::open_memory().unwrap()));
+        let router = app_with_shared_store(shared.clone(), HashMap::new());
+        for (provider, inhibited) in [(Some(Provider::Codex), true), (None, true), (None, false)] {
+            let response = router.clone().oneshot(
+                Request::post("/api/action-inhibits")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&ActionInhibitRequest { provider, inhibited }).unwrap())).unwrap(),
+            ).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let response = router.oneshot(Request::get("/api/action-inhibits").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let settings: ActionInhibits = serde_json::from_slice(&body).unwrap();
+        assert!(!settings.global);
+        assert_eq!(settings.providers, vec![Provider::Codex]);
+        assert!(shared.lock().unwrap().actions_inhibited(&Provider::Codex).unwrap());
+        assert!(!shared.lock().unwrap().actions_inhibited(&Provider::ClaudeCode).unwrap());
     }
 
     #[tokio::test]

@@ -271,6 +271,10 @@ pub trait SessionLivenessChecker: Send + Sync {
 
 #[async_trait]
 pub trait DaemonStore: Send + Sync {
+    async fn actions_inhibited(&self, _provider: &Provider) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     async fn pending_compactions(&self) -> anyhow::Result<Vec<CompactionRequest>>;
     async fn compaction_owner(&self, id: &SessionId) -> anyhow::Result<SessionSummary>;
     async fn claim_compaction(&self, id: uuid::Uuid) -> anyhow::Result<bool>;
@@ -343,6 +347,10 @@ pub trait DaemonStore: Send + Sync {
 
 #[async_trait]
 pub trait ReseedStore: Send + Sync {
+    async fn reseed_inhibited(&self, _provider: &Provider) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     async fn insert_reseed_summary(&self, summary: ReseedSummary) -> anyhow::Result<()>;
     async fn insert_reseeded_session(&self, session: SessionSummary) -> anyhow::Result<()>;
     async fn last_reseed_at(&self, id: &SessionId) -> anyhow::Result<Option<DateTime<Utc>>>;
@@ -355,6 +363,10 @@ pub trait ReseedStore: Send + Sync {
 
 #[async_trait]
 pub trait KeepaliveStore: Send + Sync {
+    async fn keepalive_inhibited(&self, _provider: &Provider) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     async fn keepalive_sessions(&self) -> anyhow::Result<Vec<SessionSummary>>;
     async fn keepalive_state(&self, id: &SessionId) -> anyhow::Result<KeepaliveState>;
     async fn record_keepalive_ping(&self, id: &SessionId, at: DateTime<Utc>) -> anyhow::Result<()>;
@@ -502,6 +514,11 @@ fn apply_threshold_values(
 }
 #[async_trait]
 impl DaemonStore for SqliteDaemonStore {
+    async fn actions_inhibited(&self, provider: &Provider) -> anyhow::Result<bool> {
+        let provider = provider.clone();
+        self.blocking(move |store| Ok(store.actions_inhibited(&provider)?)).await
+    }
+
     async fn pending_compactions(&self) -> anyhow::Result<Vec<CompactionRequest>> {
         self.blocking(|s| Ok(s.pending_compaction_requests()?))
             .await
@@ -607,6 +624,11 @@ impl DaemonStore for SqliteDaemonStore {
 
 #[async_trait]
 impl ReseedStore for SqliteDaemonStore {
+    async fn reseed_inhibited(&self, provider: &Provider) -> anyhow::Result<bool> {
+        let provider = provider.clone();
+        self.blocking(move |store| Ok(store.actions_inhibited(&provider)?)).await
+    }
+
     async fn insert_reseed_summary(&self, summary: ReseedSummary) -> anyhow::Result<()> {
         self.blocking(move |s| Ok(s.insert_reseed_summary(&summary)?))
             .await
@@ -633,6 +655,11 @@ impl ReseedStore for SqliteDaemonStore {
 }
 #[async_trait]
 impl KeepaliveStore for SqliteDaemonStore {
+    async fn keepalive_inhibited(&self, provider: &Provider) -> anyhow::Result<bool> {
+        let provider = provider.clone();
+        self.blocking(move |store| Ok(store.actions_inhibited(&provider)?)).await
+    }
+
     async fn keepalive_sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
         self.blocking(|s| Ok(s.list_sessions()?)).await
     }
@@ -1054,6 +1081,7 @@ pub async fn run_reseed(
     summarizer: &dyn Summarizer,
     store: &dyn ReseedStore,
 ) -> anyhow::Result<SessionId> {
+    anyhow::ensure!(!store.reseed_inhibited(&session.harness).await?, "active behavior is inhibited");
     let transcript = adapter.export_transcript(session).await?;
     let before = transcript.split_whitespace().count() as u64;
     let summary = summarizer
@@ -1071,6 +1099,7 @@ pub async fn run_reseed(
             created_at: Utc::now(),
         })
         .await?;
+    anyhow::ensure!(!store.reseed_inhibited(&session.harness).await?, "active behavior is inhibited");
     let new_id = adapter
         .seed_new_session(
             SeedMode::InitialPrompt,
@@ -1127,6 +1156,7 @@ pub async fn run_reseed_auto_tick(
     time_since_last_reseed: Duration,
     profile: &ThresholdProfile,
 ) -> anyhow::Result<Option<SessionId>> {
+    if store.reseed_inhibited(&session.harness).await? { return Ok(None); }
     let should = uw_policy::should_auto_reseed(
         now - session.last_seen,
         cache_ttl,
@@ -1166,6 +1196,8 @@ where
 {
     let mut reseeded = 0;
     for session in sessions {
+        if store.actions_inhibited(&session.harness).await? { continue; }
+
         let Some(profile) = profiles.get(&session.id) else {
             continue;
         };
@@ -1433,6 +1465,8 @@ pub async fn run_keepalive_tick(
 ) -> anyhow::Result<u32> {
     let mut sent = 0;
     for session in store.keepalive_sessions().await? {
+        if store.keepalive_inhibited(&session.harness).await? { continue; }
+
         let records = token_records
             .get(&session.id)
             .map(Vec::as_slice)
@@ -1492,6 +1526,7 @@ pub async fn run_compaction_tick(
             continue;
         }
         let session = store.compaction_owner(&request.session_id).await?;
+        if store.actions_inhibited(&session.harness).await? { continue; }
         let Some(adapter) = adapters.get(&session.harness) else {
             store
                 .update_compaction(request.id, CompactionStatus::Failed("no adapter".into()))
@@ -1563,6 +1598,10 @@ pub async fn run_compaction_tick(
                 } else {
                     session
                 };
+                if store.actions_inhibited(&session.harness).await? {
+                    store.update_compaction(request.id, CompactionStatus::Failed("active behavior inhibited after claim".into())).await?;
+                    continue;
+                }
                 let result = adapter.compact(&session, &request).await;
                 let status = match result {
                     Ok(DeliveryOutcome::Delivered | DeliveryOutcome::QueuedForNextIdle) => {
@@ -1696,6 +1735,8 @@ pub async fn run_policy_tick(
         }
     }
     for session in sessions {
+        if store.actions_inhibited(&session.harness).await? { continue; }
+
         let Some(adapter) = adapters.get(&session.harness) else {
             continue;
         };
@@ -1925,6 +1966,7 @@ impl IdleEpisodeTracker {
         profile: &ThresholdProfile,
         adapter: &dyn HarnessAdapter,
     ) -> anyhow::Result<bool> {
+        if store.actions_inhibited(&session.harness).await? { return Ok(false); }
         if !idle || !activity_is_idle(adapter, session).await {
             self.enqueued.remove(&session.id);
             return Ok(false);
@@ -2003,6 +2045,7 @@ async fn handle_hard_boundary(
     adapter: &dyn HarnessAdapter,
     active: bool,
 ) -> anyhow::Result<()> {
+    if store.actions_inhibited(&session.harness).await? { return Ok(()); }
     let requests = store.compaction_requests_for_session(&session.id).await?;
     let latest = requests
         .iter()
@@ -2119,6 +2162,7 @@ async fn reconcile_resume_marker_with_token_rates(
     sessions: &[SessionSummary],
     token_rates: &HashMap<SessionId, f64>,
 ) -> anyhow::Result<bool> {
+    if store.actions_inhibited(&session.harness).await? { return Ok(false); }
     let token_burn_rate = scaled_token_burn_rate(block, session, sessions, token_rates);
     match store.active_resume_marker(&session.id).await? {
         Some(marker) if marker.resume_at.is_none() => {
@@ -2312,6 +2356,7 @@ pub async fn run_preempt_resume_tick(
     let mut token_rates = HashMap::new();
     let mut token_records = HashMap::new();
     for session in sessions {
+        if store.actions_inhibited(&session.harness).await? { continue; }
         let burn_lookback = uw_policy::burn_rate_lookback(&session.harness);
         let records = store.token_usage(&session.id).await?;
         token_records.insert(session.id.clone(), records.clone());
@@ -2330,6 +2375,7 @@ pub async fn run_preempt_resume_tick(
     let mut seen_windows = HashSet::new();
     let mut moved = 0usize;
     for session in sessions {
+        if store.actions_inhibited(&session.harness).await? { continue; }
         let samples = store.usage_samples(session).await?;
         let mut keys = HashSet::new();
         for sample in &samples {
@@ -2468,6 +2514,7 @@ pub async fn run_resume_tick(
 ) -> anyhow::Result<()> {
     for marker in store.due_resume_markers(now).await? {
         let session = store.resume_owner(&marker.session_id).await?;
+        if store.actions_inhibited(&session.harness).await? { continue; }
         if let Some(resume_at) = exhausted_window_resume_at(store, &session, now).await? {
             store.defer_resume(marker.id, resume_at).await?;
             tracing::info!(
@@ -2478,6 +2525,10 @@ pub async fn run_resume_tick(
             continue;
         }
         if !store.claim_resume_marker(marker.id).await? {
+            continue;
+        }
+        if store.actions_inhibited(&session.harness).await? {
+            store.update_resume(marker.id, ResumeStatus::Failed("active behavior inhibited after claim".into())).await?;
             continue;
         }
         let mut route_errors = Vec::new();

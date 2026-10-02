@@ -70,3 +70,50 @@ test('added reset time uses the tempo shade', () => {
   assert.match(output, /<span class="added-time"[^>]*>1h 30m<\/span> \+ 30m/);
   assert.match(output, /class="added-time"[^>]*color:\s*hsl\(180\.0, 70%, 48%\)/);
 });
+
+const inhibitStart = html.indexOf('function renderInhibitToggle(');
+const inhibitEnd = html.indexOf('function renderUsage(', inhibitStart);
+
+test('global and provider switches show independent stored overrides', () => {
+  const ctx = {
+    actionInhibits: { global: true, providers: ['Codex'] },
+    escapeHtml: value => String(value).replaceAll('"', '&quot;'),
+    providerLabel: value => value,
+    inhibitSaving: false,
+  };
+  vm.runInNewContext(`${html.slice(inhibitStart, inhibitEnd)}; globalThis.toggle = renderInhibitToggle;`, ctx);
+  assert.match(ctx.toggle(null), /checked/);
+  assert.match(ctx.toggle('Codex'), /checked/);
+  assert.doesNotMatch(ctx.toggle('ClaudeCode'), / checked/);
+  assert.match(ctx.toggle('ClaudeCode'), /global inhibit/);
+  ctx.actionInhibits.global = false;
+  ctx.actionInhibits.providers = [];
+  assert.doesNotMatch(ctx.toggle(null), / checked/);
+  assert.doesNotMatch(ctx.toggle('Codex'), / checked/);
+});
+
+test('inhibit writes persist explicit state and recover after a failed save', async () => {
+  const calls = [];
+  const banner = [];
+  const ctx = {
+    actionInhibits: { global: false, providers: [] }, inhibitSaving: false,
+    inhibitRevision: 0, lastStatus: { usage: [] },
+    api: async (path, options) => {
+      calls.push([path, JSON.parse(options.body)]);
+      return { global: false, providers: ['Codex'] };
+    },
+    renderUsage: () => {}, $: () => ({ innerHTML: '' }),
+    escapeHtml: value => String(value), providerLabel: value => value,
+    setBanner: message => banner.push(message),
+  };
+  vm.runInNewContext(`${html.slice(inhibitStart, inhibitEnd)}; globalThis.save = setActionInhibit;`, ctx);
+  await ctx.save('Codex', true);
+  assert.deepEqual(calls, [['/api/action-inhibits', { provider: 'Codex', inhibited: true }]]);
+  assert.deepEqual(ctx.actionInhibits.providers, ['Codex']);
+  assert.equal(ctx.inhibitSaving, false);
+  ctx.api = async () => { throw new Error('offline'); };
+  await ctx.save('Codex', false);
+  assert.deepEqual(ctx.actionInhibits.providers, ['Codex']);
+  assert.equal(ctx.inhibitSaving, false);
+  assert.match(banner[0], /offline/);
+});
