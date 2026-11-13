@@ -288,12 +288,14 @@ impl HarnessAdapter for CodexAdapter {
             || result.get("ordinaryUsageAllowed").and_then(Value::as_bool) == Some(false);
         let mut windows = HashMap::new();
         for name in ["primary", "secondary"] {
-            if let Some(w) = limits.get(name) {
-                let mins = w
-                    .get("windowDurationMins")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| AdapterError::Other("missing window duration".into()))?
-                    as u32;
+            // An explicit `null` means the plan has no such window (weekly-only plans).
+            if let Some(w) = limits.get(name).filter(|w| !w.is_null()) {
+                // Unknown duration keeps the window under a named custom kind
+                // rather than failing the whole provider.
+                let kind = match w.get("windowDurationMins").and_then(Value::as_u64) {
+                    Some(m) => WindowKind::Rolling { minutes: m as u32 },
+                    None => WindowKind::Custom(format!("codex-{name}")),
+                };
                 let pct = w
                     .get("usedPercent")
                     .and_then(Value::as_f64)
@@ -306,7 +308,7 @@ impl HarnessAdapter for CodexAdapter {
                 windows.insert(
                     WindowKey {
                         provider: Provider::Codex,
-                        kind: WindowKind::Rolling { minutes: mins },
+                        kind,
                     },
                     UsageWindowState::new(pct, limited, true, reset, None),
                 );
@@ -1232,6 +1234,74 @@ done
                 _ => json!({"result":{}}),
             })
         }
+    }
+    struct SingleWindowRpc(serde_json::Value);
+    #[async_trait::async_trait]
+    impl AppServerTransport for SingleWindowRpc {
+        async fn call(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> AdapterResult<serde_json::Value> {
+            Ok(match method {
+                "account/read" => {
+                    json!({"result":{"account":{"type":"chatgpt","email":"codex@example.com","planType":"prolite"}}})
+                }
+                "account/rateLimits/read" => self.0.clone(),
+                _ => json!({"result":{}}),
+            })
+        }
+    }
+    // why: 2026-10-24 plan change: the app-server sends only a weekly `primary`
+    // and `"secondary": null`. The null was treated as a window with no duration,
+    // failing the whole provider (~2,300 times). Shape captured live 2026-11-13
+    // (ids, credits, reset-credit list removed). Fails on old code with
+    // "missing window duration".
+    #[tokio::test]
+    async fn null_secondary_window_is_skipped() {
+        let live = json!({"result":{"ordinaryUsageAllowed":true,"rateLimits":{
+            "limitId":"codex","primary":{"usedPercent":84,"windowDurationMins":10080,"resetsAt":1794910748},
+            "secondary":null,"planType":"prolite","rateLimitReachedType":null}}});
+        let sample = CodexAdapter::new(Arc::new(SingleWindowRpc(live)))
+            .fetch_usage(None)
+            .await
+            .unwrap();
+        assert_eq!(sample.windows.len(), 1);
+        let w = &sample.windows[&WindowKey {
+            provider: Provider::Codex,
+            kind: WindowKind::Rolling { minutes: 10080 },
+        }];
+        assert_eq!(w.pct, 84.0);
+        assert_eq!(w.resets_at.map(|t| t.timestamp()), Some(1794910748));
+    }
+    // why: a present window without a duration must be kept (unknown duration),
+    // not fail the provider. Positive control that the window is not just dropped.
+    #[tokio::test]
+    async fn window_without_duration_is_kept_with_unknown_kind() {
+        let shape = json!({"result":{"ordinaryUsageAllowed":true,"rateLimits":{
+            "primary":{"usedPercent":40,"resetsAt":1794910748},
+            "secondary":{"usedPercent":7,"windowDurationMins":300,"resetsAt":1800000100}}}});
+        let sample = CodexAdapter::new(Arc::new(SingleWindowRpc(shape)))
+            .fetch_usage(None)
+            .await
+            .unwrap();
+        assert_eq!(sample.windows.len(), 2);
+        assert_eq!(
+            sample.windows[&WindowKey {
+                provider: Provider::Codex,
+                kind: WindowKind::Custom("codex-primary".into())
+            }]
+                .pct,
+            40.0
+        );
+        assert_eq!(
+            sample.windows[&WindowKey {
+                provider: Provider::Codex,
+                kind: WindowKind::Rolling { minutes: 300 }
+            }]
+                .pct,
+            7.0
+        );
     }
     #[tokio::test]
     async fn rate_limits_key_by_duration_not_position() {
