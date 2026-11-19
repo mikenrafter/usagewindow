@@ -728,14 +728,23 @@ impl ObservationStore for SqliteDaemonStore {
     ) -> anyhow::Result<()> {
         self.blocking(move |store| {
             let last_seen_missing = found.last_seen.is_none();
+            let known = if found.first_seen.is_none() || last_seen_missing {
+                match store.read_session(&found.id) {
+                    Ok(session) => Some(session),
+                    Err(uw_store::StoreError::NotFound) => None,
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                None
+            };
             let session = SessionSummary {
                 id: found.id.clone(),
                 lineage: found.lineage,
                 harness: provider,
                 model: found.model,
                 account,
-                first_seen: found.first_seen.unwrap_or(now),
-                last_seen: found.last_seen.unwrap_or(now),
+                first_seen: found.first_seen.or_else(|| known.as_ref().map(|s| s.first_seen)).unwrap_or(now),
+                last_seen: found.last_seen.or_else(|| known.as_ref().map(|s| s.last_seen)).unwrap_or(now),
                 cwd: found.cwd,
                 state_path: found.state_path,
                 context_window_size: found.context_window_size,
@@ -933,6 +942,65 @@ pub async fn run_observation_tick(
     .await
 }
 
+struct DiscoveryGroup {
+    session: DiscoveredSession,
+    checkpoints: Vec<(String, Vec<TokenUsageRecord>)>,
+}
+
+// CLAIM(discovery-summary): each session is persisted once per pass, choosing the
+// newest source with a stable path tie-break. Every source's usage is retained
+// [discovery_coalesces_sources_without_replaying_summary_writes].
+fn consolidate_discovery(mut found: Vec<DiscoveredSession>) -> Vec<DiscoveryGroup> {
+    found.sort_by(|a, b| {
+        a.id.0
+            .cmp(&b.id.0)
+            .then(a.last_seen.cmp(&b.last_seen))
+            .then(a.state_path.cmp(&b.state_path))
+    });
+    let mut groups: Vec<DiscoveryGroup> = Vec::new();
+    for mut session in found {
+        let checkpoint = session
+            .state_path
+            .clone()
+            .map(|path| (path, session.token_usage.clone()));
+        if let Some(group) = groups
+            .last_mut()
+            .filter(|group| group.session.id == session.id)
+        {
+            session.first_seen = session
+                .first_seen
+                .into_iter()
+                .chain(group.session.first_seen)
+                .min();
+            session.model = session.model.or_else(|| group.session.model.take());
+            session.title = session
+                .title
+                .filter(|title| !title.is_empty())
+                .or_else(|| group.session.title.take());
+            session.context_window_size = session
+                .context_window_size
+                .or(group.session.context_window_size);
+            session.last_known_token_count = session
+                .last_known_token_count
+                .or(group.session.last_known_token_count);
+            session.last_known_context_pct = session
+                .last_known_context_pct
+                .or(group.session.last_known_context_pct);
+            let mut records = std::mem::take(&mut group.session.token_usage);
+            records.append(&mut session.token_usage);
+            session.token_usage = records;
+            group.session = session;
+            group.checkpoints.extend(checkpoint);
+        } else {
+            groups.push(DiscoveryGroup {
+                session,
+                checkpoints: checkpoint.into_iter().collect(),
+            });
+        }
+    }
+    groups
+}
+
 async fn run_observation_tick_cached(
     store: &dyn ObservationStore,
     adapters: &HashMap<Provider, Arc<dyn HarnessAdapter>>,
@@ -956,14 +1024,12 @@ async fn run_observation_tick_cached(
         match adapter.discover_sessions().await {
             Ok(found) => {
                 let now = Utc::now();
-                for session in found {
-                    if !known.iter().any(|existing| existing.id == session.id) {
+                for group in consolidate_discovery(found) {
+                    let session = group.session;
+                    let id = session.id.clone();
+                    if !known.iter().any(|existing| existing.id == id) {
                         report.sessions_discovered += 1;
                     }
-                    let checkpoint = session
-                        .state_path
-                        .clone()
-                        .map(|path| (path, session.id.clone(), session.token_usage.clone()));
                     store
                         .upsert_discovered_session(
                             adapter.provider(),
@@ -978,7 +1044,7 @@ async fn run_observation_tick_cached(
                             now,
                         )
                         .await?;
-                    if let Some((path, id, records)) = checkpoint {
+                    for (path, records) in group.checkpoints {
                         adapter.acknowledge_discovery(&path, &id, &records).await?;
                     }
                 }

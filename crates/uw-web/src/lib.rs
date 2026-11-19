@@ -1628,6 +1628,56 @@ mod tests {
         );
     }
 
+    // why: an idle status connection must release its read snapshot so normal
+    // autocheckpoints can recycle the WAL between requests.
+    #[tokio::test]
+    async fn status_reader_releases_wal_between_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("usage.db").to_str().unwrap()).unwrap();
+        store.insert_session(&session()).unwrap();
+        let writer = Arc::new(Mutex::new(store));
+        let router = app_with_runtime(
+            writer.clone(),
+            HashMap::new(),
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .unwrap();
+        for title in ["first", "second", "third"] {
+            writer
+                .lock()
+                .unwrap()
+                .set_session_title(&session().id, title)
+                .unwrap();
+            let response = router
+                .clone()
+                .oneshot(Request::get("/api/status").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let checkpoint: (i64, i64, i64) = writer
+                .lock()
+                .unwrap()
+                .connection()
+                .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+                .unwrap();
+            assert!(
+                checkpoint.1 > 0,
+                "positive control: changing the title writes WAL frames"
+            );
+            assert_eq!(checkpoint.0, 0);
+            assert_eq!(
+                checkpoint.1, checkpoint.2,
+                "status must release every read statement"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn action_inhibit_api_updates_scopes_independently() {
         let shared = Arc::new(Mutex::new(Store::open_memory().unwrap()));

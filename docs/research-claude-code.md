@@ -33,9 +33,17 @@ DankMaterialShell status-bar plugin (bash+QML). This is ground truth for the Cla
   token/cost analytics and for the transcript-export step of the reseed flow, but is
   NEVER reconciled against the API's `utilization` percentage by either reference
   plugin — keep them as separate signals, don't average them.
-- Subagent (sidechain) transcripts are NOT under `~/.claude/projects` — they live in
-  `/tmp/claude-<uid>/.../tasks/<agentId>.output` and are periodically purged. Any local
-  token accounting that only reads the projects dir will silently miss subagent spend.
+- Local verification on 2026-11-19 found 649 sidechain transcripts under
+  `~/.claude/projects/<project>/<parent-uuid>/subagents/agent-*.jsonl`, across
+  14 parent sessions. Every first record carried `isSidechain: true` and the
+  parent's `sessionId`. These files contribute token usage to that parent;
+  they are separate sources, not separate session identities. Discovery must
+  consolidate their summaries before writing a parent row, retain all sources'
+  usage, and acknowledge each path only after its records commit. Temporary
+  `/tmp/claude-<uid>/.../tasks/<agentId>.output` files also occur in older
+  reference evidence; they are not the only location for sidechain transcripts.
+  Counts and the field-only probe are retained in
+  `usagewindow.research/startup-memory/subagent-evidence.json`.
 
 ## Hook surface — the load-bearing gotchas
 
