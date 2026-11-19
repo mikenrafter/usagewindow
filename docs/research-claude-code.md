@@ -291,3 +291,20 @@ Duplicate tool-use records are idempotent; a repeated streaming record cannot
 reopen a tool call whose matching result already arrived. Root activity ignores
 `isSidechain:true` records. The parser was checked read-only against the original
 session transcript up to 23:17:06 UTC and reports busy at the interruption point.
+
+## Prompt-cache TTL from transcript writes
+
+The owner-provided reference is `vigil/src/cache.rs`, `Record::cache_write`
+and `newest_cache_write`, inspected on 2026-11-19. Main-thread assistant
+records expose `message.usage.cache_creation.ephemeral_1h_input_tokens`
+and `ephemeral_5m_input_tokens`. A positive 1h count takes precedence;
+otherwise a positive 5m count selects five minutes. Zero or missing writes
+retain the previous detected TTL. Records with `isSidechain: true` do not
+change the parent session's TTL. Before any detected write, usagewindow
+uses its five-minute fallback.
+
+`TranscriptScan::observe` folds this metadata into the existing incremental
+JSONL cursor, alongside activity and token accounting. It performs no
+additional file read. The incremental fixture test
+`discovery_tracks_cache_ttl_in_the_incremental_scan` covers 1h, 5m, zero
+writes, sidechains, and 1h precedence when both counters are positive.

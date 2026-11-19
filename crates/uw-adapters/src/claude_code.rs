@@ -1004,6 +1004,7 @@ struct TranscriptScan {
     last_known_token_count: Option<u64>,
     token_usage: Vec<TokenUsageRecord>,
     title: Option<String>,
+    cache_ttl: Option<chrono::Duration>,
 }
 
 impl TranscriptScan {
@@ -1036,6 +1037,26 @@ impl TranscriptScan {
             &record,
             &SessionId(self.record_id.clone().unwrap_or_default()),
         );
+        if record.get("type").and_then(Value::as_str) == Some("assistant")
+            && record.get("isSidechain").and_then(Value::as_bool) != Some(true)
+            && let Some(split) = record.pointer("/message/usage/cache_creation")
+        {
+            if split
+                .get("ephemeral_1h_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                > 0
+            {
+                self.cache_ttl = Some(chrono::Duration::hours(1));
+            } else if split
+                .get("ephemeral_5m_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                > 0
+            {
+                self.cache_ttl = Some(chrono::Duration::minutes(5));
+            }
+        }
         self.quota_error |= record_has_quota_error(&record);
         if self.cwd.is_none() {
             self.cwd = record.get("cwd").and_then(Value::as_str).map(str::to_owned);
@@ -1139,6 +1160,7 @@ impl TranscriptScan {
             context_window_size,
             last_known_token_count: self.last_known_token_count,
             last_known_context_pct: None,
+            cache_ttl: self.cache_ttl,
             first_seen: self.first_seen,
             last_seen: self.last_seen,
             state_path: Some(path.to_owned()),
@@ -1906,6 +1928,7 @@ mod tests {
             context_window_size: None,
             last_known_token_count: None,
             last_known_context_pct: None,
+            cache_ttl: None,
             launch_mode: mode,
             pid: None,
             stopped_reason: None,
@@ -2234,7 +2257,27 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    // why: the production filesystem must emit each append once, without retaining or replaying old usage.
+    // why: old transcripts and non-assistant records cannot invent a cache-write TTL.
+    #[test]
+    fn discovery_leaves_unknown_cache_ttl_for_legacy_or_non_assistant_records() {
+        let path = "/tmp/3507fe61-2d6b-4aae-a0b6-4fe4eec12b40.jsonl";
+        for kind in ["user", "system", "assistant"] {
+            let split = if kind == "assistant" {
+                serde_json::json!({})
+            } else {
+                serde_json::json!({"ephemeral_1h_input_tokens": 1})
+            };
+            let record =
+                serde_json::json!({"type": kind, "message": {"usage": {"cache_creation": split}}});
+            assert_eq!(
+                scan_transcript(path, &record.to_string())
+                    .unwrap()
+                    .cache_ttl,
+                None
+            );
+        }
+    }
+
     // why: TTL is root-session cache-write metadata, retained across cache hits and polls.
     // catches: ignoring 1h writes, accepting sidechains, or clearing TTL on a zero write.
     #[tokio::test]
@@ -2244,25 +2287,44 @@ mod tests {
         let id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b40";
         let path = dir.path().join(format!("{id}.jsonl"));
         let fs = ClaudeTranscriptFileSystem::default();
-        let record = |hour, short, sidechain| serde_json::json!({
+        let record = |hour, short, sidechain| {
+            serde_json::json!({
             "sessionId": id, "type": "assistant", "isSidechain": sidechain,
             "timestamp": "2026-09-17T23:32:34Z", "message": {"content": [], "usage": {
                 "cache_creation": {"ephemeral_1h_input_tokens": hour,
-                                   "ephemeral_5m_input_tokens": short}}}});
+                                   "ephemeral_5m_input_tokens": short}}}})
+        };
         std::fs::write(&path, format!("{}\n", record(0, 10, false))).unwrap();
-        for (hour, short, sidechain, seconds) in [(0, 0, false, 300), (10, 0, true, 300),
-                (10, 10, false, 3600), (0, 0, false, 3600), (0, 10, false, 300)] {
-            writeln!(std::fs::OpenOptions::new().append(true).open(&path).unwrap(),
-                "{}", record(hour, short, sidechain)).unwrap();
+        for (hour, short, sidechain, seconds) in [
+            (0, 0, false, 300),
+            (10, 0, true, 300),
+            (10, 10, false, 3600),
+            (0, 0, false, 3600),
+            (0, 10, false, 300),
+        ] {
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap(),
+                "{}",
+                record(hour, short, sidechain)
+            )
+            .unwrap();
             let found = fs.scan(path.to_str().unwrap()).await.unwrap().unwrap();
             let encoded = serde_json::to_value(found).unwrap();
-            let detected: Option<chrono::Duration> = encoded.get("cache_ttl")
+            let detected: Option<chrono::Duration> = encoded
+                .get("cache_ttl")
                 .and_then(|value| serde_json::from_value(value.clone()).ok());
-            assert_eq!(detected, Some(chrono::Duration::seconds(seconds)),
-                "write=({hour},{short}), sidechain={sidechain}");
+            assert_eq!(
+                detected,
+                Some(chrono::Duration::seconds(seconds)),
+                "write=({hour},{short}), sidechain={sidechain}"
+            );
         }
     }
 
+    // why: the production filesystem must emit each append once, without retaining or replaying old usage.
     #[tokio::test]
     async fn discovery_reads_only_new_claude_usage() {
         use std::io::Write;

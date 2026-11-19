@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use std::{collections::HashMap, time::Duration};
-use uw_core::model::{SessionId, SessionSummary, ThresholdProfile};
+use uw_core::model::{SessionId, SessionSummary, ThresholdProfile, is_cache_warm_for};
 
 pub(super) fn sensitive_interval(base: Duration, pct: f32, active: bool) -> Duration {
     if !active || !pct.is_finite() || !(0.0..=100.0).contains(&pct) {
@@ -28,16 +28,26 @@ pub(super) fn idle_deadline(
         .filter(|s| s.stopped_reason.is_none() && s.superseded_by.is_none())
         .filter_map(|session| {
             let profile = profiles.get(&session.id)?;
-            let ttl = *profile.cache_ttl_by_provider.get(&session.harness)?;
+            let ttl = session
+                .cache_ttl
+                .or_else(|| profile.cache_ttl_by_provider.get(&session.harness).copied())?;
             let age = now - session.last_seen;
             if age >= ttl {
                 return None;
             }
             [
-                ttl - profile.idle_compact.margin,
-                ttl - chrono::Duration::seconds(30),
+                Some(uw_policy::idle_action_delay(
+                    ttl,
+                    profile.idle_compact.margin,
+                )),
+                profile
+                    .reseed_auto
+                    .enabled
+                    .then(|| uw_policy::idle_action_delay(ttl, profile.reseed_auto.margin)),
+                Some(ttl - chrono::Duration::seconds(30)),
             ]
             .into_iter()
+            .flatten()
             .filter_map(|target| {
                 (target > age)
                     .then(|| (target - age).to_std().ok())
@@ -71,7 +81,11 @@ pub(super) fn provider_interval(
                             &session.harness == provider
                                 && session.stopped_reason.is_none()
                                 && session.superseded_by.is_none()
-                                && super::is_cache_warm(session.last_seen, now)
+                                && is_cache_warm_for(
+                                    session.last_seen,
+                                    now,
+                                    session.prompt_cache_ttl(),
+                                )
                                 && (session.account.is_none()
                                     || session.account.as_ref()
                                         == window.scope.as_ref().or(sample.account.as_ref()))
@@ -152,12 +166,40 @@ mod tests {
         let mut encoded = serde_json::to_value(session).unwrap();
         encoded["cache_ttl"] = serde_json::to_value(ChronoDuration::hours(1)).unwrap();
         let session: SessionSummary = serde_json::from_value(encoded).unwrap();
-        assert_eq!(idle_deadline(now(), &[session], &profiles), Some(Duration::from_secs(2940)));
+        assert_eq!(
+            idle_deadline(now(), &[session], &profiles),
+            Some(Duration::from_secs(2940))
+        );
+    }
+
+    // why: explicit auto-reseed overrides can become due before idle compaction.
+    #[test]
+    fn idle_deadline_includes_an_earlier_reseed_override() {
+        let (session, mut profiles) = fixture(100);
+        let profile = profiles.get_mut(&session.id).unwrap();
+        profile.reseed_auto.enabled = true;
+        profile.reseed_auto.margin = Some(ChronoDuration::minutes(2));
+        assert_eq!(
+            idle_deadline(now(), &[session], &profiles),
+            Some(Duration::from_secs(80))
+        );
+    }
+
+    // why: the five-minute fallback must wake exactly at 4m10s, without minute rounding.
+    #[test]
+    fn idle_deadline_uses_five_sixths_of_the_fallback_ttl() {
+        let (session, profiles) = fixture(240);
+        assert_eq!(
+            idle_deadline(now(), &[session], &profiles),
+            Some(Duration::from_secs(10))
+        );
     }
 
     #[test]
     fn idle_deadline_hits_the_configured_trigger_without_minute_rounding() {
-        let (session, profiles) = fixture(179);
+        let (session, mut profiles) = fixture(179);
+        profiles.get_mut(&session.id).unwrap().idle_compact.margin =
+            Some(ChronoDuration::minutes(2));
         assert_eq!(
             idle_deadline(now(), &[session], &profiles),
             Some(Duration::from_secs(1))
@@ -176,7 +218,8 @@ mod tests {
     #[test]
     fn idle_deadline_hits_four_thirty_when_configured_with_a_thirty_second_margin() {
         let (session, mut profiles) = fixture(269);
-        profiles.get_mut(&session.id).unwrap().idle_compact.margin = ChronoDuration::seconds(30);
+        profiles.get_mut(&session.id).unwrap().idle_compact.margin =
+            Some(ChronoDuration::seconds(30));
         assert_eq!(
             idle_deadline(now(), &[session], &profiles),
             Some(Duration::from_secs(1))
@@ -192,7 +235,7 @@ mod tests {
         profiles.insert(second.id.clone(), profiles[&first.id].clone());
         assert_eq!(
             idle_deadline(now(), &[first, second], &profiles),
-            Some(Duration::from_secs(7))
+            Some(Duration::from_secs(77))
         );
     }
 
@@ -203,7 +246,7 @@ mod tests {
         profile
             .cache_ttl_by_provider
             .insert(Provider::ClaudeCode, ChronoDuration::minutes(20));
-        profile.idle_compact.margin = ChronoDuration::seconds(90);
+        profile.idle_compact.margin = Some(ChronoDuration::seconds(90));
         assert_eq!(
             idle_deadline(now(), std::slice::from_ref(&session), &profiles),
             Some(Duration::from_secs(110))
@@ -218,10 +261,10 @@ mod tests {
 
     #[test]
     fn idle_deadline_skips_reached_targets_without_returning_zero_forever() {
-        let (session, profiles) = fixture(180);
+        let (session, profiles) = fixture(250);
         assert_eq!(
             idle_deadline(now(), &[session], &profiles),
-            Some(Duration::from_secs(90))
+            Some(Duration::from_secs(20))
         );
         let (session, profiles) = fixture(270);
         assert_eq!(

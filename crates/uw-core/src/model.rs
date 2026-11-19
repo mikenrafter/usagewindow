@@ -42,7 +42,7 @@ pub fn is_keepalive_eligible(
     now: DateTime<Utc>,
 ) -> bool {
     session.stopped_reason.is_none()
-        && is_cache_warm(session.last_seen, now)
+        && is_cache_warm_for(session.last_seen, now, session.prompt_cache_ttl())
         && session_has_recent_token_activity(token_records, now)
 }
 use std::str::FromStr;
@@ -235,6 +235,9 @@ pub struct SessionSummary {
     /// how full the context is without exposing token counts or a window size.
     #[serde(default)]
     pub last_known_context_pct: Option<f32>,
+    /// Last observed prompt-cache write TTL; absent in older session records.
+    #[serde(default)]
+    pub cache_ttl: Option<Duration>,
     pub launch_mode: LaunchMode,
     pub pid: Option<u32>,
     pub stopped_reason: Option<StopReason>,
@@ -250,6 +253,13 @@ pub struct SessionSummary {
     pub superseded_by: Option<SessionId>,
     pub reseeded_from: Option<SessionId>,
 }
+impl SessionSummary {
+    pub fn prompt_cache_ttl(&self) -> Duration {
+        self.cache_ttl
+            .unwrap_or_else(|| Duration::minutes(CACHE_WARM_APPROXIMATION_MINUTES))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LaunchMode {
     Interactive,
@@ -335,7 +345,9 @@ pub enum CompactionStatus {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IdleCompactConfig {
     pub tiers: Vec<TokenTier>,
-    pub margin: Duration,
+    /// An explicit margin overrides the default of one sixth of the cache TTL.
+    #[serde(default)]
+    pub margin: Option<Duration>,
     #[serde(default = "default_unknown_context_token_threshold")]
     pub unknown_context_token_threshold: u64,
     /// Context-fill percentage at which a harness that reports no token counts
@@ -356,7 +368,7 @@ impl Default for IdleCompactConfig {
     fn default() -> Self {
         Self {
             tiers: Vec::new(),
-            margin: Duration::zero(),
+            margin: None,
             unknown_context_token_threshold: default_unknown_context_token_threshold(),
             percent_threshold_pct: default_percent_threshold_pct(),
         }
@@ -372,7 +384,9 @@ pub struct ReseedAutoConfig {
     pub enabled: bool,
     pub min_tokens: u64,
     pub cooldown: Duration,
-    pub margin: Duration,
+    /// An explicit margin overrides the default of one sixth of the cache TTL.
+    #[serde(default)]
+    pub margin: Option<Duration>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct KeepaliveConfig {
@@ -446,9 +460,7 @@ impl Default for ThresholdProfile {
                         token_threshold: 200_000,
                     },
                 ],
-                // 2m leaves ~policy+compaction cadence headroom so delivery
-                // lands inside a 5m warm window (~4–4.5m), not after expiry.
-                margin: Duration::minutes(2),
+                margin: None,
                 unknown_context_token_threshold: 150_000,
                 percent_threshold_pct: default_percent_threshold_pct(),
             },
@@ -569,6 +581,7 @@ mod tests {
             context_window_size: Some(200_000),
             last_known_token_count: Some(100),
             last_known_context_pct: None,
+            cache_ttl: None,
             launch_mode: LaunchMode::Headless,
             pid: None,
             stopped_reason: None,
@@ -605,6 +618,7 @@ mod tests {
             context_window_size: None,
             last_known_token_count: None,
             last_known_context_pct: None,
+            cache_ttl: None,
             launch_mode: LaunchMode::Headless,
             pid: None,
             stopped_reason: None,
@@ -695,6 +709,7 @@ mod tests {
             context_window_size: None,
             last_known_token_count: None,
             last_known_context_pct: None,
+            cache_ttl: None,
             launch_mode: LaunchMode::Interactive,
             pid: None,
             stopped_reason: None,
@@ -718,6 +733,10 @@ mod tests {
         }];
         assert!(is_keepalive_eligible(&session, &recent, now));
         session.last_seen = now - Duration::minutes(10);
+        assert!(!is_keepalive_eligible(&session, &recent, now));
+        session.cache_ttl = Some(Duration::hours(1));
+        assert!(is_keepalive_eligible(&session, &recent, now));
+        session.last_seen = now - Duration::minutes(61);
         assert!(!is_keepalive_eligible(&session, &recent, now));
         session.last_seen = now - Duration::minutes(1);
         assert!(!is_keepalive_eligible(&session, &[], now));
@@ -775,6 +794,24 @@ mod tests {
             context_pct: Some(12.0),
         }];
         assert!(!session_has_recent_token_activity(&records, now));
+    }
+
+    // why: old configs omit margin; explicit legacy duration values, including zero, still override.
+    #[test]
+    fn idle_margin_json_keeps_legacy_overrides_and_defaults_when_absent() {
+        for margin in [Duration::zero(), Duration::minutes(2)] {
+            let mut encoded = serde_json::to_value(IdleCompactConfig::default()).unwrap();
+            encoded["margin"] = serde_json::to_value(margin).unwrap();
+            let decoded: IdleCompactConfig = serde_json::from_value(encoded.clone()).unwrap();
+            assert_eq!(decoded.margin, Some(margin));
+            encoded.as_object_mut().unwrap().remove("margin");
+            assert_eq!(
+                serde_json::from_value::<IdleCompactConfig>(encoded)
+                    .unwrap()
+                    .margin,
+                None
+            );
+        }
     }
 
     #[test]

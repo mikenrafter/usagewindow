@@ -139,6 +139,7 @@ impl Store {
             "ALTER TABLE sessions ADD COLUMN lineage_json TEXT",
             "ALTER TABLE sessions ADD COLUMN last_seen_missing INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE sessions ADD COLUMN last_known_context_pct REAL",
+            "ALTER TABLE sessions ADD COLUMN cache_ttl_seconds INTEGER",
             "ALTER TABLE session_token_usage ADD COLUMN context_pct REAL",
             "ALTER TABLE provider_fetch_status ADD COLUMN non_blocking INTEGER NOT NULL DEFAULT 0",
         ] {
@@ -361,9 +362,9 @@ impl Store {
     }
     pub fn read_session(&self, id: &SessionId) -> StoreResult<SessionSummary> {
         let r = self.connection.query_row(
-            "SELECT id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,superseded_by,reseeded_from,superseded_stop_reason,superseded_stop_reason_at,superseded_stop_reason_note,lineage_json,last_known_context_pct FROM sessions WHERE id=?",
+            "SELECT id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,superseded_by,reseeded_from,superseded_stop_reason,superseded_stop_reason_at,superseded_stop_reason_note,lineage_json,last_known_context_pct,cache_ttl_seconds FROM sessions WHERE id=?",
             [id.0.as_str()],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?, row.get(4)?, row.get(5)?, row.get::<_, Option<i64>>(6)?, row.get::<_, Option<i64>>(7)?, row.get::<_, String>(8)?, row.get::<_, Option<i64>>(9)?, row.get(10)?, row.get(11)?, row.get::<_, Option<String>>(12)?, row.get::<_, Option<String>>(13)?, row.get::<_, Option<String>>(14)?, row.get::<_, Option<String>>(15)?, row.get::<_, Option<DateTime<Utc>>>(16)?, row.get::<_, Option<String>>(17)?, row.get::<_, Option<String>>(18)?, row.get::<_, Option<f32>>(19)?)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?, row.get(4)?, row.get(5)?, row.get::<_, Option<i64>>(6)?, row.get::<_, Option<i64>>(7)?, row.get::<_, String>(8)?, row.get::<_, Option<i64>>(9)?, row.get(10)?, row.get(11)?, row.get::<_, Option<String>>(12)?, row.get::<_, Option<String>>(13)?, row.get::<_, Option<String>>(14)?, row.get::<_, Option<String>>(15)?, row.get::<_, Option<DateTime<Utc>>>(16)?, row.get::<_, Option<String>>(17)?, row.get::<_, Option<String>>(18)?, row.get::<_, Option<f32>>(19)?, row.get::<_, Option<i64>>(20)?)),
         ).optional()?.ok_or(StoreError::NotFound)?;
         Ok(SessionSummary {
             id: SessionId(r.0),
@@ -380,6 +381,7 @@ impl Store {
             context_window_size: r.6.map(|x| x as u64),
             last_known_token_count: r.7.map(|x| x as u64),
             last_known_context_pct: r.19,
+            cache_ttl: r.20.and_then(chrono::Duration::try_seconds),
             launch_mode: serde_json::from_str(&r.8)?,
             pid: r.9.map(|x| x as u32),
             first_seen: r.10,
@@ -466,12 +468,14 @@ impl Store {
             .map(|id| self.read_session(&SessionId(id)))
             .collect()
     }
-    /// Returns the shared five-minute cache-warm approximation for a session.
+    /// Tests session cache warmth and recent token activity using the observed TTL.
     pub fn session_cache_warm(&self, id: &SessionId, now: DateTime<Utc>) -> StoreResult<bool> {
         let session = self.read_session(id)?;
         let records = self.token_usage_for_session(id)?;
-        Ok(is_cache_warm(session.last_seen, now)
-            && session_has_recent_token_activity(&records, now))
+        Ok(
+            is_cache_warm_for(session.last_seen, now, session.prompt_cache_ttl())
+                && session_has_recent_token_activity(&records, now),
+        )
     }
     pub fn resume_markers_for_session(&self, id: &SessionId) -> StoreResult<Vec<ResumeMarker>> {
         let mut stmt = self.connection.prepare("SELECT id,session_id,reason,resume_at,requested_at,created_at,status,status_detail,message,preempt FROM resume_markers WHERE session_id=? ORDER BY created_at,id")?;
@@ -545,13 +549,13 @@ impl Store {
         Ok(())
     }
     pub fn insert_session(&self, s: &SessionSummary) -> StoreResult<()> {
-        self.connection.execute("INSERT INTO sessions(id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,stopped_window_kind,superseded_by,reseeded_from,lineage_json,last_known_context_pct) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![s.id.0,json(&s.harness)?,opt_json(&s.model)?,opt_json(&s.account)?,s.cwd,s.state_path,s.context_window_size.map(|x|x as i64),s.last_known_token_count.map(|x|x as i64),json(&s.launch_mode)?,s.pid.map(|x|x as i64),s.first_seen,s.last_seen,opt_json(&s.stopped_reason)?,Option::<String>::None,s.superseded_by.as_ref().map(|x|&x.0),s.reseeded_from.as_ref().map(|x|&x.0),lineage_json(&s.lineage)?,s.last_known_context_pct])?;
+        self.connection.execute("INSERT INTO sessions(id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,stopped_window_kind,superseded_by,reseeded_from,lineage_json,last_known_context_pct,cache_ttl_seconds) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![s.id.0,json(&s.harness)?,opt_json(&s.model)?,opt_json(&s.account)?,s.cwd,s.state_path,s.context_window_size.map(|x|x as i64),s.last_known_token_count.map(|x|x as i64),json(&s.launch_mode)?,s.pid.map(|x|x as i64),s.first_seen,s.last_seen,opt_json(&s.stopped_reason)?,Option::<String>::None,s.superseded_by.as_ref().map(|x|&x.0),s.reseeded_from.as_ref().map(|x|&x.0),lineage_json(&s.lineage)?,s.last_known_context_pct,s.cache_ttl.map(|ttl|ttl.num_seconds())])?;
         Ok(())
     }
     pub fn upsert_session(&self, s: &SessionSummary) -> StoreResult<()> {
         self.connection.execute(
-            "INSERT INTO sessions(id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,stopped_window_kind,superseded_by,reseeded_from,lineage_json,last_known_context_pct) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET harness=excluded.harness,model=COALESCE(excluded.model,sessions.model),account=COALESCE(excluded.account,sessions.account),cwd=excluded.cwd,state_path=COALESCE(excluded.state_path,sessions.state_path),context_window_size=CASE WHEN excluded.last_seen > sessions.last_seen THEN COALESCE(excluded.context_window_size,sessions.context_window_size) ELSE sessions.context_window_size END,last_known_token_count=CASE WHEN excluded.last_seen > sessions.last_seen THEN COALESCE(excluded.last_known_token_count,sessions.last_known_token_count) ELSE sessions.last_known_token_count END,last_known_context_pct=CASE WHEN excluded.last_seen > sessions.last_seen THEN COALESCE(excluded.last_known_context_pct,sessions.last_known_context_pct) ELSE sessions.last_known_context_pct END,pid=COALESCE(excluded.pid,sessions.pid),last_seen=MAX(sessions.last_seen,excluded.last_seen),lineage_json=COALESCE(excluded.lineage_json,sessions.lineage_json)",
-            params![s.id.0,json(&s.harness)?,opt_json(&s.model)?,opt_json(&s.account)?,s.cwd,s.state_path,s.context_window_size.map(|x|x as i64),s.last_known_token_count.map(|x|x as i64),json(&s.launch_mode)?,s.pid.map(|x|x as i64),s.first_seen,s.last_seen,opt_json(&s.stopped_reason)?,Option::<String>::None,s.superseded_by.as_ref().map(|x|&x.0),s.reseeded_from.as_ref().map(|x|&x.0),lineage_json(&s.lineage)?,s.last_known_context_pct],
+            "INSERT INTO sessions(id,harness,model,account,cwd,state_path,context_window_size,last_known_token_count,launch_mode,pid,first_seen,last_seen,stopped_reason,stopped_window_kind,superseded_by,reseeded_from,lineage_json,last_known_context_pct,cache_ttl_seconds) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET harness=excluded.harness,model=COALESCE(excluded.model,sessions.model),account=COALESCE(excluded.account,sessions.account),cwd=excluded.cwd,state_path=COALESCE(excluded.state_path,sessions.state_path),context_window_size=CASE WHEN excluded.last_seen > sessions.last_seen THEN COALESCE(excluded.context_window_size,sessions.context_window_size) ELSE sessions.context_window_size END,last_known_token_count=CASE WHEN excluded.last_seen > sessions.last_seen THEN COALESCE(excluded.last_known_token_count,sessions.last_known_token_count) ELSE sessions.last_known_token_count END,last_known_context_pct=CASE WHEN excluded.last_seen > sessions.last_seen THEN COALESCE(excluded.last_known_context_pct,sessions.last_known_context_pct) ELSE sessions.last_known_context_pct END,pid=COALESCE(excluded.pid,sessions.pid),last_seen=MAX(sessions.last_seen,excluded.last_seen),lineage_json=COALESCE(excluded.lineage_json,sessions.lineage_json),cache_ttl_seconds=COALESCE(excluded.cache_ttl_seconds,sessions.cache_ttl_seconds)",
+            params![s.id.0,json(&s.harness)?,opt_json(&s.model)?,opt_json(&s.account)?,s.cwd,s.state_path,s.context_window_size.map(|x|x as i64),s.last_known_token_count.map(|x|x as i64),json(&s.launch_mode)?,s.pid.map(|x|x as i64),s.first_seen,s.last_seen,opt_json(&s.stopped_reason)?,Option::<String>::None,s.superseded_by.as_ref().map(|x|&x.0),s.reseeded_from.as_ref().map(|x|&x.0),lineage_json(&s.lineage)?,s.last_known_context_pct,s.cache_ttl.map(|ttl|ttl.num_seconds())],
         )?;
         Ok(())
     }
@@ -1414,7 +1418,7 @@ fn decode_compaction_event_row(row: &rusqlite::Row) -> rusqlite::Result<Compacti
         completed_at: row.get(9)?,
     })
 }
-const SCHEMA: &str = r#"PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS action_inhibits(scope TEXT PRIMARY KEY,inhibited INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS usage_samples(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,account TEXT,window_kind TEXT NOT NULL,window_scope_value TEXT NOT NULL,pct REAL NOT NULL,resets_at TEXT,exceeded INTEGER NOT NULL,active INTEGER NOT NULL,source TEXT NOT NULL,at TEXT NOT NULL,fetched_at TEXT,credits_json TEXT,plan TEXT);CREATE INDEX IF NOT EXISTS usage_samples_window_at ON usage_samples(provider,window_kind,window_scope_value,at);CREATE INDEX IF NOT EXISTS usage_samples_provider_source_at ON usage_samples(provider,source,at DESC,id DESC);CREATE INDEX IF NOT EXISTS usage_samples_provider_account_source_at ON usage_samples(provider,account,source,at DESC);CREATE INDEX IF NOT EXISTS usage_samples_provider_account_at ON usage_samples(provider,account,at DESC);CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,harness TEXT NOT NULL,model TEXT,account TEXT,cwd TEXT NOT NULL,state_path TEXT,context_window_size INTEGER,last_known_token_count INTEGER,launch_mode TEXT NOT NULL,pid INTEGER,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,stopped_reason TEXT,stopped_window_kind TEXT,superseded_by TEXT,reseeded_from TEXT,title TEXT,superseded_stop_reason TEXT,superseded_stop_reason_at TEXT,superseded_stop_reason_note TEXT,lineage_json TEXT,last_known_context_pct REAL);CREATE TABLE IF NOT EXISTS session_token_usage(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),at TEXT NOT NULL,model TEXT,input_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_write_input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,context_pct REAL,UNIQUE(session_id,at,total_tokens,input_tokens,output_tokens));CREATE INDEX IF NOT EXISTS session_token_usage_session_at ON session_token_usage(session_id,at);CREATE TABLE IF NOT EXISTS resume_markers(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),reason TEXT NOT NULL,resume_at TEXT,requested_at TEXT,created_at TEXT NOT NULL,status TEXT NOT NULL,status_detail TEXT,message TEXT,preempt INTEGER NOT NULL DEFAULT 1);CREATE INDEX IF NOT EXISTS resume_markers_session_status ON resume_markers(session_id,status);CREATE UNIQUE INDEX IF NOT EXISTS resume_markers_active ON resume_markers(session_id) WHERE status IN ('pending','scheduled');CREATE TABLE IF NOT EXISTS compaction_requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL,prompt TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS compaction_requests_session_status ON compaction_requests(session_id,status);CREATE TABLE IF NOT EXISTS threshold_overrides(id TEXT PRIMARY KEY,scope_kind TEXT NOT NULL,provider TEXT NOT NULL,model_value TEXT,session_value TEXT,field TEXT NOT NULL,value_json TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS threshold_overrides_key ON threshold_overrides(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field);CREATE TABLE IF NOT EXISTS idle_reseed_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,source_model TEXT NOT NULL,summary_text TEXT NOT NULL,token_count_before INTEGER NOT NULL,token_count_after INTEGER NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS keepalive_config(session_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL,last_ping_at TEXT,ping_day TEXT,ping_count INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS hook_messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,text TEXT NOT NULL,created_at TEXT NOT NULL,delivered_at TEXT);CREATE INDEX IF NOT EXISTS hook_messages_delivery ON hook_messages(session_id,event,delivered_at,created_at);CREATE TABLE IF NOT EXISTS hook_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,created_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS hook_events_session_created ON hook_events(session_id,created_at);CREATE TABLE IF NOT EXISTS provider_fetch_status(provider TEXT NOT NULL,account TEXT,last_attempt_at TEXT NOT NULL,last_success_at TEXT,last_error TEXT,consecutive_failures INTEGER NOT NULL DEFAULT 0,non_blocking INTEGER NOT NULL DEFAULT 0);CREATE UNIQUE INDEX IF NOT EXISTS provider_fetch_status_key ON provider_fetch_status(provider,COALESCE(account,''));CREATE TABLE IF NOT EXISTS compaction_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),source TEXT NOT NULL,trigger TEXT,context_pct_before REAL,usage_window_pct_before REAL,tokens_before INTEGER,tokens_after INTEGER,started_at TEXT NOT NULL,completed_at TEXT);CREATE INDEX IF NOT EXISTS compaction_events_session_started ON compaction_events(session_id,started_at);CREATE INDEX IF NOT EXISTS compaction_events_started ON compaction_events(started_at);"#;
+const SCHEMA: &str = r#"PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS action_inhibits(scope TEXT PRIMARY KEY,inhibited INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS usage_samples(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,account TEXT,window_kind TEXT NOT NULL,window_scope_value TEXT NOT NULL,pct REAL NOT NULL,resets_at TEXT,exceeded INTEGER NOT NULL,active INTEGER NOT NULL,source TEXT NOT NULL,at TEXT NOT NULL,fetched_at TEXT,credits_json TEXT,plan TEXT);CREATE INDEX IF NOT EXISTS usage_samples_window_at ON usage_samples(provider,window_kind,window_scope_value,at);CREATE INDEX IF NOT EXISTS usage_samples_provider_source_at ON usage_samples(provider,source,at DESC,id DESC);CREATE INDEX IF NOT EXISTS usage_samples_provider_account_source_at ON usage_samples(provider,account,source,at DESC);CREATE INDEX IF NOT EXISTS usage_samples_provider_account_at ON usage_samples(provider,account,at DESC);CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,harness TEXT NOT NULL,model TEXT,account TEXT,cwd TEXT NOT NULL,state_path TEXT,context_window_size INTEGER,last_known_token_count INTEGER,launch_mode TEXT NOT NULL,pid INTEGER,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,stopped_reason TEXT,stopped_window_kind TEXT,superseded_by TEXT,reseeded_from TEXT,title TEXT,superseded_stop_reason TEXT,superseded_stop_reason_at TEXT,superseded_stop_reason_note TEXT,lineage_json TEXT,last_known_context_pct REAL,cache_ttl_seconds INTEGER);CREATE TABLE IF NOT EXISTS session_token_usage(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),at TEXT NOT NULL,model TEXT,input_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_write_input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,context_pct REAL,UNIQUE(session_id,at,total_tokens,input_tokens,output_tokens));CREATE INDEX IF NOT EXISTS session_token_usage_session_at ON session_token_usage(session_id,at);CREATE TABLE IF NOT EXISTS resume_markers(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),reason TEXT NOT NULL,resume_at TEXT,requested_at TEXT,created_at TEXT NOT NULL,status TEXT NOT NULL,status_detail TEXT,message TEXT,preempt INTEGER NOT NULL DEFAULT 1);CREATE INDEX IF NOT EXISTS resume_markers_session_status ON resume_markers(session_id,status);CREATE UNIQUE INDEX IF NOT EXISTS resume_markers_active ON resume_markers(session_id) WHERE status IN ('pending','scheduled');CREATE TABLE IF NOT EXISTS compaction_requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL,prompt TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS compaction_requests_session_status ON compaction_requests(session_id,status);CREATE TABLE IF NOT EXISTS threshold_overrides(id TEXT PRIMARY KEY,scope_kind TEXT NOT NULL,provider TEXT NOT NULL,model_value TEXT,session_value TEXT,field TEXT NOT NULL,value_json TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS threshold_overrides_key ON threshold_overrides(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field);CREATE TABLE IF NOT EXISTS idle_reseed_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,source_model TEXT NOT NULL,summary_text TEXT NOT NULL,token_count_before INTEGER NOT NULL,token_count_after INTEGER NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS keepalive_config(session_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL,last_ping_at TEXT,ping_day TEXT,ping_count INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS hook_messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,text TEXT NOT NULL,created_at TEXT NOT NULL,delivered_at TEXT);CREATE INDEX IF NOT EXISTS hook_messages_delivery ON hook_messages(session_id,event,delivered_at,created_at);CREATE TABLE IF NOT EXISTS hook_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,created_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS hook_events_session_created ON hook_events(session_id,created_at);CREATE TABLE IF NOT EXISTS provider_fetch_status(provider TEXT NOT NULL,account TEXT,last_attempt_at TEXT NOT NULL,last_success_at TEXT,last_error TEXT,consecutive_failures INTEGER NOT NULL DEFAULT 0,non_blocking INTEGER NOT NULL DEFAULT 0);CREATE UNIQUE INDEX IF NOT EXISTS provider_fetch_status_key ON provider_fetch_status(provider,COALESCE(account,''));CREATE TABLE IF NOT EXISTS compaction_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),source TEXT NOT NULL,trigger TEXT,context_pct_before REAL,usage_window_pct_before REAL,tokens_before INTEGER,tokens_after INTEGER,started_at TEXT NOT NULL,completed_at TEXT);CREATE INDEX IF NOT EXISTS compaction_events_session_started ON compaction_events(session_id,started_at);CREATE INDEX IF NOT EXISTS compaction_events_started ON compaction_events(started_at);"#;
 
 #[cfg(test)]
 mod tests {
@@ -1435,6 +1439,7 @@ mod tests {
             context_window_size: None,
             last_known_token_count: None,
             last_known_context_pct: None,
+            cache_ttl: None,
             launch_mode: LaunchMode::Headless,
             pid: None,
             stopped_reason: None,
@@ -1586,6 +1591,37 @@ mod tests {
                 "related": ["related-session"]
             })
         );
+    }
+
+    // why: upgrading an existing database must preserve rows without cache TTL metadata.
+    #[test]
+    fn opening_a_pre_cache_ttl_database_preserves_legacy_sessions() {
+        let path = std::env::temp_dir().join(format!(
+            "usagewindow-pre-cache-ttl-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let store = Store::open(path.to_str().unwrap()).unwrap();
+            store
+                .insert_session(&session(&SessionId("legacy-cache".into())))
+                .unwrap();
+            store
+                .connection()
+                .execute("ALTER TABLE sessions DROP COLUMN cache_ttl_seconds", [])
+                .unwrap();
+        }
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        let loaded = store
+            .read_session(&SessionId("legacy-cache".into()))
+            .unwrap();
+        assert_eq!(loaded.cache_ttl, None);
+        assert_eq!(loaded.prompt_cache_ttl(), chrono::Duration::minutes(5));
+        let mut encoded = serde_json::to_value(loaded).unwrap();
+        encoded.as_object_mut().unwrap().remove("cache_ttl");
+        let legacy: SessionSummary = serde_json::from_value(encoded).unwrap();
+        assert_eq!(legacy.prompt_cache_ttl(), chrono::Duration::minutes(5));
+        drop(store);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -2437,6 +2473,40 @@ mod tests {
         assert_eq!(updated.context_window_size, Some(200_000));
         assert_eq!(updated.stopped_reason, Some(StopReason::UserQuit));
         assert_eq!(updated.reseeded_from, original.reseeded_from);
+    }
+
+    // why: detected TTL must survive database reloads and hook updates without cache metadata.
+    // catches: dropping TTL on upsert or forgetting the SQLite column in reads/writes.
+    #[test]
+    fn session_cache_ttl_survives_database_and_metadata_free_updates() {
+        let store = Store::open_memory().unwrap();
+        let id = SessionId("cache-ttl".into());
+        let mut observed = session(&id);
+        store.insert_session(&observed).unwrap();
+        assert_eq!(store.read_session(&id).unwrap().cache_ttl, None);
+        observed.cache_ttl = Some(chrono::Duration::hours(1));
+        store.upsert_session(&observed).unwrap();
+        let mut hook = observed.clone();
+        hook.cache_ttl = None;
+        hook.last_seen += chrono::Duration::seconds(1);
+        store.upsert_session(&hook).unwrap();
+        assert_eq!(
+            store.read_session(&id).unwrap().cache_ttl,
+            Some(chrono::Duration::hours(1))
+        );
+        observed.cache_ttl = Some(chrono::Duration::minutes(5));
+        store.upsert_session(&observed).unwrap();
+        assert_eq!(
+            store.read_session(&id).unwrap().cache_ttl,
+            Some(chrono::Duration::minutes(5))
+        );
+        let mut inserted = session(&SessionId("cache-ttl-insert".into()));
+        inserted.cache_ttl = Some(chrono::Duration::hours(1));
+        store.insert_session(&inserted).unwrap();
+        assert_eq!(
+            store.read_session(&inserted.id).unwrap().cache_ttl,
+            inserted.cache_ttl
+        );
     }
 
     #[test]

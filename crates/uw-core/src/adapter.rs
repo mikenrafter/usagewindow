@@ -83,6 +83,8 @@ pub struct DiscoveredSession {
     /// context is without exposing token counts or a window size.
     #[serde(default)]
     pub last_known_context_pct: Option<f32>,
+    #[serde(default)]
+    pub cache_ttl: Option<chrono::Duration>,
     pub first_seen: Option<DateTime<Utc>>,
     pub last_seen: Option<DateTime<Utc>>,
     /// Path to the on-disk record backing this session, if any — lets later reads

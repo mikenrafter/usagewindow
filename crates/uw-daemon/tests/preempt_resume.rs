@@ -24,6 +24,7 @@ fn session(id: &str) -> SessionSummary {
         // The context that has to be written back to cache on resume.
         last_known_token_count: Some(20_000),
         last_known_context_pct: None,
+        cache_ttl: None,
         launch_mode: LaunchMode::Headless,
         pid: None,
         stopped_reason: Some(StopReason::UsageLimit { window: key() }),

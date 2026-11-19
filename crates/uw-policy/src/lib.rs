@@ -398,6 +398,11 @@ pub fn resume_lead_minutes(
     )
 }
 
+/// Idle actions begin at five sixths of the cache TTL unless a margin is configured.
+pub fn idle_action_delay(cache_ttl: Duration, margin: Option<Duration>) -> Duration {
+    cache_ttl - margin.unwrap_or(cache_ttl / 6)
+}
+
 /// Harnesses that report token counts take the token-tier path. Harnesses
 /// that only expose a context-fill percentage (Cursor) take an independent
 /// percent-threshold path rather than having a token count guessed for them.
@@ -412,7 +417,7 @@ pub fn should_idle_compact(
     caps: &Capabilities,
 ) -> bool {
     caps.can_trigger_compaction
-        && idle_for >= cache_ttl - config.margin
+        && idle_for >= idle_action_delay(cache_ttl, config.margin)
         && if caps.reports_token_counts {
             match context_window_size {
                 Some(size) => config
@@ -444,7 +449,7 @@ pub fn should_auto_reseed(
             .seed_modes
             .contains(&uw_core::adapter::SeedMode::InitialPrompt)
         && config.enabled
-        && idle_for >= cache_ttl - config.margin
+        && idle_for >= idle_action_delay(cache_ttl, config.margin)
         && last_known_token_count >= config.min_tokens
         && estimated_reseed_cost_usd < estimated_wait_for_reset_cost_usd
         && time_since_last_reseed >= config.cooldown
@@ -1080,7 +1085,7 @@ mod tests {
                     token_threshold: 200_000,
                 },
             ],
-            margin: Duration::minutes(1),
+            margin: Some(Duration::minutes(1)),
             unknown_context_token_threshold: 150_000,
             percent_threshold_pct: 65.0,
         };
@@ -1122,7 +1127,7 @@ mod tests {
         };
         let caps = caps();
         assert!(!should_idle_compact(
-            Duration::minutes(4),
+            Duration::seconds(250),
             Duration::minutes(5),
             149_999,
             None,
@@ -1131,7 +1136,7 @@ mod tests {
             &caps
         ));
         assert!(should_idle_compact(
-            Duration::minutes(4),
+            Duration::seconds(250),
             Duration::minutes(5),
             150_000,
             None,
@@ -1148,7 +1153,7 @@ mod tests {
         let mut caps = caps();
         caps.reports_token_counts = false;
         assert!(should_idle_compact(
-            Duration::minutes(4),
+            Duration::seconds(250),
             Duration::minutes(5),
             0,
             None,
@@ -1165,7 +1170,7 @@ mod tests {
         let mut caps = caps();
         caps.reports_token_counts = false;
         assert!(!should_idle_compact(
-            Duration::minutes(4),
+            Duration::seconds(250),
             Duration::minutes(5),
             0,
             None,
@@ -1183,7 +1188,7 @@ mod tests {
         caps.reports_token_counts = false;
         caps.can_trigger_compaction = false;
         assert!(!should_idle_compact(
-            Duration::minutes(4),
+            Duration::seconds(250),
             Duration::minutes(5),
             0,
             None,
@@ -1213,8 +1218,6 @@ mod tests {
 
     #[test]
     fn idle_compact_percent_path_uses_the_default_threshold() {
-        // `IdleCompactConfig::default()`'s margin is zero, so idle_for must
-        // fully cover cache_ttl to clear the shared idle-duration gate.
         let config = IdleCompactConfig::default();
         let mut caps = caps();
         caps.reports_token_counts = false;
@@ -1244,7 +1247,7 @@ mod tests {
             enabled: true,
             min_tokens: 100,
             cooldown: Duration::hours(1),
-            margin: Duration::minutes(1),
+            margin: Some(Duration::minutes(1)),
         };
         let caps = caps();
         assert!(should_auto_reseed(
@@ -1302,7 +1305,7 @@ mod tests {
                     window_size_floor: 0,
                     token_threshold: 100_000
                 }],
-                margin: Duration::minutes(1),
+                margin: Some(Duration::minutes(1)),
                 unknown_context_token_threshold: 150_000,
                 percent_threshold_pct: 65.0,
             },
@@ -1329,7 +1332,7 @@ mod tests {
             enabled: true,
             min_tokens: 100,
             cooldown: Duration::minutes(30),
-            margin: Duration::minutes(1),
+            margin: Some(Duration::minutes(1)),
         };
         assert!(should_auto_reseed(
             Duration::minutes(5),
@@ -1420,11 +1423,25 @@ mod tests {
     #[test]
     fn idle_compaction_follows_five_sixths_of_each_ttl() {
         let config = profile().idle_compact;
-        for (ttl, age, expected) in [(3600, 2940, false), (3600, 3000, true),
-                                     (300, 240, false), (300, 250, true)] {
-            assert_eq!(should_idle_compact(Duration::seconds(age), Duration::seconds(ttl),
-                150_000, Some(200_000), None, &config, &caps()), expected,
-                "ttl={ttl}, age={age}");
+        for (ttl, age, expected) in [
+            (3600, 2940, false),
+            (3600, 3000, true),
+            (300, 240, false),
+            (300, 250, true),
+        ] {
+            assert_eq!(
+                should_idle_compact(
+                    Duration::seconds(age),
+                    Duration::seconds(ttl),
+                    150_000,
+                    Some(200_000),
+                    None,
+                    &config,
+                    &caps()
+                ),
+                expected,
+                "ttl={ttl}, age={age}"
+            );
         }
     }
 
@@ -1432,41 +1449,54 @@ mod tests {
     // catches: leaving reseed at full TTL or a fixed one-minute margin.
     #[test]
     fn auto_reseed_follows_five_sixths_of_each_ttl() {
-        let config = ReseedAutoConfig { enabled: true, ..Default::default() };
-        for (ttl, age, expected) in [(3600, 2940, false), (3600, 3000, true),
-                                     (300, 240, false), (300, 250, true)] {
-            assert_eq!(should_auto_reseed(Duration::seconds(age), Duration::seconds(ttl),
-                150_000, 0.1, 1.0, Duration::hours(2), &config, &caps()), expected,
-                "ttl={ttl}, age={age}");
+        let config = ReseedAutoConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        for (ttl, age, expected) in [
+            (3600, 2940, false),
+            (3600, 3000, true),
+            (300, 240, false),
+            (300, 250, true),
+        ] {
+            assert_eq!(
+                should_auto_reseed(
+                    Duration::seconds(age),
+                    Duration::seconds(ttl),
+                    150_000,
+                    0.1,
+                    1.0,
+                    Duration::hours(2),
+                    &config,
+                    &caps()
+                ),
+                expected,
+                "ttl={ttl}, age={age}"
+            );
         }
     }
 
+    // why: explicit margins, including zero, retain their preexisting meaning.
     #[test]
-    fn default_idle_compact_margin_leaves_warm_window_headroom() {
-        // Policy (~30s) + compaction (~60s) cadence can add ~90s after the
-        // threshold. Margin of 2m on a 5m TTL fires at ~3m so delivery lands
-        // around 4–4.5m — still inside the warm cache, not after it expires.
-        let c = &profile().idle_compact;
-        assert_eq!(c.margin, Duration::minutes(2));
-        let caps = caps();
-        assert!(should_idle_compact(
-            Duration::minutes(3),
-            Duration::minutes(5),
-            150_000,
-            Some(200_000),
-            None,
-            c,
-            &caps
-        ));
-        assert!(!should_idle_compact(
-            Duration::minutes(2) + Duration::seconds(59),
-            Duration::minutes(5),
-            150_000,
-            Some(200_000),
-            None,
-            c,
-            &caps
-        ));
+    fn explicit_idle_margins_override_the_ttl_fraction() {
+        for (margin, before, at) in [(0, 3599, 3600), (120, 3479, 3480)] {
+            let mut config = profile().idle_compact;
+            config.margin = Some(Duration::seconds(margin));
+            for (age, expected) in [(before, false), (at, true)] {
+                assert_eq!(
+                    should_idle_compact(
+                        Duration::seconds(age),
+                        Duration::hours(1),
+                        150_000,
+                        Some(200_000),
+                        None,
+                        &config,
+                        &caps()
+                    ),
+                    expected
+                );
+            }
+        }
     }
 
     fn caps() -> Capabilities {

@@ -278,6 +278,7 @@ mod tests {
                 context_window_size: None,
                 last_known_token_count: None,
                 last_known_context_pct: None,
+                cache_ttl: None,
                 launch_mode: LaunchMode::Headless,
                 pid: None,
                 stopped_reason: None,

@@ -237,6 +237,7 @@ fn discovered(path: &str, at: Option<DateTime<Utc>>, tokens: u64) -> DiscoveredS
         context_window_size: Some(200_000),
         last_known_token_count: Some(tokens),
         last_known_context_pct: None,
+        cache_ttl: None,
         first_seen: at,
         last_seen: at,
         state_path: Some(path.into()),
@@ -283,7 +284,8 @@ async fn discovery_coalesces_sources_without_replaying_summary_writes() {
     let at = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
         .unwrap()
         .with_timezone(&Utc);
-    let older = discovered("/older", Some(at), 12);
+    let mut older = discovered("/older", Some(at), 12);
+    older.cache_ttl = Some(chrono::Duration::hours(1));
     let newer = discovered("/newer", Some(at + chrono::Duration::seconds(1)), 24);
     let duplicate = DiscoveredSession {
         last_seen: newer.last_seen,
@@ -311,6 +313,7 @@ async fn discovery_coalesces_sources_without_replaying_summary_writes() {
         assert_eq!(summary.model, newer.model);
         assert_eq!(summary.last_seen, newer.last_seen.unwrap());
         assert_eq!(summary.first_seen, at);
+        assert_eq!(summary.cache_ttl, Some(chrono::Duration::hours(1)));
         assert_eq!(db.resolve_session_title(&newer.id).unwrap(), newer.title);
         let records = db.token_usage_for_session(&newer.id).unwrap();
         assert_eq!(records.len(), 2);

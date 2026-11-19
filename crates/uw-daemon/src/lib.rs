@@ -750,6 +750,7 @@ impl ObservationStore for SqliteDaemonStore {
                 context_window_size: found.context_window_size,
                 last_known_token_count: found.last_known_token_count,
                 last_known_context_pct: found.last_known_context_pct,
+                cache_ttl: found.cache_ttl,
                 launch_mode: LaunchMode::Interactive,
                 pid: None,
                 stopped_reason: None,
@@ -986,6 +987,7 @@ fn consolidate_discovery(mut found: Vec<DiscoveredSession>) -> Vec<DiscoveryGrou
             session.last_known_context_pct = session
                 .last_known_context_pct
                 .or(group.session.last_known_context_pct);
+            session.cache_ttl = session.cache_ttl.or(group.session.cache_ttl);
             let mut records = std::mem::take(&mut group.session.token_usage);
             records.append(&mut session.token_usage);
             session.token_usage = records;
@@ -1073,13 +1075,14 @@ async fn run_observation_tick_cached(
         // Account-level exceeded is not a per-session stop. Adapters decide via
         // detect_stop_with_usage (quota error markers + usage), and cold/uncached
         // chats are never candidates for an inferred UsageLimit stop.
-        let detected = if !is_cache_warm(session.last_seen, Utc::now()) {
-            Ok(None)
-        } else {
-            adapter
-                .detect_stop_with_usage(&session.id, fetched_samples.get(&session.harness))
-                .await
-        };
+        let detected =
+            if !is_cache_warm_for(session.last_seen, Utc::now(), session.prompt_cache_ttl()) {
+                Ok(None)
+            } else {
+                adapter
+                    .detect_stop_with_usage(&session.id, fetched_samples.get(&session.harness))
+                    .await
+            };
         match detected {
             Ok(Some(reason)) if session.stopped_reason.as_ref() != Some(&reason) => {
                 // Codex has no passive mid-turn channel, so a hook event that isn't
@@ -1203,6 +1206,7 @@ pub async fn run_reseed(
             context_window_size: None,
             last_known_token_count: None,
             last_known_context_pct: None,
+            cache_ttl: None,
             launch_mode: LaunchMode::Headless,
             pid: None,
             stopped_reason: None,
@@ -1237,7 +1241,7 @@ pub async fn run_reseed_auto_tick(
     if store.reseed_inhibited(&session.harness).await? { return Ok(None); }
     let should = uw_policy::should_auto_reseed(
         now - session.last_seen,
-        cache_ttl,
+        session.cache_ttl.unwrap_or(cache_ttl),
         session.last_known_token_count.unwrap_or_default(),
         estimated_reseed_cost_usd,
         estimated_wait_for_reset_cost_usd,
@@ -1279,7 +1283,10 @@ where
         let Some(profile) = profiles.get(&session.id) else {
             continue;
         };
-        let Some(cache_ttl) = profile.cache_ttl_by_provider.get(&session.harness) else {
+        let Some(cache_ttl) = session
+            .cache_ttl
+            .or_else(|| profile.cache_ttl_by_provider.get(&session.harness).copied())
+        else {
             continue;
         };
         let Some(adapter) = adapters.get(&session.harness) else {
@@ -1289,7 +1296,7 @@ where
         let since = last.map_or(Duration::MAX, |at| now - at);
         let should_reseed = uw_policy::should_auto_reseed(
             now - session.last_seen,
-            *cache_ttl,
+            cache_ttl,
             session.last_known_token_count.unwrap_or_default(),
             runtime.estimated_reseed_cost_usd,
             runtime.estimated_wait_for_reset_cost_usd,
@@ -1520,14 +1527,17 @@ pub fn should_fire_keepalive(
     if !config.enabled {
         return false;
     }
-    let Some(ttl) = profile.cache_ttl_by_provider.get(&session.harness) else {
+    let Some(ttl) = session
+        .cache_ttl
+        .or_else(|| profile.cache_ttl_by_provider.get(&session.harness).copied())
+    else {
         return false;
     };
-    let keepalive_margin = profile.idle_compact.margin + Duration::minutes(1);
+    let keepalive_margin = profile.idle_compact.margin.unwrap_or(ttl / 6) + Duration::minutes(1);
     let last_activity = state
         .last_ping_at
         .map_or(session.last_seen, |ping| ping.max(session.last_seen));
-    if !state.enabled || last_activity >= now || now - last_activity < *ttl - keepalive_margin {
+    if !state.enabled || last_activity >= now || now - last_activity < ttl - keepalive_margin {
         return false;
     }
     let today = now.date_naive().to_string();
@@ -1622,7 +1632,7 @@ pub async fn run_compaction_tick(
             &adapter.capabilities(),
             idle,
             &session,
-            is_cache_warm(session.last_seen, Utc::now()),
+            is_cache_warm_for(session.last_seen, Utc::now(), session.prompt_cache_ttl()),
         ) {
             CompactionPlan::SkipUnsupported(reason) => {
                 store
@@ -1659,7 +1669,11 @@ pub async fn run_compaction_tick(
                             &adapter.capabilities(),
                             idle,
                             &current,
-                            is_cache_warm(current.last_seen, Utc::now()),
+                            is_cache_warm_for(
+                                current.last_seen,
+                                Utc::now(),
+                                current.prompt_cache_ttl(),
+                            ),
                         ) != CompactionPlan::ClaimAndSend
                     {
                         store
@@ -1816,11 +1830,12 @@ pub async fn run_policy_tick(
         }
         let records = store.token_usage(&session.id).await?;
         token_records.insert(session.id.clone(), records.clone());
-        let activity_weight = if is_cache_warm(session.last_seen, now) {
-            1.0
-        } else {
-            0.3
-        };
+        let activity_weight =
+            if is_cache_warm_for(session.last_seen, now, session.prompt_cache_ttl()) {
+                1.0
+            } else {
+                0.3
+            };
         if let Some(rate) = uw_policy::weighted_token_rate_per_minute(
             &records,
             now,
@@ -1896,7 +1911,7 @@ pub async fn run_policy_tick(
                     .await?;
                 } else if quota_exhausted
                     && stopped_on_this_window
-                    && is_cache_warm(session.last_seen, now)
+                    && is_cache_warm_for(session.last_seen, now, session.prompt_cache_ttl())
                 {
                     // Past 100% there is nothing left to reclaim by compacting.
                     // Still schedule resume for the session that actually stopped.
@@ -1978,7 +1993,9 @@ pub async fn run_policy_tick(
             }
         }
         if !suppress_idle
-            && let Some(cache_ttl) = profile.cache_ttl_by_provider.get(&session.harness)
+            && let Some(cache_ttl) = session
+                .cache_ttl
+                .or_else(|| profile.cache_ttl_by_provider.get(&session.harness).copied())
         {
             state
                 .idle
@@ -1987,7 +2004,7 @@ pub async fn run_policy_tick(
                     session,
                     now,
                     liveness.is_idle(session).await,
-                    *cache_ttl,
+                    cache_ttl,
                     profile,
                     adapter.as_ref(),
                 )
@@ -2064,7 +2081,7 @@ impl IdleEpisodeTracker {
         let tokens = session.last_known_token_count.unwrap_or(0);
         let should = uw_policy::should_idle_compact(
             now - session.last_seen,
-            cache_ttl,
+            session.cache_ttl.unwrap_or(cache_ttl),
             tokens,
             session.context_window_size,
             session.last_known_context_pct,
@@ -2111,7 +2128,7 @@ pub fn should_enqueue_hard_boundary_compaction(
     if !(current_pct >= profile.plan_pressure_pct || stopped_on_this_window) {
         return false;
     }
-    if !is_cache_warm(session.last_seen, now) {
+    if !is_cache_warm_for(session.last_seen, now, session.prompt_cache_ttl()) {
         return false;
     }
     session.last_known_token_count.unwrap_or(0) >= profile.plan_pressure_min_tokens
@@ -2347,10 +2364,9 @@ fn resume_floor_with_burn(
     token_burn_rate: Option<f64>,
 ) -> Option<DateTime<Utc>> {
     let (_, pct) = *block.points.last()?;
-    let cache_ttl = profile
-        .cache_ttl_by_provider
-        .get(&session.harness)
-        .copied()
+    let cache_ttl = session
+        .cache_ttl
+        .or_else(|| profile.cache_ttl_by_provider.get(&session.harness).copied())
         .unwrap_or_default();
     if is_cache_warm_for(session.last_seen, now, cache_ttl) {
         return Some(now);
@@ -3087,14 +3103,9 @@ async fn run_production_ticks_with_readiness(
                     profile.idle_compact.tiers = tiers.clone();
                 }
                 if matches!(session.harness, Provider::ClaudeCode | Provider::Codex) {
-                    // Five minutes is the shared warm-cache approximation for both
-                    // harnesses until usagewindow can emit explicit cache-control
-                    // markers. Codex has no documented user-facing TTL; this is the
-                    // same heuristic, not a researched provider value.
-                    profile.cache_ttl_by_provider.insert(
-                        session.harness.clone(),
-                        Duration::minutes(CACHE_WARM_APPROXIMATION_MINUTES),
-                    );
+                    profile
+                        .cache_ttl_by_provider
+                        .insert(session.harness.clone(), session.prompt_cache_ttl());
                 }
                 if auto_reseed.is_some() {
                     profile.reseed_auto = ReseedAutoConfig {
@@ -3109,7 +3120,7 @@ async fn run_production_ticks_with_readiness(
                                 .and_then(|value| value.parse().ok())
                                 .unwrap_or(60),
                         ),
-                        margin: Duration::minutes(1),
+                        margin: None,
                     };
                 }
                 match store.resolved_profile(session, profile).await {
@@ -3128,7 +3139,11 @@ async fn run_production_ticks_with_readiness(
                 regular_policy
                     || (session.stopped_reason.is_none()
                         && session.superseded_by.is_none()
-                        && is_cache_warm(session.last_seen, Utc::now())
+                        && is_cache_warm_for(
+                            session.last_seen,
+                            Utc::now(),
+                            session.prompt_cache_ttl(),
+                        )
                         && (changed_providers.contains(&session.harness)
                             || bands
                                 .get(&session.harness)
@@ -3716,6 +3731,7 @@ mod tests {
             context_window_size: Some(200_000),
             last_known_token_count: Some(150_000),
             last_known_context_pct: None,
+            cache_ttl: None,
             launch_mode: LaunchMode::Headless,
             pid: None,
             stopped_reason: None,
@@ -5897,6 +5913,80 @@ mod tests {
         assert_eq!(*adapter.advised.lock().unwrap(), 0);
     }
 
+    // why: queue eligibility must use detected session TTL even with the provider's 5m fallback.
+    // catches: plumbing TTL into cadence but leaving the queue policy on its fallback.
+    #[tokio::test]
+    async fn idle_episode_uses_session_cache_ttl_at_the_exact_boundary() {
+        use uw_adapters::claude_code::{ClaudeTranscriptFileSystem, TranscriptFileSystem};
+        let now = Utc::now();
+        for (ttl, before, at) in [(3600, 2940, 3000), (300, 240, 250)] {
+            let store = activity_store(CompactionKind::OpportunisticIdle);
+            let adapter = FakeAdapter {
+                capabilities: caps(true, false, false),
+                compacted: Arc::new(StdMutex::new(0)),
+                advised: Arc::new(StdMutex::new(0)),
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let id = uuid::Uuid::new_v4();
+            let path = dir.path().join(format!("{id}.jsonl"));
+            let split = if ttl == 3600 {
+                serde_json::json!({"ephemeral_1h_input_tokens": 1})
+            } else {
+                serde_json::json!({"ephemeral_5m_input_tokens": 1})
+            };
+            let record = serde_json::json!({"sessionId": id, "type": "assistant",
+                "timestamp": now, "message": {"content": [], "usage": {
+                    "input_tokens": 150_000, "cache_creation": split}}});
+            std::fs::write(&path, format!("{record}\n")).unwrap();
+            let found = ClaudeTranscriptFileSystem::default()
+                .scan(path.to_str().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            let sqlite = SqliteDaemonStore::new(Store::open_memory().unwrap());
+            sqlite
+                .upsert_discovered_session(Provider::ClaudeCode, found, None, now)
+                .await
+                .unwrap();
+            let tracked = ObservationStore::tracked_sessions(&sqlite)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            let mut tracker = IdleEpisodeTracker::new();
+            let profile = ThresholdProfile::default();
+            assert!(
+                !tracker
+                    .tick(
+                        &store,
+                        &tracked,
+                        now + Duration::seconds(before),
+                        true,
+                        Duration::minutes(5),
+                        &profile,
+                        &adapter
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                tracker
+                    .tick(
+                        &store,
+                        &tracked,
+                        now + Duration::seconds(at),
+                        true,
+                        Duration::minutes(5),
+                        &profile,
+                        &adapter
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(*store.enqueues.lock().unwrap(), 1);
+        }
+    }
+
     #[tokio::test]
     async fn idle_compact_enqueues_once_per_episode_and_resets_when_active() {
         let now = Utc::now();
@@ -5989,6 +6079,7 @@ mod tests {
             last_known_token_count: None,
             context_window_size: None,
             last_known_context_pct: Some(70.0),
+            cache_ttl: None,
             ..session()
         };
         let store = FakeStore {
@@ -6038,6 +6129,7 @@ mod tests {
             last_known_token_count: None,
             context_window_size: None,
             last_known_context_pct: Some(50.0),
+            cache_ttl: None,
             ..session()
         };
         let store = FakeStore {
@@ -6091,6 +6183,7 @@ mod tests {
             context_window_size: None,
             last_known_token_count: None,
             last_known_context_pct: Some(66.2),
+            cache_ttl: None,
             first_seen: Some(Utc::now()),
             last_seen: Some(Utc::now()),
             state_path: None,
@@ -7091,8 +7184,7 @@ mod tests {
 
     fn boundary_store(now: DateTime<Utc>, pct: f32) -> BoundaryStore {
         let session = SessionSummary {
-            // Warm enough for hard-boundary eligibility, idle enough for
-            // compact-band keepalive cadence (ttl 5m − margin 2m − 1m = 2m).
+            // Four idle minutes satisfy keepalive cadence while the cache remains warm.
             last_seen: now - Duration::minutes(4),
             ..session()
         };
