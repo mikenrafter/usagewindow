@@ -270,8 +270,8 @@ fn truncate_wal(store: &DiscoveryOnlyStore) {
         .unwrap();
 }
 
-// why: sidechain files share a parent ID. Replaying their competing summaries must
-// generate no WAL frames, while every source's unique usage survives exactly once.
+// why: CLAIM(discovery-summary): competing sidechain summaries must generate no
+// WAL frames when unchanged, while every source's unique usage survives once.
 // catches: writing each source separately, picking by directory order, or dropping losing sources' tokens.
 #[tokio::test]
 async fn discovery_coalesces_sources_without_replaying_summary_writes() {
