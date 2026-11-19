@@ -360,7 +360,7 @@ async fn incremental_activity_does_not_report_idle_during_a_partial_append() {
         } else {
             codex_start()[0].clone()
         };
-        std::fs::write(&path, format!("{header}\n")).unwrap();
+        std::fs::write(&path, header.to_string()).unwrap();
         let session: uw_core::model::SessionSummary = serde_json::from_value(json!({
             "id":id, "harness": if claude { "ClaudeCode" } else { "Codex" }, "account":null, "cwd":"/tmp", "model":null,
             "first_seen":"2026-09-30T00:00:00Z", "last_seen":"2026-09-30T00:00:00Z", "launch_mode":"Interactive",
@@ -394,6 +394,8 @@ async fn incremental_activity_does_not_report_idle_during_a_partial_append() {
             .append(true)
             .open(&path)
             .unwrap();
+        // why: a complete JSON record can precede its newline; that later newline is not a malformed activity event.
+        file.write_all(b"\n").unwrap();
         file.write_all(left.as_bytes()).unwrap();
         assert_eq!(
             adapter.session_activity(&session).await.unwrap(),

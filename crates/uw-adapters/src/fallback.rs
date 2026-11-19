@@ -161,9 +161,10 @@ impl HarnessAdapter for FallbackCompactionAdapter {
     async fn acknowledge_discovery(
         &self,
         path: &str,
+        id: &SessionId,
         records: &[TokenUsageRecord],
     ) -> AdapterResult<()> {
-        self.native.acknowledge_discovery(path, records).await
+        self.native.acknowledge_discovery(path, id, records).await
     }
 
     async fn discover_sessions(&self) -> AdapterResult<Vec<DiscoveredSession>> {

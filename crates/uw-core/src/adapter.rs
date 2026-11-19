@@ -213,12 +213,13 @@ pub trait HarnessAdapter: Send + Sync {
     async fn discover_sessions(&self) -> AdapterResult<Vec<DiscoveredSession>> {
         Err(AdapterError::Unsupported)
     }
-    /// Acknowledge the prefix of discovery usage committed to storage for one path.
+    /// Acknowledge discovery usage committed to storage for one session and path.
     /// Until this succeeds, incremental adapters replay that prefix after cancellation
     /// or a failed write. The store deduplicates replayed records.
     async fn acknowledge_discovery(
         &self,
         _path: &str,
+        _id: &SessionId,
         _records: &[TokenUsageRecord],
     ) -> AdapterResult<()> {
         Ok(())

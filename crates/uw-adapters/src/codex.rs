@@ -540,16 +540,20 @@ impl HarnessAdapter for CodexAdapter {
     async fn acknowledge_discovery(
         &self,
         path: &str,
+        id: &SessionId,
         records: &[TokenUsageRecord],
     ) -> AdapterResult<()> {
         let cache = self.discovery_cache.clone();
         let path = path.to_owned();
+        let id = id.clone();
         let records = records.to_vec();
         tokio::task::spawn_blocking(move || {
             let mut cache = cache
                 .lock()
                 .map_err(|e| AdapterError::Other(e.to_string()))?;
-            if let Some(scan) = cache.get_mut(std::path::Path::new(&path)) {
+            if let Some(scan) = cache.get_mut(std::path::Path::new(&path))
+                && scan.header.as_ref().is_some_and(|(known, _, _)| known == &id.0)
+            {
                 crate::jsonl::acknowledge_usage(&mut scan.token_usage, &records);
             }
             Ok(())
@@ -741,6 +745,7 @@ struct RolloutScan {
 }
 impl RolloutScan {
     fn observe(&mut self, line: &str) {
+        if line.trim().is_empty() { return; }
         let record = serde_json::from_str::<Value>(line);
         match &record {
             Ok(record) => self.activity.observe(record),
@@ -1896,7 +1901,11 @@ done
         let initial = adapter.discover_sessions().await.unwrap();
         assert_eq!(initial[0].token_usage.len(), 1);
         adapter
-            .acknowledge_discovery(rollout_path.to_str().unwrap(), &initial[0].token_usage)
+            .acknowledge_discovery(
+                rollout_path.to_str().unwrap(),
+                &initial[0].id,
+                &initial[0].token_usage,
+            )
             .await
             .unwrap();
         writeln!(
@@ -1955,6 +1964,7 @@ done
         adapter
             .acknowledge_discovery(
                 found[0].state_path.as_deref().unwrap(),
+                &found[0].id,
                 &found[0].token_usage,
             )
             .await
@@ -1981,7 +1991,7 @@ done
         std::fs::write(&path, replacement).unwrap();
         let new = adapter.discover_sessions().await.unwrap();
         adapter
-            .acknowledge_discovery(path.to_str().unwrap(), &old[0].token_usage)
+            .acknowledge_discovery(path.to_str().unwrap(), &old[0].id, &old[0].token_usage)
             .await
             .unwrap();
         assert_eq!(
@@ -1989,7 +1999,43 @@ done
             new[0].token_usage
         );
         adapter
-            .acknowledge_discovery(path.to_str().unwrap(), &new[0].token_usage)
+            .acknowledge_discovery(path.to_str().unwrap(), &new[0].id, &new[0].token_usage)
+            .await
+            .unwrap();
+        assert!(
+            adapter.discover_sessions().await.unwrap()[0]
+                .token_usage
+                .is_empty()
+        );
+    }
+
+    // why: two sessions can have identical token records; a delayed write for the old owner cannot acknowledge the new one.
+    #[tokio::test]
+    async fn discovery_acknowledgement_is_scoped_to_the_session_owner() {
+        let script = FakeAppServerScript::write();
+        let root = tempfile::tempdir().unwrap();
+        let old_id = "01a0b1b6-f024-7b73-a5fc-a6ea05f0a581";
+        let new_id = "01a0b1b6-f024-7b73-a5fc-a6ea05f0a582";
+        let path = write_incremental_rollout(root.path(), old_id);
+        let adapter = CodexAdapter::new(Arc::new(script.transport()))
+            .with_sessions_root(root.path().to_owned());
+        let old = adapter.discover_sessions().await.unwrap();
+        let replacement = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace(old_id, new_id);
+        std::fs::write(&path, replacement).unwrap();
+        let new = adapter.discover_sessions().await.unwrap();
+        assert_eq!(old[0].token_usage, new[0].token_usage);
+        adapter
+            .acknowledge_discovery(path.to_str().unwrap(), &old[0].id, &old[0].token_usage)
+            .await
+            .unwrap();
+        assert_eq!(
+            adapter.discover_sessions().await.unwrap()[0].token_usage,
+            new[0].token_usage
+        );
+        adapter
+            .acknowledge_discovery(path.to_str().unwrap(), &new[0].id, &new[0].token_usage)
             .await
             .unwrap();
         assert!(

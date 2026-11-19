@@ -28,6 +28,7 @@ pub trait TranscriptFileSystem: Send + Sync {
     async fn acknowledge_scan(
         &self,
         _path: &str,
+        _id: &SessionId,
         _records: &[TokenUsageRecord],
     ) -> AdapterResult<()> {
         Ok(())
@@ -211,16 +212,20 @@ impl TranscriptFileSystem for ClaudeTranscriptFileSystem {
     async fn acknowledge_scan(
         &self,
         path: &str,
+        id: &SessionId,
         records: &[TokenUsageRecord],
     ) -> AdapterResult<()> {
         let cache = self.scans.clone();
         let path = path.to_owned();
+        let id = id.clone();
         let records = records.to_vec();
         tokio::task::spawn_blocking(move || {
             let mut cache = cache
                 .lock()
                 .map_err(|e| AdapterError::Other(e.to_string()))?;
-            if let Some(scan) = cache.get_mut(std::path::Path::new(&path)) {
+            if let Some(scan) = cache.get_mut(std::path::Path::new(&path))
+                && scan.record_id.as_ref().is_none_or(|known| known == &id.0)
+            {
                 crate::jsonl::acknowledge_usage(&mut scan.token_usage, &records);
             }
             Ok(())
@@ -894,14 +899,18 @@ impl HarnessAdapter for ClaudeCodeAdapter {
     async fn acknowledge_discovery(
         &self,
         path: &str,
+        id: &SessionId,
         records: &[TokenUsageRecord],
     ) -> AdapterResult<()> {
-        self.transcript_fs.acknowledge_scan(path, records).await?;
+        self.transcript_fs
+            .acknowledge_scan(path, id, records)
+            .await?;
         if let Some(cached) = self
             .discovery_cache
             .lock()
             .map_err(|e| AdapterError::Other(e.to_string()))?
             .get_mut(path)
+            && cached.session.id == *id
         {
             crate::jsonl::acknowledge_usage(&mut cached.session.token_usage, records);
         }
@@ -999,6 +1008,7 @@ struct TranscriptScan {
 
 impl TranscriptScan {
     fn observe(&mut self, line: &str) {
+        if line.trim().is_empty() { return; }
         if self.invalid {
             return;
         }
@@ -2249,7 +2259,9 @@ mod tests {
             "uncommitted records must be replayed"
         );
         let pending = fs.scan(path).await.unwrap().unwrap().token_usage;
-        fs.acknowledge_scan(path, &pending).await.unwrap();
+        fs.acknowledge_scan(path, &SessionId(id.into()), &pending)
+            .await
+            .unwrap();
         assert!(fs.scan(path).await.unwrap().unwrap().token_usage.is_empty());
         writeln!(
             std::fs::OpenOptions::new().append(true).open(path).unwrap(),

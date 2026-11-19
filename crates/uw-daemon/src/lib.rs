@@ -963,7 +963,7 @@ async fn run_observation_tick_cached(
                     let checkpoint = session
                         .state_path
                         .clone()
-                        .map(|path| (path, session.token_usage.clone()));
+                        .map(|path| (path, session.id.clone(), session.token_usage.clone()));
                     store
                         .upsert_discovered_session(
                             adapter.provider(),
@@ -978,8 +978,8 @@ async fn run_observation_tick_cached(
                             now,
                         )
                         .await?;
-                    if let Some((path, records)) = checkpoint {
-                        adapter.acknowledge_discovery(&path, &records).await?;
+                    if let Some((path, id, records)) = checkpoint {
+                        adapter.acknowledge_discovery(&path, &id, &records).await?;
                     }
                 }
             }
