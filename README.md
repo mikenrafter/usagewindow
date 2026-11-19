@@ -42,18 +42,38 @@ nix --extra-experimental-features 'ca-derivations dynamic-derivations recursive-
 ```
 
 Run `result/bin/uw-daemon` with `UW_DB_PATH` set to the SQLite path. The daemon listens
-on `UW_LISTEN_ADDR`, defaulting to `127.0.0.1:7878`. Configure `uw-hook` with
-`UW_HOOK_PROVIDER=claude-code`, `codex`, or `cursor`; `UW_DAEMON_URL` defaults to
-the matching local address. Generic usage polling is available through
-`UW_GENERIC_USAGE_COMMAND`.
+on `UW_LISTEN_ADDR`, defaulting to `127.0.0.1:7878`; port `0` chooses a free port.
+The web login still protects TCP, including traffic proxied by Tailscale Serve.
+Local tools use a private Unix socket without a token or login. The socket has
+mode `0600` and its directory must have mode `0700`.
+
+`uw`, `uw-mcp`, and `uw-hook` discover the daemon automatically. They check their
+URL override first (`UW_API_URL` for `uw`, `UW_DAEMON_URL` for MCP and hooks, with
+the other variable accepted as a fallback), then live sockets under
+`$XDG_RUNTIME_DIR/usagewindow`, the directory containing `UW_DB_PATH`, and
+`$HOME/.usagewindow`, then those directories' `endpoint` discovery files, then
+`http://127.0.0.1:7878`. Overrides accept `unix:/absolute/path` and HTTP URLs.
+Explicit HTTP connections still need the web login when it is configured.
+
+The daemon defaults to `$XDG_RUNTIME_DIR/usagewindow/api.sock`, or
+`<data directory>/api.sock` when no runtime directory is set. Set `UW_SOCKET_PATH`
+to choose a socket and `UW_ENDPOINT_FILE` to choose the discovery file, which
+otherwise lives beside the database. The discovery file records the socket and
+actual web address. A system service can use `<data directory>/api.sock` so
+clients with a different runtime directory still find it. `uw endpoint` prints
+the selected endpoint; `uw endpoint --check` also checks API access.
+
+Configure `uw-hook` with `UW_HOOK_PROVIDER=claude-code`, `codex`, or `cursor`.
+Hooks return an empty response promptly if no daemon is available. Generic usage
+polling is available through `UW_GENERIC_USAGE_COMMAND`.
 
 The hook is harness-neutral at the executable boundary: Claude Code and Codex use
 their command-hook documents, while Cursor uses native `.cursor/hooks.json` event
 names. All three pass their events to the same `uw-hook` binary with the provider
 environment variable above.
 
-Run `result/bin/uw-mcp` beside the daemon with `UW_DAEMON_URL` set to the daemon API
-(default `http://127.0.0.1:7878`). MCP never opens the SQLite database. Its MCP endpoint
+Run `result/bin/uw-mcp` beside the daemon; it discovers the same local socket.
+MCP never opens the SQLite database. Its MCP endpoint
 is `http://127.0.0.1:7880/mcp`; change the listener with `UW_MCP_LISTEN_ADDR`. The
 endpoint implements MCP `2026-07-28`: each JSON-RPC request is an independent HTTP
 POST with modern request metadata and the required `MCP-Protocol-Version`,

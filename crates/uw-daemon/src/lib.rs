@@ -3175,6 +3175,7 @@ fn with_compaction_fallback(
 /// configuration (SQLite path and adapter registry) is intentionally still a later
 /// wiring concern; this preserves the same cadence/ownership point for Phase 7.
 pub async fn run_daemon_loop() -> anyhow::Result<()> {
+    let local = local_api::LocalApi::bind()?;
     let path = std::env::var("UW_DB_PATH").unwrap_or_else(|_| {
         let home = std::env::var("HOME").unwrap_or_default();
         format!("{home}/.usagewindow/usagewindow.db")
@@ -3292,7 +3293,6 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
     let web_app = uw_web::app_with_shared_store_and_auth(shared_store, adapters.clone(), web_password_hash)?;
     let address = std::env::var("UW_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".into());
     let tcp = tokio::net::TcpListener::bind(address).await?;
-    let local = local_api::LocalApi::bind()?;
     local.publish(tcp.local_addr()?)?;
     tracing::info!(web_address = %tcp.local_addr()?, socket = %local.socket_path.display(), "usagewindow listening");
     tokio::select! {

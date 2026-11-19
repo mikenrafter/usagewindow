@@ -17,7 +17,8 @@ this repository's `packages.${system}.default` Nix output and listens on
 
 It exposes `get_usage`, `get_resume_state`, and the capability-gated
 `request_compaction` tool. MCP sends those requests to the daemon at
-`UW_DAEMON_URL` (default `http://127.0.0.1:7878`); it does not open the SQLite
+automatic local Unix socket discovery, with `UW_DAEMON_URL` as an optional
+`unix:/path` or HTTP override; it does not open the SQLite
 database. Keep the daemon listener on loopback because the internal MCP routes
 are intentionally not protected by the web password.
 Set `UW_MCP_LISTEN_ADDR` to change its listener. If a browser or reverse proxy sends an

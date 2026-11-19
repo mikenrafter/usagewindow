@@ -207,10 +207,7 @@ async fn authorize(
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    // Harness hook processes call this local endpoint directly and do not have
-    // a browser session. The handler only validates and records hook payloads;
-    // all model-control UI routes remain behind auth.
-    if request.uri().path() == "/api/hooks" || auth.authenticated(request.headers()) {
+    if auth.authenticated(request.headers()) {
         next.run(request).await
     } else {
         (StatusCode::UNAUTHORIZED, "authentication required").into_response()
