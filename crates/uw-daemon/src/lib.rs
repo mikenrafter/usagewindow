@@ -1644,6 +1644,26 @@ pub async fn run_near_limit_tick(
     let Some(block) = blocks.last() else {
         return Ok(NearLimitOutcome::NoData);
     };
+    advise_near_limit(
+        adapter,
+        session,
+        block,
+        profile,
+        last_asked_pct,
+        asks_this_epoch,
+    )
+    .await
+}
+
+async fn advise_near_limit(
+    adapter: &dyn HarnessAdapter,
+    session: &SessionSummary,
+    block: &WindowBlock,
+    profile: &ThresholdProfile,
+    last_asked_pct: Option<f32>,
+    asks_this_epoch: u32,
+) -> anyhow::Result<NearLimitOutcome> {
+    let key = &block.key;
     let Some((_, current_pct)) = block.points.last() else {
         return Ok(NearLimitOutcome::NoData);
     };
@@ -1747,6 +1767,7 @@ pub async fn run_policy_tick(
         }
     }
     let mut samples_by_account = SamplesByAccount::default();
+    let mut windows_by_account = HashMap::new();
     for session in sessions {
         if store.actions_inhibited(&session.harness).await? { continue; }
 
@@ -1759,13 +1780,12 @@ pub async fn run_policy_tick(
         // Samples depend only on provider and account; loading them once per
         // session reread ~10k rows for each of ~1,000 sessions every tick.
         let samples = samples_by_account.load(store, session).await?;
-        let mut keys = HashSet::new();
-        for sample in samples.iter() {
-            keys.extend(sample.windows.keys().cloned());
-        }
+        let windows = windows_by_account
+            .entry((session.harness.clone(), session.account.clone()))
+            .or_insert_with(|| analyze_account_windows(&samples, session.account.as_ref()));
         let mut suppress_idle = false;
-        for key in keys {
-            let blocks = uw_policy::segment_blocks(&samples, &key, session.account.as_ref());
+        for (key, (blocks, window_exceeded)) in windows {
+            let key = key.clone();
             let Some(block) = blocks.last() else {
                 continue;
             };
@@ -1777,17 +1797,7 @@ pub async fn run_policy_tick(
                 session.stopped_reason.as_ref(),
                 Some(StopReason::UsageLimit { window }) if window == &key
             );
-            let window_exceeded = samples
-                .iter()
-                .filter(|sample| sample.account == session.account)
-                .filter_map(|sample| {
-                    sample
-                        .windows
-                        .get(&key)
-                        .map(|window| (sample.at, window.exceeded))
-                })
-                .max_by_key(|(at, _)| *at)
-                .is_some_and(|(_, exceeded)| exceeded);
+            let window_exceeded = *window_exceeded;
             let quota_exhausted = window_exceeded || current_pct >= 100.0;
             let hard_boundary_active =
                 current_pct >= profile.plan_pressure_pct || stopped_on_this_window;
@@ -1860,11 +1870,10 @@ pub async fn run_policy_tick(
             } else {
                 let ask_key = (session.id.clone(), key.clone(), block.resets_at);
                 let previous = state.asked.get(&ask_key).copied();
-                let outcome = run_near_limit_tick(
-                    &samples,
+                let outcome = advise_near_limit(
                     adapter.as_ref(),
                     session,
-                    &key,
+                    block,
                     profile,
                     previous.map(|entry| entry.0),
                     previous.map_or(0, |entry| entry.1),
@@ -2356,6 +2365,33 @@ fn plan_resume_marker_with_burn(
         message: None,
         preempt: true,
     })
+}
+
+fn analyze_account_windows(
+    samples: &[UsageSample],
+    account: Option<&AccountId>,
+) -> HashMap<WindowKey, (Vec<WindowBlock>, bool)> {
+    let keys: HashSet<_> = samples
+        .iter()
+        .flat_map(|sample| sample.windows.keys().cloned())
+        .collect();
+    keys.into_iter()
+        .map(|key| {
+            let blocks = uw_policy::segment_blocks(samples, &key, account);
+            let exceeded = samples
+                .iter()
+                .filter(|sample| sample.account.as_ref() == account)
+                .filter_map(|sample| {
+                    sample
+                        .windows
+                        .get(&key)
+                        .map(|window| (sample.at, window.exceeded))
+                })
+                .max_by_key(|(at, _)| *at)
+                .is_some_and(|(_, exceeded)| exceeded);
+            (key, (blocks, exceeded))
+        })
+        .collect()
 }
 
 /// Usage samples loaded once per provider and account within one pass.
