@@ -1,4 +1,4 @@
-"""Run after cargo build --workspace --bins: python3 tests/local_clients.py /path/to/debug."""
+"""Run after cargo build --workspace --bins: python3 tests/local_clients.py /path/to/debug /path/to/uw-agent."""
 import http.client
 import json
 import os
@@ -11,6 +11,7 @@ import time
 import unittest
 
 BIN = Path(sys.argv.pop(1)).resolve()
+AGENT_SCRIPT = Path(sys.argv.pop(1)).resolve()
 
 
 class UnixHttp(http.client.HTTPConnection):
@@ -76,7 +77,7 @@ class LocalClients(unittest.TestCase):
             'hook_event_name': 'SessionStart', 'session_id': 'hook-local',
             'cwd': '/work', 'source': 'startup'}), env={**self.env, 'UW_HOOK_PROVIDER': 'codex'})
         self.assertEqual(hook.returncode, 0, hook.stderr)
-        self.assertEqual(self.request('GET', '/api/sessions/hook-local')[1]['session']['id'], 'hook-local')
+        self.assertEqual(self.request('GET', '/api/sessions/hook-local')[1]['summary']['id'], 'hook-local')
         compact = self.run_bin('uw', '--json', 'compact', 'ask', 'hook-local')
         self.assertEqual(compact.returncode, 0, compact.stderr)
         response = json.loads(compact.stdout)
@@ -89,6 +90,22 @@ class LocalClients(unittest.TestCase):
         self.assertNotIn('error', reply, reply)
         self.assertNotEqual(reply.get('result', {}).get('isError'), True, reply)
         self.assertIn('hook-local', mcp.stdout)
+
+    # why: uw-agent must reuse the real authenticated daemon without reading secrets or starting a private unit.
+    def test_agent_uses_running_daemon_without_starting_unit(self):
+        self.start()
+        shims = self.root / 'shims'
+        shims.mkdir()
+        marker = self.root / 'systemctl-called'
+        systemctl = shims / 'systemctl'
+        systemctl.write_text('#!/bin/sh\necho called > "' + str(marker) + '"\nexit 42\n')
+        systemctl.chmod(0o755)
+        env = {**self.env, 'PATH': str(shims) + ':' + str(BIN) + ':' + self.env['PATH']}
+        result = subprocess.run(['bash', str(AGENT_SCRIPT), 'daemon-start'],
+                                env=env, text=True, capture_output=True, timeout=3)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(self.published['endpoint'], result.stderr)
+        self.assertFalse(marker.exists())
 
     # why: a system service's data-directory socket must be found despite the agent's different runtime directory.
     def test_runtime_directory_difference_and_explicit_env_precedence(self):

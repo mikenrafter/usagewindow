@@ -15,12 +15,11 @@ this repository's `packages.${system}.default` Nix output and listens on
 }
 ```
 
-It exposes `get_usage`, `get_resume_state`, and the capability-gated
-`request_compaction` tool. MCP sends those requests to the daemon at
-automatic local Unix socket discovery, with `UW_DAEMON_URL` as an optional
-`unix:/path` or HTTP override; it does not open the SQLite
-database. Keep the daemon listener on loopback because the internal MCP routes
-are intentionally not protected by the web password.
+It exposes `get_usage`, `get_resume_state`, `request_compaction`, and
+`schedule_resume`. MCP discovers the daemon's private Unix socket automatically
+and needs no token or web login. Set `UW_DAEMON_URL` to `unix:/path` or an HTTP
+URL for an explicit override. MCP does not open the SQLite database. The daemon's
+TCP API requires its configured web login, including the internal route aliases.
 Set `UW_MCP_LISTEN_ADDR` to change its listener. If a browser or reverse proxy sends an
 `Origin` other than localhost, add the exact origin to the comma-separated
 `UW_MCP_ALLOWED_ORIGINS` value.

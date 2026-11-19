@@ -720,19 +720,21 @@ fn run_stdio(deps: &Deps) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let deps = build_deps()?;
+fn main() -> anyhow::Result<()> {
+    let deps = Arc::new(build_deps()?);
     if std::env::args().any(|arg| arg == "--stdio")
         || std::env::var("UW_MCP_TRANSPORT").is_ok_and(|value| value == "stdio")
     {
         return run_stdio(&deps);
     }
 
-    let address = std::env::var("UW_MCP_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:7880".into());
-    let listener = tokio::net::TcpListener::bind(&address).await?;
-    axum::serve(listener, http_app(Arc::new(deps))).await?;
-    Ok(())
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let address = std::env::var("UW_MCP_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:7880".into());
+        let listener = tokio::net::TcpListener::bind(&address).await?;
+        axum::serve(listener, http_app(Arc::clone(&deps))).await?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
