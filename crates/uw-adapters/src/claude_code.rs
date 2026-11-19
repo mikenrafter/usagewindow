@@ -2235,6 +2235,34 @@ mod tests {
     }
 
     // why: the production filesystem must emit each append once, without retaining or replaying old usage.
+    // why: TTL is root-session cache-write metadata, retained across cache hits and polls.
+    // catches: ignoring 1h writes, accepting sidechains, or clearing TTL on a zero write.
+    #[tokio::test]
+    async fn discovery_tracks_cache_ttl_in_the_incremental_scan() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b40";
+        let path = dir.path().join(format!("{id}.jsonl"));
+        let fs = ClaudeTranscriptFileSystem::default();
+        let record = |hour, short, sidechain| serde_json::json!({
+            "sessionId": id, "type": "assistant", "isSidechain": sidechain,
+            "timestamp": "2026-09-17T23:32:34Z", "message": {"content": [], "usage": {
+                "cache_creation": {"ephemeral_1h_input_tokens": hour,
+                                   "ephemeral_5m_input_tokens": short}}}});
+        std::fs::write(&path, format!("{}\n", record(0, 10, false))).unwrap();
+        for (hour, short, sidechain, seconds) in [(0, 0, false, 300), (10, 0, true, 300),
+                (10, 10, false, 3600), (0, 0, false, 3600), (0, 10, false, 300)] {
+            writeln!(std::fs::OpenOptions::new().append(true).open(&path).unwrap(),
+                "{}", record(hour, short, sidechain)).unwrap();
+            let found = fs.scan(path.to_str().unwrap()).await.unwrap().unwrap();
+            let encoded = serde_json::to_value(found).unwrap();
+            let detected: Option<chrono::Duration> = encoded.get("cache_ttl")
+                .and_then(|value| serde_json::from_value(value.clone()).ok());
+            assert_eq!(detected, Some(chrono::Duration::seconds(seconds)),
+                "write=({hour},{short}), sidechain={sidechain}");
+        }
+    }
+
     #[tokio::test]
     async fn discovery_reads_only_new_claude_usage() {
         use std::io::Write;

@@ -144,6 +144,17 @@ mod tests {
         }
     }
 
+    // why: wake at 50 minutes for an hour cache, using session metadata over fallback TTL.
+    // catches: waking after three minutes or only changing the policy predicate.
+    #[test]
+    fn idle_deadline_uses_detected_hour_cache() {
+        let (session, profiles) = fixture(60);
+        let mut encoded = serde_json::to_value(session).unwrap();
+        encoded["cache_ttl"] = serde_json::to_value(ChronoDuration::hours(1)).unwrap();
+        let session: SessionSummary = serde_json::from_value(encoded).unwrap();
+        assert_eq!(idle_deadline(now(), &[session], &profiles), Some(Duration::from_secs(2940)));
+    }
+
     #[test]
     fn idle_deadline_hits_the_configured_trigger_without_minute_rounding() {
         let (session, profiles) = fixture(179);

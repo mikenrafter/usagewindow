@@ -1415,6 +1415,32 @@ mod tests {
         );
     }
 
+    // why: defaults must preserve warm caches until five sixths of their actual TTL.
+    // catches: a fixed two-minute margin or retaining the five-minute approximation.
+    #[test]
+    fn idle_compaction_follows_five_sixths_of_each_ttl() {
+        let config = profile().idle_compact;
+        for (ttl, age, expected) in [(3600, 2940, false), (3600, 3000, true),
+                                     (300, 240, false), (300, 250, true)] {
+            assert_eq!(should_idle_compact(Duration::seconds(age), Duration::seconds(ttl),
+                150_000, Some(200_000), None, &config, &caps()), expected,
+                "ttl={ttl}, age={age}");
+        }
+    }
+
+    // why: auto-reseed must share the TTL-relative idle boundary.
+    // catches: leaving reseed at full TTL or a fixed one-minute margin.
+    #[test]
+    fn auto_reseed_follows_five_sixths_of_each_ttl() {
+        let config = ReseedAutoConfig { enabled: true, ..Default::default() };
+        for (ttl, age, expected) in [(3600, 2940, false), (3600, 3000, true),
+                                     (300, 240, false), (300, 250, true)] {
+            assert_eq!(should_auto_reseed(Duration::seconds(age), Duration::seconds(ttl),
+                150_000, 0.1, 1.0, Duration::hours(2), &config, &caps()), expected,
+                "ttl={ttl}, age={age}");
+        }
+    }
+
     #[test]
     fn default_idle_compact_margin_leaves_warm_window_headroom() {
         // Policy (~30s) + compaction (~60s) cadence can add ~90s after the
