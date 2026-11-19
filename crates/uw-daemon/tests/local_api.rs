@@ -15,6 +15,7 @@ impl Drop for Daemon {
 #[test]
 fn socket_requires_no_token_and_tcp_including_internal_aliases_requires_login() {
     let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("api.sock");
     let endpoint = dir.path().join("endpoint");
     let hash = dir.path().join("password-hash");

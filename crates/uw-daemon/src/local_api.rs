@@ -70,6 +70,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_public_socket_parent() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(LocalApi::bind_paths(dir.path().join("api.sock"), dir.path().join("endpoint")).is_err());
         assert!(!dir.path().join("api.sock").exists());
@@ -79,6 +80,7 @@ mod tests {
     #[tokio::test]
     async fn replaces_stale_socket_and_refuses_live_daemon() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = dir.path().join("api.sock");
         let endpoint = dir.path().join("endpoint");
         drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
@@ -92,6 +94,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_to_replace_regular_file() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = dir.path().join("api.sock");
         std::fs::write(&socket, "keep me").unwrap();
         assert!(LocalApi::bind_paths(socket.clone(), dir.path().join("endpoint")).is_err());

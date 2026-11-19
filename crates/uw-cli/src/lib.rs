@@ -15,6 +15,11 @@ pub struct Cli {
 }
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Print the discovered daemon endpoint; --check requires a successful API response.
+    Endpoint {
+        #[arg(long)]
+        check: bool,
+    },
     Status(StatusArgs),
     Sessions {
         #[command(subcommand)]
@@ -231,6 +236,7 @@ pub fn execute<A: ApiClient, D: DirectReader>(
 ) -> Result<String> {
     let json = cli.json;
     let value = match cli.command {
+        Command::Endpoint { check } => return endpoint(check),
         Command::Status(args) => serde_json::to_value(client.status(&args)?)?,
         Command::Sessions {
             command: SessionsCommand::List { stopped, harness },
@@ -382,6 +388,15 @@ fn human(value: &serde_json::Value) -> String {
         serde_json::Value::Null => "-".into(),
         _ => value.to_string().trim_matches('"').into(),
     }
+}
+
+pub fn endpoint(check: bool) -> Result<String> {
+    let endpoint = uw_client::Discovery::from_environment("UW_API_URL").resolve();
+    if check {
+        endpoint.blocking_client()?.get(format!("{}/api/status", endpoint.base_url()))
+            .timeout(std::time::Duration::from_millis(250)).send()?.error_for_status()?;
+    }
+    Ok(endpoint.0)
 }
 
 pub struct HttpApiClient {
