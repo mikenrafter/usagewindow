@@ -285,7 +285,7 @@ fn get_usage(args: &Value, deps: &Deps) -> Result<Value, String> {
     let account = args.get("account").and_then(Value::as_str);
     let mut request = deps
         .client
-        .get(format!("{}/api/internal/status", deps.daemon_url));
+        .get(format!("{}/api/status", deps.daemon_url));
     if let Some(provider) = provider {
         request = request.query(&[("provider", provider)]);
     }
@@ -311,7 +311,7 @@ fn call_tool(
             let detail: SessionDetail = daemon_request(
                 deps.client
                     .get(format!(
-                        "{}/api/internal/sessions/{}",
+                        "{}/api/sessions/{}",
                         deps.daemon_url, session_id.0
                     ))
                     .send()
@@ -342,7 +342,7 @@ fn call_tool(
             let status: CompactStatusResponse = daemon_request(
                 deps.client
                     .post(format!(
-                        "{}/api/internal/sessions/{}/compact/ask",
+                        "{}/api/sessions/{}/compact/ask",
                         deps.daemon_url, session_id.0
                     ))
                     .json(&request)
@@ -380,7 +380,7 @@ fn call_tool(
             let response: ResumeResponse = daemon_request(
                 deps.client
                     .post(format!(
-                        "{}/api/internal/sessions/{}/resume",
+                        "{}/api/sessions/{}/resume",
                         deps.daemon_url, session_id.0
                     ))
                     .json(&request)
@@ -690,13 +690,10 @@ pub fn http_app(deps: Arc<Deps>) -> Router {
 
 #[cfg(not(test))]
 fn build_deps() -> anyhow::Result<Deps> {
-    let daemon_url = std::env::var("UW_DAEMON_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:7878".into())
-        .trim_end_matches('/')
-        .to_owned();
+    let endpoint = uw_client::Discovery::from_environment("UW_DAEMON_URL").resolve();
     Ok(Deps {
-        client: reqwest::blocking::Client::new(),
-        daemon_url,
+        client: endpoint.blocking_client()?,
+        daemon_url: endpoint.base_url().into(),
     })
 }
 

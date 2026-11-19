@@ -390,9 +390,10 @@ pub struct HttpApiClient {
 }
 impl HttpApiClient {
     pub fn new(base_url: impl Into<String>) -> Result<Self> {
+        let endpoint = uw_client::Endpoint(base_url.into());
         Ok(Self {
-            base_url: base_url.into().trim_end_matches('/').into(),
-            client: reqwest::blocking::Client::builder().build()?,
+            base_url: endpoint.base_url().into(),
+            client: endpoint.blocking_client()?,
         })
     }
     fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
@@ -419,7 +420,7 @@ impl HttpApiClient {
 }
 impl Default for HttpApiClient {
     fn default() -> Self {
-        Self::new(std::env::var("UW_API_URL").unwrap_or_else(|_| "http://127.0.0.1:7878".into()))
+        Self::new(uw_client::Discovery::from_environment("UW_API_URL").resolve().0)
             .expect("valid default daemon URL")
     }
 }

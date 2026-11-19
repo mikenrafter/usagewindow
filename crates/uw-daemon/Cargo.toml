@@ -16,6 +16,7 @@ name = "uw-hook"
 path = "src/bin/uw-hook.rs"
 
 [dependencies]
+uw-client.workspace = true
 uw-core.workspace = true
 uw-adapters.workspace = true
 uw-policy.workspace = true

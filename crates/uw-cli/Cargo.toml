@@ -12,6 +12,7 @@ name = "uw"
 path = "src/main.rs"
 
 [dependencies]
+uw-client.workspace = true
 uw-core.workspace = true
 tokio.workspace = true
 anyhow.workspace = true

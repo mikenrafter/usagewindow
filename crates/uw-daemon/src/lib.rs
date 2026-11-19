@@ -1,6 +1,7 @@
 //! Polling and delivery orchestration. Decisions are kept separate from I/O so
 //! policy behavior can be tested with synthetic state and fake adapters/stores.
 
+mod local_api;
 mod cadence;
 #[cfg(test)]
 mod cadence_regression_tests;
@@ -3286,13 +3287,17 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
         Err(std::env::VarError::NotPresent) => None,
         Err(error) => return Err(error.into()),
     };
-    let app =
-        uw_web::app_with_shared_store_and_auth(shared_store, adapters.clone(), web_password_hash)?;
+    // CLAIM(local-api-boundary): only the private Unix listener skips login [local_api integration test].
+    let local_app = uw_web::app_with_shared_store(shared_store.clone(), adapters.clone());
+    let web_app = uw_web::app_with_shared_store_and_auth(shared_store, adapters.clone(), web_password_hash)?;
     let address = std::env::var("UW_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".into());
-    let listener = tokio::net::TcpListener::bind(address).await?;
-    let server = async move { axum::serve(listener, app).await };
+    let tcp = tokio::net::TcpListener::bind(address).await?;
+    let local = local_api::LocalApi::bind()?;
+    local.publish(tcp.local_addr()?)?;
+    tracing::info!(web_address = %tcp.local_addr()?, socket = %local.socket_path.display(), "usagewindow listening");
     tokio::select! {
-        result = server => result.map_err(Into::into),
+        result = axum::serve(tcp, web_app) => result.map_err(Into::into),
+        result = axum::serve(local.listener, local_app) => result.map_err(Into::into),
         result = run_production_ticks(daemon_store, &adapters, &liveness, std::time::Duration::from_secs(60)) => result,
     }
 }

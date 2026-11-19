@@ -169,17 +169,15 @@ pub fn app_with_shared_store_and_auth(
         .route("/api/thresholds", get(thresholds_get).post(thresholds_set))
         .route("/api/compactions/recent", get(compactions_recent))
         .route("/api/actions/recent", get(actions_recent))
+        .route("/api/internal/status", get(status))
+        .route("/api/internal/sessions/{id}", get(session))
+        .route("/api/internal/sessions/{id}/compact/ask", post(compact_ask))
+        .route("/api/internal/sessions/{id}/resume", post(resume))
         .layer(middleware::from_fn_with_state(Arc::clone(&auth), authorize));
     Ok(Router::new()
         .route("/api/auth/status", get(auth_status))
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/logout", post(auth_logout))
-        // These routes are for the loopback-only MCP bridge. The daemon owns
-        // the database, so MCP must use the daemon even when web auth is on.
-        .route("/api/internal/status", get(status))
-        .route("/api/internal/sessions/{id}", get(session))
-        .route("/api/internal/sessions/{id}/compact/ask", post(compact_ask))
-        .route("/api/internal/sessions/{id}/resume", post(resume))
         .merge(protected)
         .fallback(static_asset)
         .with_state(AppState {
@@ -1657,6 +1655,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&body).contains("session-1"));
     }
 
+    // why: Tailscale Serve reaches TCP through loopback; every API alias must require login.
     #[tokio::test]
     async fn configured_auth_protects_api_until_password_login() {
         let hash = Argon2::default()
@@ -1686,7 +1685,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         let response = router
             .clone()
