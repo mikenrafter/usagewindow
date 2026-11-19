@@ -1734,6 +1734,7 @@ pub async fn run_policy_tick(
             token_rates.insert(session.id.clone(), rate);
         }
     }
+    let mut samples_by_account = SamplesByAccount::default();
     for session in sessions {
         if store.actions_inhibited(&session.harness).await? { continue; }
 
@@ -1743,9 +1744,11 @@ pub async fn run_policy_tick(
         let Some(profile) = profiles.get(&session.id) else {
             continue;
         };
-        let samples = store.usage_samples(session).await?;
+        // Samples depend only on provider and account; loading them once per
+        // session reread ~10k rows for each of ~1,000 sessions every tick.
+        let samples = samples_by_account.load(store, session).await?;
         let mut keys = HashSet::new();
-        for sample in &samples {
+        for sample in samples.iter() {
             keys.extend(sample.windows.keys().cloned());
         }
         let mut suppress_idle = false;
@@ -2343,6 +2346,26 @@ fn plan_resume_marker_with_burn(
     })
 }
 
+/// Usage samples loaded once per provider and account within one pass.
+#[derive(Default)]
+struct SamplesByAccount(HashMap<(Provider, Option<AccountId>), Arc<Vec<UsageSample>>>);
+
+impl SamplesByAccount {
+    async fn load(
+        &mut self,
+        store: &dyn DaemonStore,
+        session: &SessionSummary,
+    ) -> anyhow::Result<Arc<Vec<UsageSample>>> {
+        let key = (session.harness.clone(), session.account.clone());
+        if let Some(samples) = self.0.get(&key) {
+            return Ok(samples.clone());
+        }
+        let samples = Arc::new(store.usage_samples(session).await?);
+        self.0.insert(key, samples.clone());
+        Ok(samples)
+    }
+}
+
 /// Spends a window's last few minutes of budget on sessions that are otherwise
 /// parked until it resets, pulling one or two of them forward. The advisory,
 /// keepalive and plan-pressure thresholds do not gate this: the remaining
@@ -2372,13 +2395,16 @@ pub async fn run_preempt_resume_tick(
         }
     }
 
+    let mut samples_by_account = SamplesByAccount::default();
     let mut seen_windows = HashSet::new();
     let mut moved = 0usize;
     for session in sessions {
         if store.actions_inhibited(&session.harness).await? { continue; }
-        let samples = store.usage_samples(session).await?;
+        // Samples depend only on provider and account; loading them once per
+        // session reread ~10k rows for each of ~1,000 sessions every tick.
+        let samples = samples_by_account.load(store, session).await?;
         let mut keys = HashSet::new();
-        for sample in &samples {
+        for sample in samples.iter() {
             keys.extend(sample.windows.keys().cloned());
         }
         for key in keys {
@@ -2412,7 +2438,7 @@ pub async fn run_preempt_resume_tick(
             let mut candidates = Vec::new();
             let mut context_samples = Vec::new();
             let mut plan_samples = Vec::new();
-            for sample in &samples {
+            for sample in samples.iter() {
                 if sample.account != session.account {
                     continue;
                 }
@@ -2512,10 +2538,12 @@ pub async fn run_resume_tick(
     adapters: &HashMap<Provider, Arc<dyn HarnessAdapter>>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
+    let mut samples_by_account = SamplesByAccount::default();
     for marker in store.due_resume_markers(now).await? {
         let session = store.resume_owner(&marker.session_id).await?;
         if store.actions_inhibited(&session.harness).await? { continue; }
-        if let Some(resume_at) = exhausted_window_resume_at(store, &session, now).await? {
+        let samples = samples_by_account.load(store, &session).await?;
+        if let Some(resume_at) = exhausted_window_resume_at(&samples, now) {
             store.defer_resume(marker.id, resume_at).await?;
             tracing::info!(
                 session = %session.id.0,
@@ -2580,25 +2608,21 @@ pub async fn run_resume_tick(
     Ok(())
 }
 
-async fn exhausted_window_resume_at(
-    store: &dyn DaemonStore,
-    session: &SessionSummary,
+fn exhausted_window_resume_at(
+    samples: &[UsageSample],
     now: DateTime<Utc>,
-) -> anyhow::Result<Option<DateTime<Utc>>> {
-    let reset = store
-        .usage_samples(session)
-        .await?
-        .into_iter()
+) -> Option<DateTime<Utc>> {
+    samples
+        .iter()
         .flat_map(|sample| {
-            sample.windows.into_values().filter_map(|state| {
+            sample.windows.values().filter_map(|state| {
                 (state.exceeded || state.pct >= 95.0)
                     .then_some(state.resets_at)
                     .flatten()
             })
         })
         .filter(|at| *at > now)
-        .max();
-    Ok(reset)
+        .max()
 }
 
 fn provider_label(provider: &Provider) -> String {
@@ -3560,6 +3584,7 @@ mod tests {
         claim: bool,
         status: StdMutex<Vec<CompactionStatus>>,
         samples: Vec<UsageSample>,
+        sample_loads: Arc<StdMutex<u32>>,
         enqueues: Arc<StdMutex<u32>>,
         active_resume: Option<ResumeMarker>,
         resolved: ResolvedTimes,
@@ -3589,6 +3614,7 @@ mod tests {
             Ok(())
         }
         async fn usage_samples(&self, _: &SessionSummary) -> anyhow::Result<Vec<UsageSample>> {
+            *self.sample_loads.lock().unwrap() += 1;
             Ok(self.samples.clone())
         }
         async fn token_usage(&self, _: &SessionId) -> anyhow::Result<Vec<TokenUsageRecord>> {
@@ -3731,6 +3757,7 @@ mod tests {
         let mut req = request();
         req.kind = kind;
         FakeStore {
+            sample_loads: Arc::new(StdMutex::new(0)),
             request: StdMutex::new(Some(req)),
             owner: session(),
             claim: true,
@@ -4151,6 +4178,141 @@ mod tests {
         }
     }
 
+    fn sample_load_cases() -> Vec<(Vec<SessionSummary>, u32)> {
+        let account_a = Some(AccountId("a".into()));
+        let account_b = Some(AccountId("b".into()));
+        vec![
+            (vec![(Provider::ClaudeCode, None); 3], 1),
+            (vec![(Provider::ClaudeCode, account_a.clone()); 3], 1),
+            (
+                vec![
+                    (Provider::ClaudeCode, account_a.clone()),
+                    (Provider::ClaudeCode, account_b),
+                    (Provider::ClaudeCode, account_a.clone()),
+                ],
+                2,
+            ),
+            (
+                vec![
+                    (Provider::ClaudeCode, None),
+                    (Provider::ClaudeCode, account_a.clone()),
+                    (Provider::ClaudeCode, None),
+                ],
+                2,
+            ),
+            (
+                vec![
+                    (Provider::ClaudeCode, account_a.clone()),
+                    (Provider::Codex, account_a.clone()),
+                    (Provider::ClaudeCode, account_a),
+                ],
+                2,
+            ),
+        ]
+        .into_iter()
+        .map(|(keys, expected)| {
+            let sessions = keys
+                .into_iter()
+                .enumerate()
+                .map(|(index, (harness, account))| SessionSummary {
+                    id: SessionId(format!("session-{index}")),
+                    harness,
+                    account,
+                    ..session()
+                })
+                .collect();
+            (sessions, expected)
+        })
+        .collect()
+    }
+
+    fn sample_for_session(session: &SessionSummary, now: DateTime<Utc>) -> UsageSample {
+        UsageSample {
+            at: now,
+            fetched_at: None,
+            source: UsageSource::ProviderReported,
+            provider: session.harness.clone(),
+            account: session.account.clone(),
+            plan: None,
+            windows: HashMap::from([(
+                WindowKey {
+                    provider: session.harness.clone(),
+                    kind: WindowKind::Rolling { minutes: 300 },
+                },
+                UsageWindowState::new(
+                    10.0,
+                    false,
+                    true,
+                    Some(now + Duration::hours(1)),
+                    None,
+                ),
+            )]),
+            credits: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_tick_loads_samples_once_per_provider_account_per_pass() {
+        // WHY: account histories were decoded once per session, saturating the daemon CPU.
+        // catches: loading per session, conflating providers/accounts/None, retaining a cache across ticks.
+        let now = Utc::now();
+        for (sessions, expected_loads) in sample_load_cases() {
+            let mut store = activity_store(CompactionKind::OpportunisticIdle);
+            let adapter = Arc::new(FakeAdapter {
+                capabilities: caps(false, false, false),
+                compacted: Arc::new(StdMutex::new(0)),
+                advised: Arc::new(StdMutex::new(0)),
+            }) as Arc<dyn HarnessAdapter>;
+            let adapters = HashMap::from([
+                (Provider::ClaudeCode, adapter.clone()),
+                (Provider::Codex, adapter),
+            ]);
+            let profiles = sessions
+                .iter()
+                .map(|session| (session.id.clone(), ThresholdProfile::default()))
+                .collect();
+            let mut state = PolicyRuntimeState::default();
+            for pass in 1..=2 {
+                run_policy_tick(
+                    &store,
+                    &store,
+                    &adapters,
+                    &AlwaysActive,
+                    &sessions,
+                    &profiles,
+                    &mut state,
+                    now,
+                )
+                .await
+                .unwrap();
+                assert_eq!(*store.sample_loads.lock().unwrap(), pass * expected_loads);
+                assert_eq!(*store.enqueues.lock().unwrap(), 0);
+                // Both empty and populated histories must be cached within a pass.
+                store.samples = sessions.iter().map(|s| sample_for_session(s, now)).collect();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn preempt_tick_loads_samples_once_per_provider_account_per_pass() {
+        // WHY: the preempt pass shared the policy pass's per-session history reload bug.
+        // catches: loading per session, conflating providers/accounts/None, retaining a cache across ticks.
+        let now = Utc::now();
+        for (sessions, expected_loads) in sample_load_cases() {
+            let mut store = activity_store(CompactionKind::OpportunisticIdle);
+            for pass in 1..=2 {
+                assert_eq!(
+                    run_preempt_resume_tick(&store, &sessions, now, &ThresholdProfile::default())
+                        .await
+                        .unwrap(),
+                    0,
+                );
+                assert_eq!(*store.sample_loads.lock().unwrap(), pass * expected_loads);
+                store.samples = sessions.iter().map(|s| sample_for_session(s, now)).collect();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn manual_resume_marker_is_reconciled_without_stopped_reason() {
         let now = Utc::now();
@@ -4170,6 +4332,7 @@ mod tests {
             preempt: true,
         };
         let store = FakeStore {
+            sample_loads: Arc::new(StdMutex::new(0)),
             request: StdMutex::new(None),
             owner: session(),
             claim: true,
@@ -4399,6 +4562,7 @@ mod tests {
         let mut cold = session();
         cold.last_seen = Utc::now() - Duration::minutes(CACHE_WARM_APPROXIMATION_MINUTES + 1);
         let store = FakeStore {
+            sample_loads: Arc::new(StdMutex::new(0)),
             request: StdMutex::new(Some(request())),
             owner: cold,
             claim: true,
@@ -5221,6 +5385,7 @@ mod tests {
             advised: Arc::new(StdMutex::new(0)),
         });
         let store = FakeStore {
+            sample_loads: Arc::new(StdMutex::new(0)),
             request: StdMutex::new(Some(request())),
             owner: session(),
             claim: true,
@@ -5254,6 +5419,7 @@ mod tests {
         let mut ask = request();
         ask.kind = CompactionKind::AskNearLimit;
         let store = FakeStore {
+            sample_loads: Arc::new(StdMutex::new(0)),
             request: StdMutex::new(Some(ask)),
             owner: session(),
             claim: true,
@@ -5295,6 +5461,7 @@ mod tests {
         let mut requested = request();
         requested.kind = CompactionKind::AgentRequested;
         let store = FakeStore {
+            sample_loads: Arc::new(StdMutex::new(0)),
             request: StdMutex::new(Some(requested)),
             owner: session(),
             claim: true,
@@ -5327,6 +5494,7 @@ mod tests {
             advised: Arc::new(StdMutex::new(0)),
         });
         let raced = FakeStore {
+            sample_loads: Arc::new(StdMutex::new(0)),
             request: StdMutex::new(Some(request())),
             owner: session(),
             claim: false,
@@ -5348,6 +5516,7 @@ mod tests {
         .unwrap();
         assert_eq!(*compacted.lock().unwrap(), 0);
         let sent = FakeStore {
+            sample_loads: Arc::new(StdMutex::new(0)),
             request: StdMutex::new(Some(request())),
             owner: session(),
             claim: true,
@@ -5380,6 +5549,7 @@ mod tests {
             advised: Arc::new(StdMutex::new(0)),
         });
         let store = FakeStore {
+            sample_loads: Arc::new(StdMutex::new(0)),
             request: StdMutex::new(Some(request())),
             owner: session(),
             claim: true,
@@ -5582,6 +5752,7 @@ mod tests {
         let now = Utc::now();
         let enqueues = Arc::new(StdMutex::new(0));
         let store = FakeStore {
+            sample_loads: Arc::new(StdMutex::new(0)),
             request: StdMutex::new(None),
             owner: session(),
             claim: true,
@@ -5671,6 +5842,7 @@ mod tests {
             ..session()
         };
         let store = FakeStore {
+            sample_loads: Arc::new(StdMutex::new(0)),
             request: StdMutex::new(None),
             owner: percent_session.clone(),
             claim: true,
@@ -5719,6 +5891,7 @@ mod tests {
             ..session()
         };
         let store = FakeStore {
+            sample_loads: Arc::new(StdMutex::new(0)),
             request: StdMutex::new(None),
             owner: percent_session.clone(),
             claim: true,
@@ -5799,6 +5972,7 @@ mod tests {
         due: Vec<ResumeMarker>,
         claim: Arc<StdMutex<bool>>,
         samples: Vec<UsageSample>,
+        sample_loads: Arc<StdMutex<u32>>,
         deferred: StdMutex<Vec<(uuid::Uuid, DateTime<Utc>)>>,
     }
     #[async_trait]
@@ -5823,6 +5997,7 @@ mod tests {
             Ok(())
         }
         async fn usage_samples(&self, _: &SessionSummary) -> anyhow::Result<Vec<UsageSample>> {
+            *self.sample_loads.lock().unwrap() += 1;
             Ok(self.samples.clone())
         }
         async fn token_usage(&self, _: &SessionId) -> anyhow::Result<Vec<TokenUsageRecord>> {
@@ -5907,6 +6082,7 @@ mod tests {
             preempt: true,
         };
         let store = ResumeFake {
+            sample_loads: Arc::new(StdMutex::new(0)),
             active: Some(already_scheduled),
             inserts: StdMutex::new(0),
             resolved: StdMutex::new(vec![]),
@@ -5947,6 +6123,7 @@ mod tests {
         let marker_id = marker.id;
         let calls = Arc::new(StdMutex::new(vec![]));
         let store = ResumeFake {
+            sample_loads: Arc::new(StdMutex::new(0)),
             active: None,
             inserts: StdMutex::new(0),
             resolved: StdMutex::new(vec![]),
@@ -6007,6 +6184,7 @@ mod tests {
             preempt: true,
         };
         let store = ResumeFake {
+            sample_loads: Arc::new(StdMutex::new(0)),
             active: Some(too_early.clone()),
             inserts: StdMutex::new(0),
             resolved: StdMutex::new(vec![]),
@@ -6039,6 +6217,7 @@ mod tests {
             ..too_early
         };
         let store = ResumeFake {
+            sample_loads: Arc::new(StdMutex::new(0)),
             active: Some(ask_for_more_margin.clone()),
             inserts: StdMutex::new(0),
             resolved: StdMutex::new(vec![]),
@@ -6083,6 +6262,7 @@ mod tests {
             preempt: true,
         };
         let store = Arc::new(ResumeFake {
+            sample_loads: Arc::new(StdMutex::new(0)),
             active: None,
             inserts: StdMutex::new(0),
             resolved: StdMutex::new(vec![]),
@@ -6192,6 +6372,7 @@ mod tests {
 
     fn resume_routing_store(marker: ResumeMarker) -> ResumeFake {
         ResumeFake {
+            sample_loads: Arc::new(StdMutex::new(0)),
             active: None,
             inserts: StdMutex::new(0),
             resolved: StdMutex::new(vec![]),
@@ -6202,6 +6383,32 @@ mod tests {
             samples: vec![],
             deferred: StdMutex::new(vec![]),
         }
+    }
+
+    #[tokio::test]
+    async fn resume_tick_loads_samples_once_per_provider_account_per_pass() {
+        // WHY: exhaustion checks run for every due marker and share the same history.
+        // catches: reloading for every marker, retaining exhausted samples across ticks.
+        let now = Utc::now();
+        let reset = now + Duration::hours(1);
+        let mut store = resume_routing_store(due_resume_marker());
+        store.due = (0..3).map(|_| due_resume_marker()).collect();
+        *store.claim.lock().unwrap() = false;
+        let mut sample = sample_for_session(&store.owner, now);
+        for window in sample.windows.values_mut() {
+            window.pct = 96.0;
+        }
+        store.samples = vec![sample];
+        run_resume_tick(&store, &HashMap::new(), now).await.unwrap();
+        assert_eq!(*store.sample_loads.lock().unwrap(), 1);
+        let expected: Vec<_> = store.due.iter().map(|marker| (marker.id, reset)).collect();
+        assert_eq!(*store.deferred.lock().unwrap(), expected);
+
+        store.samples.clear();
+        store.deferred.lock().unwrap().clear();
+        run_resume_tick(&store, &HashMap::new(), now).await.unwrap();
+        assert_eq!(*store.sample_loads.lock().unwrap(), 2);
+        assert!(store.deferred.lock().unwrap().is_empty());
     }
 
     fn resume_routing_adapters(
