@@ -336,3 +336,73 @@ fn claude_partial_history_without_matching_tool_call_is_unknown() {
         SessionActivity::Unknown
     );
 }
+
+// why: a writer can stop halfway through a tool call while the previous snapshot was idle.
+// The incremental reader must report unknown until the record completes, then account for the tool.
+#[tokio::test]
+async fn incremental_activity_does_not_report_idle_during_a_partial_append() {
+    use std::io::Write;
+    use uw_core::adapter::HarnessAdapter;
+    for claude in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let id = if claude {
+            "006d12d4-5826-495b-a799-c2998da1451c"
+        } else {
+            "session"
+        };
+        let path = dir.path().join(if claude {
+            format!("{id}.jsonl")
+        } else {
+            format!("rollout-{id}.jsonl")
+        });
+        let header = if claude {
+            json!({"type":"system","sessionId":id})
+        } else {
+            codex_start()[0].clone()
+        };
+        std::fs::write(&path, format!("{header}\n")).unwrap();
+        let session: uw_core::model::SessionSummary = serde_json::from_value(json!({
+            "id":id, "harness": if claude { "ClaudeCode" } else { "Codex" }, "account":null, "cwd":"/tmp", "model":null,
+            "first_seen":"2026-09-30T00:00:00Z", "last_seen":"2026-09-30T00:00:00Z", "launch_mode":"Interactive",
+            "state_path":path.to_str().unwrap(), "last_known_token_count":null, "context_window_size":null
+        })).unwrap();
+        let adapter: Box<dyn HarnessAdapter> = if claude {
+            Box::new(uw_adapters::claude_code::ClaudeCodeAdapter::real(
+                dir.path().join("cache"),
+                "test",
+            ))
+        } else {
+            Box::new(
+                uw_adapters::codex::CodexAdapter::real().with_sessions_root(dir.path().to_owned()),
+            )
+        };
+        assert_eq!(
+            adapter.session_activity(&session).await.unwrap(),
+            SessionActivity::Idle
+        );
+        let mut call = if claude {
+            claude_tool("call", "Bash")
+        } else {
+            codex_start()[1].clone()
+        };
+        if claude {
+            call["sessionId"] = json!(id);
+        }
+        let call = call.to_string();
+        let (left, right) = call.split_at(call.len() / 2);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(left.as_bytes()).unwrap();
+        assert_eq!(
+            adapter.session_activity(&session).await.unwrap(),
+            SessionActivity::Unknown
+        );
+        writeln!(file, "{right}").unwrap();
+        assert_eq!(
+            adapter.session_activity(&session).await.unwrap(),
+            SessionActivity::Busy
+        );
+    }
+}

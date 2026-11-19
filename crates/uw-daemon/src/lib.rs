@@ -893,7 +893,11 @@ async fn poll_provider(
                 .record_fetch_result(provider, None, Err(error.to_string()), Utc::now())
                 .await?;
             report.adapter_errors = 1;
-            tracing::warn!(%error, "usage poll failed");
+            if matches!(error, AdapterError::Unsupported) {
+                tracing::debug!(%error, "usage poll unsupported");
+            } else {
+                tracing::warn!(%error, "usage poll failed");
+            }
             Ok((report, None))
         }
     }
@@ -956,6 +960,10 @@ async fn run_observation_tick_cached(
                     if !known.iter().any(|existing| existing.id == session.id) {
                         report.sessions_discovered += 1;
                     }
+                    let checkpoint = session
+                        .state_path
+                        .clone()
+                        .map(|path| (path, session.token_usage.clone()));
                     store
                         .upsert_discovered_session(
                             adapter.provider(),
@@ -970,6 +978,9 @@ async fn run_observation_tick_cached(
                             now,
                         )
                         .await?;
+                    if let Some((path, records)) = checkpoint {
+                        adapter.acknowledge_discovery(&path, &records).await?;
+                    }
                 }
             }
             Err(AdapterError::Unsupported) => {}

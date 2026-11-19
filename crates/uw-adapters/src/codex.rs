@@ -158,13 +158,9 @@ pub struct CodexAdapter {
     now: Arc<dyn Fn() -> chrono::DateTime<Utc> + Send + Sync>,
     hook: Option<Arc<dyn crate::claude_code::HookChannel>>,
     sessions_root: Option<PathBuf>,
-    discovery_cache: Mutex<HashMap<PathBuf, CachedRollout>>,
+    discovery_cache: Arc<Mutex<crate::jsonl::JsonlCache<RolloutScan>>>,
 }
 
-struct CachedRollout {
-    fingerprint: (u64, Option<std::time::SystemTime>),
-    session: DiscoveredSession,
-}
 impl CodexAdapter {
     pub fn new(transport: Arc<dyn AppServerTransport>) -> Self {
         Self {
@@ -173,7 +169,7 @@ impl CodexAdapter {
             now: Arc::new(Utc::now),
             hook: None,
             sessions_root: None,
-            discovery_cache: Mutex::new(HashMap::new()),
+            discovery_cache: Arc::new(Mutex::new(crate::jsonl::JsonlCache::default())),
         }
     }
     pub fn real() -> Self {
@@ -210,7 +206,11 @@ impl CodexAdapter {
     async fn has_quota_error_evidence(&self, session_id: &SessionId) -> AdapterResult<bool> {
         let root = self.resolved_sessions_root();
         let id = session_id.0.clone();
+        let cache = self.discovery_cache.clone();
         tokio::task::spawn_blocking(move || {
+            let mut cache = cache
+                .lock()
+                .map_err(|e| AdapterError::Other(e.to_string()))?;
             for path in rollout_files(&root) {
                 let matches_id = path
                     .file_stem()
@@ -219,10 +219,10 @@ impl CodexAdapter {
                 if !matches_id {
                     continue;
                 }
-                let Ok(content) = std::fs::read_to_string(&path) else {
+                let Ok(scan) = cache.scan(&path, RolloutScan::observe) else {
                     continue;
                 };
-                if rollout_has_quota_error(&content) {
+                if scan.quota_error {
                     return Ok(true);
                 }
             }
@@ -509,47 +509,53 @@ impl HarnessAdapter for CodexAdapter {
 
     async fn discover_sessions(&self) -> AdapterResult<Vec<DiscoveredSession>> {
         let root = self.resolved_sessions_root();
-        let mut cache = self
-            .discovery_cache
-            .lock()
-            .map_err(|_| AdapterError::Other("discovery cache poisoned".into()))?;
-        let mut found = Vec::new();
-        for path in rollout_files(&root) {
-            let metadata = match std::fs::metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(_) => continue,
-            };
-            let fingerprint = (metadata.len(), metadata.modified().ok());
-            if let Some(cached) = cache.get(&path)
-                && cached.fingerprint == fingerprint
-            {
-                found.push(cached.session.clone());
-                continue;
+        let cache = self.discovery_cache.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut cache = cache
+                .lock()
+                .map_err(|e| AdapterError::Other(e.to_string()))?;
+            let paths = rollout_files(&root);
+            cache.retain(|path| paths.iter().any(|p| p == path));
+            let mut found = Vec::new();
+            for path in paths {
+                #[cfg(test)]
+                let old_offset = cache.offset(&path);
+                let Ok(scan) = cache.scan(&path, RolloutScan::observe) else {
+                    continue;
+                };
+                if let Some(session) = scan.session(&path) {
+                    found.push(session);
+                }
+                #[cfg(test)]
+                if cache.offset(&path) != old_offset {
+                    *ROLLOUT_SCAN_COUNTS.lock().unwrap().entry(path).or_default() += 1;
+                }
             }
-            let Some(session) = scan_rollout(&path) else {
-                cache.remove(&path);
-                continue;
-            };
-            let returned = cache
-                .get(&path)
-                .map(|old| {
-                    let old_count = old.session.token_usage.len();
-                    let mut delta = session.clone();
-                    delta.token_usage =
-                        session.token_usage[old_count.min(session.token_usage.len())..].to_vec();
-                    delta
-                })
-                .unwrap_or_else(|| session.clone());
-            cache.insert(
-                path,
-                CachedRollout {
-                    fingerprint,
-                    session,
-                },
-            );
-            found.push(returned);
-        }
-        Ok(found)
+            Ok(found)
+        })
+        .await
+        .map_err(|e| AdapterError::Other(e.to_string()))?
+    }
+
+    async fn acknowledge_discovery(
+        &self,
+        path: &str,
+        records: &[TokenUsageRecord],
+    ) -> AdapterResult<()> {
+        let cache = self.discovery_cache.clone();
+        let path = path.to_owned();
+        let records = records.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let mut cache = cache
+                .lock()
+                .map_err(|e| AdapterError::Other(e.to_string()))?;
+            if let Some(scan) = cache.get_mut(std::path::Path::new(&path)) {
+                crate::jsonl::acknowledge_usage(&mut scan.token_usage, &records);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| AdapterError::Other(e.to_string()))?
     }
 
     async fn session_activity(
@@ -559,6 +565,7 @@ impl HarnessAdapter for CodexAdapter {
         let known_path = session.state_path.clone();
         let id = session.id.clone();
         let root = self.resolved_sessions_root();
+        let cache = self.discovery_cache.clone();
         tokio::task::spawn_blocking(move || {
             use uw_core::activity::SessionActivity;
             let path = known_path.map(PathBuf::from).or_else(|| {
@@ -580,9 +587,17 @@ impl HarnessAdapter for CodexAdapter {
             {
                 return SessionActivity::Unknown;
             }
-            match std::fs::read_to_string(path) {
-                Ok(content) => rollout_activity(&content, &id),
-                Err(_) => SessionActivity::Unknown,
+            let Ok(mut cache) = cache.lock() else {
+                return SessionActivity::Unknown;
+            };
+            let Ok(scan) = cache.scan(&path, RolloutScan::observe) else {
+                return SessionActivity::Unknown;
+            };
+            let activity = scan.activity.activity(&id);
+            if cache.is_complete(&path) {
+                activity
+            } else {
+                SessionActivity::Unknown
             }
         })
         .await
@@ -650,35 +665,30 @@ fn plan_from_response(value: &Value) -> Option<String> {
 /// "usage_limit_exceeded"` and a "You've hit your usage limit..." message).
 /// Matching either the structured code or the same quota phrasing trusted
 /// elsewhere is enough; other errors never invent a UsageLimit stop.
-fn rollout_has_quota_error(content: &str) -> bool {
-    content.lines().any(|line| {
-        let Ok(record) = serde_json::from_str::<Value>(line) else {
-            return false;
-        };
-        if record.get("type").and_then(Value::as_str) != Some("event_msg") {
-            return false;
-        }
-        let Some(payload) = record.get("payload") else {
-            return false;
-        };
-        if payload.get("type").and_then(Value::as_str) != Some("task_complete") {
-            return false;
-        }
-        let Some(error) = payload.get("error") else {
-            return false;
-        };
-        error
-            .get("codex_error_info")
+fn rollout_record_has_quota_error(record: &Value) -> bool {
+    if record.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return false;
+    }
+    let Some(payload) = record.get("payload") else {
+        return false;
+    };
+    if payload.get("type").and_then(Value::as_str) != Some("task_complete") {
+        return false;
+    }
+    let Some(error) = payload.get("error") else {
+        return false;
+    };
+    error
+        .get("codex_error_info")
+        .and_then(Value::as_str)
+        .is_some_and(|info| info == "usage_limit_exceeded")
+        || error
+            .get("message")
             .and_then(Value::as_str)
-            .is_some_and(|info| info == "usage_limit_exceeded")
-            || error
-                .get("message")
-                .and_then(Value::as_str)
-                .is_some_and(|message| {
-                    let lower = message.to_ascii_lowercase();
-                    lower.contains("usage limit") || lower.contains("rate limit")
-                })
-    })
+            .is_some_and(|message| {
+                let lower = message.to_ascii_lowercase();
+                lower.contains("usage limit") || lower.contains("rate limit")
+            })
 }
 
 fn rollout_files(root: &std::path::Path) -> Vec<PathBuf> {
@@ -716,59 +726,73 @@ fn rollout_files(root: &std::path::Path) -> Vec<PathBuf> {
 /// A file that isn't valid JSONL or doesn't start with `session_meta` is skipped, not an
 /// error — most files under `sessions/` are unrelated or historical. The daemon uses this
 /// scan both to discover new sessions and to refresh token history for known sessions.
-fn scan_rollout(path: &std::path::Path) -> Option<DiscoveredSession> {
-    #[cfg(test)]
-    {
-        *ROLLOUT_SCAN_COUNTS
-            .lock()
-            .unwrap()
-            .entry(path.to_path_buf())
-            .or_default() += 1;
-    }
-
-    let file = std::fs::File::open(path).ok()?;
-    let mut lines = std::io::BufReader::new(file).lines();
-
-    let first: Value = serde_json::from_str(&lines.next()?.ok()?).ok()?;
-    if first.get("type").and_then(Value::as_str) != Some("session_meta") {
-        return None;
-    }
-    let payload = first.get("payload")?;
-    let id = payload.get("session_id").and_then(Value::as_str)?;
-    uuid::Uuid::parse_str(id).ok()?;
-    let cwd = payload
-        .get("cwd")
-        .and_then(Value::as_str)
-        .unwrap_or(".")
-        .to_owned();
-    let first_seen = first
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
-        .map(|ts| ts.with_timezone(&Utc));
-
-    let mut model = None;
-    let mut context_window_size = None;
-    let mut last_known_token_count = None;
-    let mut last_seen = first_seen;
-    let mut token_usage = Vec::new();
-    let mut usage_model = model.clone();
-    for line in lines.map_while(Result::ok) {
-        let Ok(record) = serde_json::from_str::<Value>(&line) else {
-            continue;
+#[derive(Default)]
+struct RolloutScan {
+    header_seen: bool,
+    quota_error: bool,
+    activity: RolloutActivity,
+    header: Option<(String, String, Option<DateTime<Utc>>)>,
+    model: Option<ModelId>,
+    context_window_size: Option<u64>,
+    last_known_token_count: Option<u64>,
+    last_seen: Option<DateTime<Utc>>,
+    token_usage: Vec<TokenUsageRecord>,
+    usage_model: Option<ModelId>,
+}
+impl RolloutScan {
+    fn observe(&mut self, line: &str) {
+        let record = serde_json::from_str::<Value>(line);
+        match &record {
+            Ok(record) => self.activity.observe(record),
+            Err(_) => self.activity.invalid = true,
+        }
+        if !self.header_seen {
+            self.header_seen = true;
+            let Ok(first) = record else {
+                return;
+            };
+            if first.get("type").and_then(Value::as_str) != Some("session_meta") {
+                return;
+            }
+            let Some(payload) = first.get("payload") else {
+                return;
+            };
+            let Some(id) = payload.get("session_id").and_then(Value::as_str) else {
+                return;
+            };
+            if uuid::Uuid::parse_str(id).is_err() {
+                return;
+            }
+            let cwd = payload
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or(".")
+                .to_owned();
+            let at = first
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+                .map(|ts| ts.with_timezone(&Utc));
+            self.last_seen = at;
+            self.header = Some((id.to_owned(), cwd, at));
+            return;
+        }
+        let Ok(record) = record else {
+            return;
         };
+        self.quota_error |= rollout_record_has_quota_error(&record);
         if let Some(ts) = record
             .get("timestamp")
             .and_then(Value::as_str)
             .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
         {
-            last_seen = Some(ts.with_timezone(&Utc));
+            self.last_seen = Some(ts.with_timezone(&Utc));
         }
         match record.get("type").and_then(Value::as_str) {
             Some("turn_context") => {
                 if let Some(m) = record.pointer("/payload/model").and_then(Value::as_str) {
-                    model = Some(ModelId(m.to_owned()));
-                    usage_model = model.clone();
+                    self.model = Some(ModelId(m.to_owned()));
+                    self.usage_model = self.model.clone();
                 }
             }
             Some("event_msg")
@@ -779,7 +803,7 @@ fn scan_rollout(path: &std::path::Path) -> Option<DiscoveredSession> {
                     .pointer("/payload/model_context_window")
                     .and_then(Value::as_u64)
                 {
-                    context_window_size = Some(w);
+                    self.context_window_size = Some(w);
                 }
             }
             Some("token_usage_record") => {
@@ -789,17 +813,17 @@ fn scan_rollout(path: &std::path::Path) -> Option<DiscoveredSession> {
                     .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
                     .map(|ts| ts.with_timezone(&Utc))
                 else {
-                    continue;
+                    return;
                 };
                 let Some(usage) = record.pointer("/payload/usage") else {
-                    continue;
+                    return;
                 };
                 let Some(total_tokens) = usage.get("total_tokens").and_then(Value::as_u64) else {
-                    continue;
+                    return;
                 };
                 let token_usage_record = TokenUsageRecord {
                     at: timestamp,
-                    model: usage_model.clone(),
+                    model: self.usage_model.clone(),
                     input_tokens: usage
                         .get("input_tokens")
                         .and_then(Value::as_u64)
@@ -823,26 +847,29 @@ fn scan_rollout(path: &std::path::Path) -> Option<DiscoveredSession> {
                     total_tokens,
                     context_pct: None,
                 };
-                last_known_token_count = Some(total_tokens);
-                token_usage.push(token_usage_record);
+                self.last_known_token_count = Some(total_tokens);
+                self.token_usage.push(token_usage_record);
             }
             _ => {}
         }
     }
-    Some(DiscoveredSession {
-        id: SessionId(id.to_owned()),
-        lineage: SessionLineage::default(),
-        cwd,
-        model,
-        context_window_size,
-        last_known_token_count,
-        last_known_context_pct: None,
-        first_seen,
-        last_seen,
-        state_path: Some(path.to_string_lossy().into_owned()),
-        token_usage,
-        title: None,
-    })
+    fn session(&self, path: &std::path::Path) -> Option<DiscoveredSession> {
+        let (id, cwd, first_seen) = self.header.as_ref()?;
+        Some(DiscoveredSession {
+            id: SessionId(id.clone()),
+            lineage: SessionLineage::default(),
+            cwd: cwd.clone(),
+            model: self.model.clone(),
+            context_window_size: self.context_window_size,
+            last_known_token_count: self.last_known_token_count,
+            last_known_context_pct: None,
+            first_seen: *first_seen,
+            last_seen: self.last_seen,
+            state_path: Some(path.to_string_lossy().into_owned()),
+            token_usage: self.token_usage.clone(),
+            title: None,
+        })
+    }
 }
 
 /// The role- and text-bearing turns from an `item_completed` event: `UserMessage` and
@@ -958,55 +985,93 @@ pub fn rollout_activity(
     content: &str,
     session_id: &SessionId,
 ) -> uw_core::activity::SessionActivity {
-    use uw_core::activity::{ActivityEvent, ActivityTracker, SessionActivity};
-    let mut tracker = ActivityTracker::default();
-    let mut calls = std::collections::HashMap::<String, Value>::new();
-    let mut finished = std::collections::HashSet::new();
-    let mut identified = false;
-    let mut uncertain = false;
+    let mut scan = RolloutActivity::default();
     for line in content.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(record) = serde_json::from_str::<Value>(line) else {
-            return SessionActivity::Unknown;
-        };
+        match serde_json::from_str::<Value>(line) {
+            Ok(record) => scan.observe(&record),
+            Err(_) => scan.invalid = true,
+        }
+    }
+    scan.activity(session_id)
+}
+
+struct ActivityCall {
+    name: Option<String>,
+    stdin_session: Option<String>,
+}
+
+#[derive(Default)]
+struct RolloutActivity {
+    tracker: uw_core::activity::ActivityTracker,
+    calls: HashMap<String, ActivityCall>,
+    finished: std::collections::HashSet<String>,
+    identity: Option<String>,
+    uncertain: bool,
+    invalid: bool,
+}
+impl RolloutActivity {
+    fn observe(&mut self, record: &Value) {
+        use uw_core::activity::ActivityEvent;
+        if self.invalid {
+            return;
+        }
         let Some(payload) = record.get("payload") else {
-            return SessionActivity::Unknown;
+            self.invalid = true;
+            return;
         };
         match record.get("type").and_then(Value::as_str) {
             Some("session_meta") => {
                 let primary = payload.get("id").and_then(Value::as_str);
                 let alternate = payload.get("session_id").and_then(Value::as_str);
-                if primary.or(alternate) != Some(session_id.0.as_str())
-                    || primary.zip(alternate).is_some_and(|(a, b)| a != b)
+                let Some(id) = primary.or(alternate) else {
+                    self.invalid = true;
+                    return;
+                };
+                if primary.zip(alternate).is_some_and(|(a, b)| a != b)
+                    || self.identity.as_deref().is_some_and(|known| known != id)
                 {
-                    return SessionActivity::Unknown;
+                    self.invalid = true;
+                    return;
                 }
-                identified = true;
+                self.identity.get_or_insert_with(|| id.to_owned());
             }
             Some("response_item") => match payload.get("type").and_then(Value::as_str) {
                 Some("custom_tool_call" | "function_call") => {
                     let Some(id) = payload.get("call_id").and_then(Value::as_str) else {
-                        return SessionActivity::Unknown;
+                        self.invalid = true;
+                        return;
                     };
-                    calls
+                    self.calls
                         .entry(id.to_owned())
-                        .or_insert_with(|| payload.clone());
-                    if !finished.contains(id) {
-                        tracker.observe(ActivityEvent::ToolStarted(id.to_owned()));
+                        .or_insert_with(|| ActivityCall {
+                            name: payload
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            stdin_session: single_write_stdin_session(payload),
+                        });
+                    if !self.finished.contains(id) {
+                        self.tracker
+                            .observe(ActivityEvent::ToolStarted(id.to_owned()));
                     }
                 }
                 Some("custom_tool_call_output" | "function_call_output") => {
                     let Some(id) = payload.get("call_id").and_then(Value::as_str) else {
-                        return SessionActivity::Unknown;
+                        self.invalid = true;
+                        return;
                     };
-                    if !finished.insert(id.to_owned()) {
-                        continue;
+                    if !self.finished.insert(id.to_owned()) {
+                        return;
                     }
-                    let Some(call) = calls.get(id) else {
-                        return SessionActivity::Unknown;
+                    let Some(call) = self.calls.remove(id) else {
+                        self.invalid = true;
+                        return;
                     };
-                    tracker.observe(ActivityEvent::ToolFinished(id.to_owned()));
+                    self.tracker
+                        .observe(ActivityEvent::ToolFinished(id.to_owned()));
                     let Some(output) = payload.get("output") else {
-                        return SessionActivity::Unknown;
+                        self.invalid = true;
+                        return;
                     };
                     let texts: Vec<&str> = if let Some(text) = output.as_str() {
                         vec![text]
@@ -1016,7 +1081,8 @@ pub fn rollout_activity(
                             .filter_map(|part| part.get("text").and_then(Value::as_str))
                             .collect()
                     } else {
-                        return SessionActivity::Unknown;
+                        self.invalid = true;
+                        return;
                     };
                     let mut recognized = false;
                     for text in texts {
@@ -1030,24 +1096,26 @@ pub fn rollout_activity(
                         if result.get("exit_code").is_some_and(Value::is_number) {
                             recognized = true;
                             if let Some(command_id) =
-                                command_id.or_else(|| single_write_stdin_session(call))
+                                command_id.or_else(|| call.stdin_session.clone())
                             {
-                                tracker.observe(ActivityEvent::BackgroundFinished(command_id));
+                                self.tracker
+                                    .observe(ActivityEvent::BackgroundFinished(command_id));
                             }
                             // Arbitrary orchestration cannot correlate a terminal result by source text.
                         } else if let Some(command_id) = command_id {
                             recognized = true;
-                            tracker.observe(ActivityEvent::BackgroundStarted(command_id));
+                            self.tracker
+                                .observe(ActivityEvent::BackgroundStarted(command_id));
                         }
                     }
-                    // Suppressed or arbitrary JavaScript output cannot prove its nested commands finished.
+                    // Suppressed or arbitrary JavaScript output cannot prove its nested commands self.finished.
                     if !recognized
                         && matches!(
-                            call.get("name").and_then(Value::as_str),
+                            call.name.as_deref(),
                             Some("exec" | "functions.exec" | "exec_command" | "write_stdin")
                         )
                     {
-                        uncertain = true;
+                        self.uncertain = true;
                     }
                 }
                 _ => {}
@@ -1055,14 +1123,17 @@ pub fn rollout_activity(
             _ => {}
         }
     }
-    if !identified {
-        SessionActivity::Unknown
-    } else if tracker.activity() == SessionActivity::Busy {
-        SessionActivity::Busy
-    } else if uncertain {
-        SessionActivity::Unknown
-    } else {
-        SessionActivity::Idle
+    fn activity(&self, session_id: &SessionId) -> uw_core::activity::SessionActivity {
+        use uw_core::activity::SessionActivity;
+        if self.invalid || self.identity.as_deref() != Some(session_id.0.as_str()) {
+            SessionActivity::Unknown
+        } else if self.tracker.activity() == SessionActivity::Busy {
+            SessionActivity::Busy
+        } else if self.uncertain {
+            SessionActivity::Unknown
+        } else {
+            SessionActivity::Idle
+        }
     }
 }
 
@@ -1824,6 +1895,10 @@ done
 
         let initial = adapter.discover_sessions().await.unwrap();
         assert_eq!(initial[0].token_usage.len(), 1);
+        adapter
+            .acknowledge_discovery(rollout_path.to_str().unwrap(), &initial[0].token_usage)
+            .await
+            .unwrap();
         writeln!(
             std::fs::OpenOptions::new()
                 .append(true)
@@ -1855,6 +1930,94 @@ done
             "a growing rollout must emit only records beyond the saved byte offset"
         );
         assert_eq!(appended[0].last_known_token_count, Some(22));
+    }
+
+    // why: cached usage is already durable; unchanged files must not replay their entire history each minute.
+    #[tokio::test]
+    async fn discovery_does_not_replay_unchanged_usage() {
+        let script = FakeAppServerScript::write();
+        let root = tempfile::tempdir().unwrap();
+        write_incremental_rollout(root.path(), "01a0b1b6-f024-7b73-a5fc-a6ea05f0a581");
+        let adapter = CodexAdapter::new(Arc::new(script.transport()))
+            .with_sessions_root(root.path().to_owned());
+        assert_eq!(
+            adapter.discover_sessions().await.unwrap()[0]
+                .token_usage
+                .len(),
+            1
+        );
+        let found = adapter.discover_sessions().await.unwrap();
+        assert_eq!(
+            found[0].token_usage.len(),
+            1,
+            "uncommitted records must be replayed"
+        );
+        adapter
+            .acknowledge_discovery(
+                found[0].state_path.as_deref().unwrap(),
+                &found[0].token_usage,
+            )
+            .await
+            .unwrap();
+        assert!(
+            adapter.discover_sessions().await.unwrap()[0]
+                .token_usage
+                .is_empty()
+        );
+    }
+
+    // why: policy activity scans can observe a replacement between discovery and the database acknowledgement.
+    #[tokio::test]
+    async fn discovery_keeps_new_usage_when_an_old_write_is_acknowledged() {
+        let script = FakeAppServerScript::write();
+        let root = tempfile::tempdir().unwrap();
+        let path = write_incremental_rollout(root.path(), "01a0b1b6-f024-7b73-a5fc-a6ea05f0a581");
+        let adapter = CodexAdapter::new(Arc::new(script.transport()))
+            .with_sessions_root(root.path().to_owned());
+        let old = adapter.discover_sessions().await.unwrap();
+        let replacement = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("23:32:34", "23:32:35");
+        std::fs::write(&path, replacement).unwrap();
+        let new = adapter.discover_sessions().await.unwrap();
+        adapter
+            .acknowledge_discovery(path.to_str().unwrap(), &old[0].token_usage)
+            .await
+            .unwrap();
+        assert_eq!(
+            adapter.discover_sessions().await.unwrap()[0].token_usage,
+            new[0].token_usage
+        );
+        adapter
+            .acknowledge_discovery(path.to_str().unwrap(), &new[0].token_usage)
+            .await
+            .unwrap();
+        assert!(
+            adapter.discover_sessions().await.unwrap()[0]
+                .token_usage
+                .is_empty()
+        );
+    }
+
+    // why: truncation replaces the old prefix; slicing by the previous record count loses new usage.
+    #[tokio::test]
+    async fn discovery_replays_rewritten_rollout_without_losing_usage() {
+        let script = FakeAppServerScript::write();
+        let root = tempfile::tempdir().unwrap();
+        let path = write_incremental_rollout(root.path(), "01a0b1b6-f024-7b73-a5fc-a6ea05f0a581");
+        let adapter = CodexAdapter::new(Arc::new(script.transport()))
+            .with_sessions_root(root.path().to_owned());
+        adapter.discover_sessions().await.unwrap();
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("23:32:34", "23:32:35");
+        std::fs::write(&path, text).unwrap();
+        let rewritten = adapter.discover_sessions().await.unwrap();
+        assert_eq!(rewritten[0].token_usage.len(), 1);
+        assert_eq!(
+            rewritten[0].token_usage[0].at.to_rfc3339(),
+            "2026-09-17T23:32:35+00:00"
+        );
     }
 
     #[tokio::test]

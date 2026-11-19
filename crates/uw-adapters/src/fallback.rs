@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use uw_core::adapter::{
     AdapterError, AdapterResult, Capabilities, DeliveryOutcome, DiscoveredSession, HarnessAdapter,
-    SeedContext, SeedMode, StatusEvent, TurnPreview,
+    SeedContext, SeedMode, StatusEvent, TokenUsageRecord, TurnPreview,
 };
 use uw_core::model::*;
 
@@ -158,6 +158,14 @@ impl HarnessAdapter for FallbackCompactionAdapter {
     ) -> AdapterResult<SessionId> {
         self.native.seed_new_session(mode, seed).await
     }
+    async fn acknowledge_discovery(
+        &self,
+        path: &str,
+        records: &[TokenUsageRecord],
+    ) -> AdapterResult<()> {
+        self.native.acknowledge_discovery(path, records).await
+    }
+
     async fn discover_sessions(&self) -> AdapterResult<Vec<DiscoveredSession>> {
         self.native.discover_sessions().await
     }

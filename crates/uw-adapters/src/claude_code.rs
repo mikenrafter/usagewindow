@@ -16,11 +16,28 @@ use uw_core::model::*;
 pub trait TranscriptFileSystem: Send + Sync {
     async fn jsonl_files(&self) -> AdapterResult<Vec<String>>;
     async fn read_to_string(&self, path: &str) -> AdapterResult<String>;
+    fn incremental(&self) -> bool {
+        false
+    }
     /// Scan one transcript for session discovery. The real file system streams
     /// it line by line; transcripts reach tens of MB and active ones change
     /// every tick, so reading them whole each time inflated the daemon's heap.
     async fn scan(&self, path: &str) -> AdapterResult<Option<DiscoveredSession>> {
         Ok(scan_transcript(path, &self.read_to_string(path).await?))
+    }
+    async fn acknowledge_scan(
+        &self,
+        _path: &str,
+        _records: &[TokenUsageRecord],
+    ) -> AdapterResult<()> {
+        Ok(())
+    }
+    async fn activity(
+        &self,
+        path: &str,
+        id: &SessionId,
+    ) -> AdapterResult<uw_core::activity::SessionActivity> {
+        Ok(transcript_activity(&self.read_to_string(path).await?, id))
     }
     /// Whether one transcript records a quota error; streamed like `scan`.
     async fn has_quota_error(&self, path: &str) -> AdapterResult<bool> {
@@ -28,20 +45,10 @@ pub trait TranscriptFileSystem: Send + Sync {
     }
 }
 
-/// Calls `f` on each line of `path` without holding the whole file.
-fn for_each_line(path: &str, mut f: impl FnMut(&str) -> bool) -> std::io::Result<()> {
-    use std::io::BufRead;
-    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 || !f(line.trim_end_matches(['\n', '\r'])) {
-            return Ok(());
-        }
-    }
+#[derive(Default)]
+pub struct ClaudeTranscriptFileSystem {
+    scans: Arc<Mutex<crate::jsonl::JsonlCache<TranscriptScan>>>,
 }
-
-pub struct ClaudeTranscriptFileSystem;
 
 /// Usage percentage at or above which a transcript quota error is corroborated
 /// by the provider's own reported usage, rather than some unrelated error.
@@ -93,39 +100,43 @@ fn line_has_quota_error(line: &str) -> bool {
         let Ok(record) = serde_json::from_str::<Value>(line) else {
             return false;
         };
-        match record.get("type").and_then(Value::as_str) {
-            Some("error") => {
-                record
+        record_has_quota_error(&record)
+    }
+}
+
+fn record_has_quota_error(record: &Value) -> bool {
+    match record.get("type").and_then(Value::as_str) {
+        Some("error") => {
+            record
+                .get("error")
+                .and_then(|error| error.get("type"))
+                .and_then(Value::as_str)
+                == Some("rate_limit_error")
+                || record
                     .get("error")
-                    .and_then(|error| error.get("type"))
+                    .and_then(|error| error.get("message"))
                     .and_then(Value::as_str)
-                    == Some("rate_limit_error")
-                    || record
-                        .get("error")
-                        .and_then(|error| error.get("message"))
-                        .and_then(Value::as_str)
-                        .is_some_and(quota_limit_text)
-            }
-            Some("assistant")
-                if record.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) =>
-            {
-                record
-                    .get("message")
-                    .and_then(assistant_text)
-                    .is_some_and(|text| quota_limit_text(&text))
-            }
-            Some("system")
-                if record.get("subtype").and_then(Value::as_str) == Some("local_command") =>
-            {
-                record
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .is_some_and(|content| {
-                        content.contains("local-command-stderr") && quota_limit_text(content)
-                    })
-            }
-            _ => false,
+                    .is_some_and(quota_limit_text)
         }
+        Some("assistant")
+            if record.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) =>
+        {
+            record
+                .get("message")
+                .and_then(assistant_text)
+                .is_some_and(|text| quota_limit_text(&text))
+        }
+        Some("system")
+            if record.get("subtype").and_then(Value::as_str) == Some("local_command") =>
+        {
+            record
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| {
+                    content.contains("local-command-stderr") && quota_limit_text(content)
+                })
+        }
+        _ => false,
     }
 }
 
@@ -138,6 +149,9 @@ pub fn filter_keepalive_transcript(content: &str) -> String {
 }
 #[async_trait]
 impl TranscriptFileSystem for ClaudeTranscriptFileSystem {
+    fn incremental(&self) -> bool {
+        true
+    }
     async fn jsonl_files(&self) -> AdapterResult<Vec<String>> {
         let root = std::env::var("HOME").map_err(|e| AdapterError::Other(e.to_string()))?
             + "/.claude/projects";
@@ -160,6 +174,18 @@ impl TranscriptFileSystem for ClaudeTranscriptFileSystem {
                 }
             }
         }
+        let scans = self.scans.clone();
+        let present: std::collections::HashSet<std::path::PathBuf> =
+            out.iter().map(std::path::PathBuf::from).collect();
+        tokio::task::spawn_blocking(move || {
+            scans
+                .lock()
+                .map_err(|e| AdapterError::Other(e.to_string()))?
+                .retain(|path| present.contains(path));
+            Ok::<_, AdapterError>(())
+        })
+        .await
+        .map_err(|e| AdapterError::Other(e.to_string()))??;
         Ok(out)
     }
     async fn read_to_string(&self, path: &str) -> AdapterResult<String> {
@@ -169,25 +195,79 @@ impl TranscriptFileSystem for ClaudeTranscriptFileSystem {
     }
     async fn scan(&self, path: &str) -> AdapterResult<Option<DiscoveredSession>> {
         let path = path.to_owned();
+        let scans = self.scans.clone();
         tokio::task::spawn_blocking(move || {
-            use std::io::BufRead;
-            let file = std::fs::File::open(&path).map_err(|e| AdapterError::Other(e.to_string()))?;
-            let lines = std::io::BufReader::new(file).lines().map_while(Result::ok);
-            Ok(scan_transcript_lines(&path, lines))
+            let mut scans = scans
+                .lock()
+                .map_err(|e| AdapterError::Other(e.to_string()))?;
+            let scan = scans
+                .scan(std::path::Path::new(&path), TranscriptScan::observe)
+                .map_err(|e| AdapterError::Other(e.to_string()))?;
+            Ok(scan.session(&path))
         })
         .await
         .map_err(|e| AdapterError::Other(e.to_string()))?
     }
+    async fn acknowledge_scan(
+        &self,
+        path: &str,
+        records: &[TokenUsageRecord],
+    ) -> AdapterResult<()> {
+        let cache = self.scans.clone();
+        let path = path.to_owned();
+        let records = records.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let mut cache = cache
+                .lock()
+                .map_err(|e| AdapterError::Other(e.to_string()))?;
+            if let Some(scan) = cache.get_mut(std::path::Path::new(&path)) {
+                crate::jsonl::acknowledge_usage(&mut scan.token_usage, &records);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| AdapterError::Other(e.to_string()))?
+    }
+
     async fn has_quota_error(&self, path: &str) -> AdapterResult<bool> {
         let path = path.to_owned();
+        let scans = self.scans.clone();
         tokio::task::spawn_blocking(move || {
-            let mut found = false;
-            for_each_line(&path, |line| {
-                found = line_has_quota_error(line);
-                !found
+            let mut scans = scans
+                .lock()
+                .map_err(|e| AdapterError::Other(e.to_string()))?;
+            Ok(scans
+                .scan(std::path::Path::new(&path), TranscriptScan::observe)
+                .map_err(|e| AdapterError::Other(e.to_string()))?
+                .quota_error)
+        })
+        .await
+        .map_err(|e| AdapterError::Other(e.to_string()))?
+    }
+    async fn activity(
+        &self,
+        path: &str,
+        id: &SessionId,
+    ) -> AdapterResult<uw_core::activity::SessionActivity> {
+        let path = path.to_owned();
+        let id = id.clone();
+        let scans = self.scans.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut scans = scans
+                .lock()
+                .map_err(|e| AdapterError::Other(e.to_string()))?;
+            let scan = scans
+                .scan(std::path::Path::new(&path), TranscriptScan::observe)
+                .map_err(|e| AdapterError::Other(e.to_string()))?;
+            if scan.invalid || scan.record_id.as_deref() != Some(id.0.as_str()) {
+                return Ok(uw_core::activity::SessionActivity::Unknown);
+            }
+            let activity = scan.activity.activity();
+            Ok(if scans.is_complete(std::path::Path::new(&path)) {
+                activity
+            } else {
+                uw_core::activity::SessionActivity::Unknown
             })
-            .map_err(|e| AdapterError::Other(e.to_string()))?;
-            Ok(found)
         })
         .await
         .map_err(|e| AdapterError::Other(e.to_string()))?
@@ -424,7 +504,7 @@ impl ClaudeCodeAdapter {
             hook: None,
             messenger: None,
             spawner: Arc::new(crate::process::TokioProcessSpawner),
-            transcript_fs: Arc::new(ClaudeTranscriptFileSystem),
+            transcript_fs: Arc::new(ClaudeTranscriptFileSystem::default()),
             discovery_cache: Mutex::new(HashMap::new()),
             known_ids: Mutex::new(HashMap::new()),
             auth_status: Arc::new(ClaudeCliAuthStatusReader),
@@ -796,13 +876,11 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         {
             return Ok(SessionActivity::Unknown);
         }
-        let Ok(content) = self.transcript_fs.read_to_string(&path).await else {
-            return Ok(SessionActivity::Unknown);
-        };
-        let id = session.id.clone();
-        tokio::task::spawn_blocking(move || transcript_activity(&content, &id))
+        Ok(self
+            .transcript_fs
+            .activity(&path, &session.id)
             .await
-            .map_err(|error| AdapterError::Other(error.to_string()))
+            .unwrap_or(uw_core::activity::SessionActivity::Unknown))
     }
 
     async fn export_transcript(&self, session: &SessionSummary) -> AdapterResult<String> {
@@ -811,6 +889,23 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             matching.push(self.transcript_fs.read_to_string(&path).await?);
         }
         Ok(filter_keepalive_transcript(&matching.join("\n")))
+    }
+
+    async fn acknowledge_discovery(
+        &self,
+        path: &str,
+        records: &[TokenUsageRecord],
+    ) -> AdapterResult<()> {
+        self.transcript_fs.acknowledge_scan(path, records).await?;
+        if let Some(cached) = self
+            .discovery_cache
+            .lock()
+            .map_err(|e| AdapterError::Other(e.to_string()))?
+            .get_mut(path)
+        {
+            crate::jsonl::acknowledge_usage(&mut cached.session.token_usage, records);
+        }
+        Ok(())
     }
 
     async fn discover_sessions(&self) -> AdapterResult<Vec<DiscoveredSession>> {
@@ -832,7 +927,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
                 .await
                 .ok()
                 .map(|metadata| (metadata.len(), metadata.modified().ok()));
-            if let Some(fingerprint) = fingerprint {
+            if let Some(fingerprint) = fingerprint.filter(|_| !self.transcript_fs.incremental()) {
                 let cached = self
                     .discovery_cache
                     .lock()
@@ -850,7 +945,8 @@ impl HarnessAdapter for ClaudeCodeAdapter {
                     .lock()
                     .map_err(|_| AdapterError::Other("session id map poisoned".into()))?
                     .insert(path.clone(), session.id.clone());
-                if let Some(fingerprint) = fingerprint {
+                if let Some(fingerprint) = fingerprint.filter(|_| !self.transcript_fs.incremental())
+                {
                     self.discovery_cache
                         .lock()
                         .map_err(|_| AdapterError::Other("discovery cache poisoned".into()))?
@@ -877,26 +973,38 @@ fn scan_transcript_lines<S: AsRef<str>>(
     path: &str,
     lines: impl Iterator<Item = S>,
 ) -> Option<DiscoveredSession> {
-    let filename_id = std::path::Path::new(path)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .filter(|stem| uuid::Uuid::parse_str(stem).is_ok())
-        .map(str::to_owned);
-    let mut record_id: Option<String> = None;
-    let mut cwd = None;
-    let mut model = None;
-    let mut context_window_size = None;
-    let mut extended_context_model = false;
-    let mut first_seen = None;
-    let mut last_seen = None;
-    let mut last_known_token_count = None;
-    let mut token_usage = Vec::new();
-    let mut title = None;
-
+    let mut scan = TranscriptScan::default();
     for line in lines {
-        let line = line.as_ref();
+        scan.observe(line.as_ref());
+    }
+    scan.session(path)
+}
+
+#[derive(Default)]
+struct TranscriptScan {
+    invalid: bool,
+    activity: ActivityScan,
+    quota_error: bool,
+    record_id: Option<String>,
+    cwd: Option<String>,
+    model: Option<ModelId>,
+    context_window_size: Option<u64>,
+    extended_context_model: bool,
+    first_seen: Option<DateTime<Utc>>,
+    last_seen: Option<DateTime<Utc>>,
+    last_known_token_count: Option<u64>,
+    token_usage: Vec<TokenUsageRecord>,
+    title: Option<String>,
+}
+
+impl TranscriptScan {
+    fn observe(&mut self, line: &str) {
+        if self.invalid {
+            return;
+        }
         let Ok(record) = serde_json::from_str::<Value>(line) else {
-            continue;
+            self.activity.invalid = true;
+            return;
         };
         if let Some(candidate) = record
             .get("sessionId")
@@ -904,19 +1012,29 @@ fn scan_transcript_lines<S: AsRef<str>>(
             .and_then(Value::as_str)
             .filter(|value| uuid::Uuid::parse_str(value).is_ok())
         {
-            if record_id.as_deref().is_some_and(|known| known != candidate) {
-                return None;
+            if self
+                .record_id
+                .as_deref()
+                .is_some_and(|known| known != candidate)
+            {
+                self.invalid = true;
+                return;
             }
-            record_id.get_or_insert_with(|| candidate.to_owned());
+            self.record_id.get_or_insert_with(|| candidate.to_owned());
         }
-        if cwd.is_none() {
-            cwd = record.get("cwd").and_then(Value::as_str).map(str::to_owned);
+        self.activity.observe_record(
+            &record,
+            &SessionId(self.record_id.clone().unwrap_or_default()),
+        );
+        self.quota_error |= record_has_quota_error(&record);
+        if self.cwd.is_none() {
+            self.cwd = record.get("cwd").and_then(Value::as_str).map(str::to_owned);
         }
         if record.get("type").and_then(Value::as_str) == Some("ai-title")
             && let Some(value) = record.get("aiTitle").and_then(Value::as_str)
             && !value.is_empty()
         {
-            title = Some(value.to_owned());
+            self.title = Some(value.to_owned());
         }
         let timestamp = record
             .get("timestamp")
@@ -924,18 +1042,18 @@ fn scan_transcript_lines<S: AsRef<str>>(
             .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
             .map(|value| value.with_timezone(&Utc));
         if let Some(at) = timestamp {
-            first_seen.get_or_insert(at);
-            last_seen = Some(at);
+            self.first_seen.get_or_insert(at);
+            self.last_seen = Some(at);
         }
         if let Some(value) = record.pointer("/message/model").and_then(Value::as_str) {
-            extended_context_model |= value.to_ascii_lowercase().contains("[1m]");
-            model = Some(ModelId(value.to_owned()));
+            self.extended_context_model |= value.to_ascii_lowercase().contains("[1m]");
+            self.model = Some(ModelId(value.to_owned()));
         }
         if let Some(value) = record
             .pointer("/message/model_context_window")
             .and_then(Value::as_u64)
         {
-            context_window_size = Some(value);
+            self.context_window_size = Some(value);
         }
         if let Some(value) = record
             .pointer("/message/usage/input_tokens")
@@ -955,19 +1073,20 @@ fn scan_transcript_lines<S: AsRef<str>>(
                 .unwrap_or_default();
             let total_input = value.saturating_add(cache_read).saturating_add(cache_write);
             let total = total_input.saturating_add(output);
-            let Some(at) = timestamp else { continue };
+            let Some(at) = timestamp else { return };
             // Claude/T3Code can silently promote a session selected as 200k to
             // the 1M context tier. In that path the transcript may omit both
             // the `[1m]` model suffix and `model_context_window`; a token
             // observation above 200k is nevertheless definitive evidence that
             // the effective window was promoted.
             if total > 200_000 {
-                context_window_size = Some(context_window_size.unwrap_or(200_000).max(1_000_000));
+                self.context_window_size =
+                    Some(self.context_window_size.unwrap_or(200_000).max(1_000_000));
             }
-            last_known_token_count = Some(total);
-            token_usage.push(TokenUsageRecord {
+            self.last_known_token_count = Some(total);
+            self.token_usage.push(TokenUsageRecord {
                 at,
-                model: model.clone(),
+                model: self.model.clone(),
                 input_tokens: total_input,
                 cached_input_tokens: cache_read,
                 cache_write_input_tokens: cache_write,
@@ -978,36 +1097,45 @@ fn scan_transcript_lines<S: AsRef<str>>(
             });
         }
     }
-
-    if filename_id
-        .as_deref()
-        .zip(record_id.as_deref())
-        .is_some_and(|(filename, record)| filename != record)
-    {
-        return None;
-    }
-    let id = filename_id.or(record_id)?;
-    let context_window_size = context_window_size.or({
-        Some(if extended_context_model {
-            1_000_000
-        } else {
-            200_000
+    fn session(&self, path: &str) -> Option<DiscoveredSession> {
+        if self.invalid {
+            return None;
+        }
+        let filename_id = std::path::Path::new(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| uuid::Uuid::parse_str(s).is_ok())
+            .map(str::to_owned);
+        if filename_id
+            .as_deref()
+            .zip(self.record_id.as_deref())
+            .is_some_and(|(filename, record)| filename != record)
+        {
+            return None;
+        }
+        let id = filename_id.or(self.record_id.clone())?;
+        let context_window_size = self.context_window_size.or({
+            Some(if self.extended_context_model {
+                1_000_000
+            } else {
+                200_000
+            })
+        });
+        Some(DiscoveredSession {
+            id: SessionId(id),
+            lineage: SessionLineage::default(),
+            cwd: self.cwd.clone().unwrap_or_else(|| ".".into()),
+            model: self.model.clone(),
+            context_window_size,
+            last_known_token_count: self.last_known_token_count,
+            last_known_context_pct: None,
+            first_seen: self.first_seen,
+            last_seen: self.last_seen,
+            state_path: Some(path.to_owned()),
+            token_usage: self.token_usage.clone(),
+            title: self.title.clone(),
         })
-    });
-    Some(DiscoveredSession {
-        id: SessionId(id),
-        lineage: SessionLineage::default(),
-        cwd: cwd.unwrap_or_else(|| ".".into()),
-        model,
-        context_window_size,
-        last_known_token_count,
-        last_known_context_pct: None,
-        first_seen,
-        last_seen,
-        state_path: Some(path.to_owned()),
-        token_usage,
-        title,
-    })
+    }
 }
 
 fn validate_session_owner(session: &SessionSummary) -> AdapterResult<()> {
@@ -1029,62 +1157,84 @@ pub fn transcript_activity(
     content: &str,
     session_id: &SessionId,
 ) -> uw_core::activity::SessionActivity {
-    use uw_core::activity::{ActivityEvent, ActivityTracker, SessionActivity};
-    let mut tracker = ActivityTracker::default();
-    let mut calls = HashMap::<String, String>::new();
-    let mut finished = std::collections::HashSet::new();
-    let mut identified = false;
-    let mut notification_turn = false;
+    let mut scan = ActivityScan::default();
     for line in content.lines().filter(|line| !line.trim().is_empty()) {
+        scan.observe(line, session_id);
+    }
+    scan.activity()
+}
+
+#[derive(Default)]
+struct ActivityScan {
+    tracker: uw_core::activity::ActivityTracker,
+    calls: HashMap<String, String>,
+    finished: std::collections::HashSet<String>,
+    identified: bool,
+    notification_turn: bool,
+    invalid: bool,
+}
+impl ActivityScan {
+    fn observe(&mut self, line: &str, session_id: &SessionId) {
         let Ok(record) = serde_json::from_str::<Value>(line) else {
-            return SessionActivity::Unknown;
+            self.invalid = true;
+            return;
         };
+        self.observe_record(&record, session_id);
+    }
+    fn observe_record(&mut self, record: &Value, session_id: &SessionId) {
+        use uw_core::activity::ActivityEvent;
+        if self.invalid {
+            return;
+        }
         if record.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-            continue;
+            return;
         }
         if let Some(id) = record.get("sessionId").and_then(Value::as_str) {
             if id != session_id.0 {
-                return SessionActivity::Unknown;
+                self.invalid = true;
+                return;
             }
-            identified = true;
+            self.identified = true;
         }
         let kind = record.get("type").and_then(Value::as_str);
         if kind == Some("system")
             && record.get("subtype").and_then(Value::as_str) == Some("turn_duration")
         {
-            notification_turn = false;
+            self.notification_turn = false;
         }
         if !matches!(kind, Some("assistant" | "user")) {
-            continue;
+            return;
         }
         let Some(content) = record.pointer("/message/content") else {
-            return SessionActivity::Unknown;
+            self.invalid = true;
+            return;
         };
         if kind == Some("user")
             && let Some(text) = content.as_str()
         {
             let text = text.trim();
             if text.starts_with("<task-notification>") && text.ends_with("</task-notification>") {
-                notification_turn = true;
+                self.notification_turn = true;
                 let terminal = ["completed", "failed", "stopped"]
                     .iter()
                     .any(|status| text.contains(&format!("<status>{status}</status>")));
                 if terminal {
                     for part in text.split("<task-id>").skip(1) {
                         if let Some((id, _)) = part.split_once("</task-id>") {
-                            tracker
+                            self.tracker
                                 .observe(ActivityEvent::BackgroundFinished(id.trim().to_owned()));
                         }
                     }
                 }
             }
-            continue;
+            return;
         }
         let Some(parts) = content.as_array() else {
             if content.is_string() {
-                continue;
+                return;
             }
-            return SessionActivity::Unknown;
+            self.invalid = true;
+            return;
         };
         for part in parts {
             match (kind, part.get("type").and_then(Value::as_str)) {
@@ -1093,31 +1243,36 @@ pub fn transcript_activity(
                         part.get("id").and_then(Value::as_str),
                         part.get("name").and_then(Value::as_str),
                     ) else {
-                        return SessionActivity::Unknown;
+                        self.invalid = true;
+                        return;
                     };
-                    calls
+                    self.calls
                         .entry(id.to_owned())
                         .or_insert_with(|| name.to_owned());
-                    if !finished.contains(id) {
-                        tracker.observe(ActivityEvent::ToolStarted(id.to_owned()));
+                    if !self.finished.contains(id) {
+                        self.tracker
+                            .observe(ActivityEvent::ToolStarted(id.to_owned()));
                     }
                 }
                 (Some("user"), Some("tool_result")) => {
                     let Some(id) = part.get("tool_use_id").and_then(Value::as_str) else {
-                        return SessionActivity::Unknown;
+                        self.invalid = true;
+                        return;
                     };
-                    if !calls.contains_key(id) {
-                        return SessionActivity::Unknown;
+                    if !self.calls.contains_key(id) {
+                        self.invalid = true;
+                        return;
                     }
-                    if !finished.insert(id.to_owned()) {
+                    if !self.finished.insert(id.to_owned()) {
                         continue;
                     }
-                    tracker.observe(ActivityEvent::ToolFinished(id.to_owned()));
+                    self.tracker
+                        .observe(ActivityEvent::ToolFinished(id.to_owned()));
                     if part.get("is_error").and_then(Value::as_bool) == Some(true) {
                         continue;
                     }
                     if let Some(text) = part.get("content").and_then(Value::as_str) {
-                        let task = match calls.get(id).map(String::as_str) {
+                        let task = match self.calls.get(id).map(String::as_str) {
                             Some("Bash") => text
                                 .strip_prefix("Command running in background with ID: ")
                                 .and_then(|rest| {
@@ -1134,7 +1289,8 @@ pub fn transcript_activity(
                         if let Some(task) = task
                             .filter(|task| !task.is_empty() && !task.contains(char::is_whitespace))
                         {
-                            tracker.observe(ActivityEvent::BackgroundStarted(task.to_owned()));
+                            self.tracker
+                                .observe(ActivityEvent::BackgroundStarted(task.to_owned()));
                         }
                     }
                 }
@@ -1142,12 +1298,15 @@ pub fn transcript_activity(
             }
         }
     }
-    if !identified {
-        SessionActivity::Unknown
-    } else if notification_turn {
-        SessionActivity::Busy
-    } else {
-        tracker.activity()
+    fn activity(&self) -> uw_core::activity::SessionActivity {
+        use uw_core::activity::SessionActivity;
+        if self.invalid || !self.identified {
+            SessionActivity::Unknown
+        } else if self.notification_turn {
+            SessionActivity::Busy
+        } else {
+            self.tracker.activity()
+        }
     }
 }
 
@@ -2053,13 +2212,54 @@ mod tests {
         );
         std::fs::write(&path, &content).unwrap();
         let path = path.to_string_lossy().into_owned();
-        let fs = ClaudeTranscriptFileSystem;
-        assert_eq!(fs.scan(&path).await.unwrap(), scan_transcript(&path, &content));
+        let fs = ClaudeTranscriptFileSystem::default();
+        assert_eq!(
+            fs.scan(&path).await.unwrap(),
+            scan_transcript(&path, &content)
+        );
         assert!(fs.scan(&path).await.unwrap().is_some());
         assert!(fs.has_quota_error(&path).await.unwrap());
         std::fs::write(&path, content.replace("spend limit", "nothing")).unwrap();
         assert!(!fs.has_quota_error(&path).await.unwrap());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // why: the production filesystem must emit each append once, without retaining or replaying old usage.
+    #[tokio::test]
+    async fn discovery_reads_only_new_claude_usage() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b40";
+        let path = dir.path().join(format!("{id}.jsonl"));
+        let line = |second, tokens| {
+            format!(
+                r#"{{"sessionId":"{id}","timestamp":"2026-09-17T23:32:{second}Z","message":{{"model":"sonnet","usage":{{"input_tokens":{tokens},"output_tokens":2}}}}}}"#
+            )
+        };
+        std::fs::write(&path, line("34", 10) + "\n").unwrap();
+        let fs = ClaudeTranscriptFileSystem::default();
+        let path = path.to_str().unwrap();
+        assert_eq!(
+            fs.scan(path).await.unwrap().unwrap().token_usage[0].total_tokens,
+            12
+        );
+        assert_eq!(
+            fs.scan(path).await.unwrap().unwrap().token_usage.len(),
+            1,
+            "uncommitted records must be replayed"
+        );
+        let pending = fs.scan(path).await.unwrap().unwrap().token_usage;
+        fs.acknowledge_scan(path, &pending).await.unwrap();
+        assert!(fs.scan(path).await.unwrap().unwrap().token_usage.is_empty());
+        writeln!(
+            std::fs::OpenOptions::new().append(true).open(path).unwrap(),
+            "{}",
+            line("35", 20)
+        )
+        .unwrap();
+        let appended = fs.scan(path).await.unwrap().unwrap();
+        assert_eq!(appended.token_usage.len(), 1);
+        assert_eq!(appended.token_usage[0].total_tokens, 22);
     }
 
     #[tokio::test]
