@@ -25,6 +25,8 @@ struct Assets;
 #[derive(Clone)]
 pub struct AppState {
     store: Arc<Mutex<Store>>,
+    status_store: SharedStore,
+    warming: Arc<std::sync::atomic::AtomicBool>,
     adapters: Arc<HashMap<Provider, Arc<dyn HarnessAdapter>>>,
     auth: Arc<WebAuth>,
 }
@@ -144,6 +146,33 @@ pub fn app_with_shared_store_and_auth(
     adapters: HashMap<Provider, Arc<dyn HarnessAdapter>>,
     password_hash: Option<String>,
 ) -> anyhow::Result<Router> {
+    app_with_runtime(
+        store,
+        adapters,
+        password_hash,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+}
+
+pub fn app_with_runtime(
+    store: SharedStore,
+    adapters: HashMap<Provider, Arc<dyn HarnessAdapter>>,
+    password_hash: Option<String>,
+    warming: Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<Router> {
+    let status_store = {
+        let locked = store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("store lock poisoned"))?;
+        locked
+            .connection()
+            .path()
+            .filter(|path| !path.is_empty())
+            .map(Store::open_read_only)
+            .transpose()?
+            .map(|reader| Arc::new(Mutex::new(reader)))
+            .unwrap_or_else(|| store.clone())
+    };
     let auth = Arc::new(WebAuth::new(password_hash)?);
     let protected = Router::new()
         .route("/api/status", get(status))
@@ -182,6 +211,8 @@ pub fn app_with_shared_store_and_auth(
         .fallback(static_asset)
         .with_state(AppState {
             store,
+            status_store,
+            warming,
             adapters: Arc::new(adapters),
             auth,
         }))
@@ -550,12 +581,14 @@ fn status_marker_thresholds(store: &Store, provider: &Provider) -> anyhow::Resul
 }
 
 async fn status(
-    State(state): State<AppState>,
+    State(mut state): State<AppState>,
     Query(query): Query<StatusQuery>,
 ) -> Result<Json<StatusResponse>, (StatusCode, String)> {
     let provider: Option<Provider> = query.provider.and_then(|p| p.parse().ok());
     let model = query.model.map(ModelId);
     let account = query.account.map(AccountId);
+    let warming = state.warming.load(std::sync::atomic::Ordering::Acquire);
+    state.store = state.status_store.clone();
     let value = read(state, move |store| {
         let all_samples = store.all_usage_samples()?;
         let sessions = store.list_sessions()?;
@@ -585,7 +618,7 @@ async fn status(
         let session_activity = sessions
             .iter()
             .map(|session| {
-                let records = store.token_usage_for_session(&session.id)?;
+                let records = store.token_usage_for_session_since(&session.id, now - Duration::hours(24))?;
                 let active = session.stopped_reason.is_none()
                     && uw_core::model::session_has_recent_token_activity(&records, now);
                 let activity = records
@@ -722,6 +755,7 @@ async fn status(
             ProviderUsageSummary { provider, account, plan, windows }
         }).collect();
         Ok(StatusResponse {
+            warming,
             usage,
             last_updated: now,
             provider_status: store.fetch_statuses()?,
@@ -1541,6 +1575,57 @@ mod tests {
             superseded_by: None,
             reseeded_from: None,
         }
+    }
+
+    // why: startup discovery and policy writes must not hold status requests; callers need the stored snapshot and readiness.
+    #[tokio::test]
+    async fn status_reads_stored_usage_while_writer_is_locked_and_reports_warming() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("usage.db").to_str().unwrap()).unwrap();
+        let writer = Arc::new(Mutex::new(store));
+        let warming = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let router =
+            app_with_runtime(writer.clone(), HashMap::new(), None, warming.clone()).unwrap();
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holding = std::thread::spawn(move || {
+            let _lock = writer.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.await.unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            router
+                .clone()
+                .oneshot(Request::get("/api/status").body(Body::empty()).unwrap()),
+        )
+        .await;
+        release_tx.send(()).unwrap();
+        holding.join().unwrap();
+        let response = response
+            .expect("status must use its independent WAL reader")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: StatusResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(value.warming);
+        assert_eq!(value.usage, vec![]);
+        warming.store(false, std::sync::atomic::Ordering::Release);
+        let response = router
+            .oneshot(Request::get("/api/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !serde_json::from_slice::<StatusResponse>(&bytes)
+                .unwrap()
+                .warming
+        );
     }
 
     #[tokio::test]

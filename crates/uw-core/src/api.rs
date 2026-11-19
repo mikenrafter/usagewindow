@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StatusResponse {
+    #[serde(default)]
+    pub warming: bool,
     pub usage: Vec<ProviderUsageSummary>,
     pub last_updated: DateTime<Utc>,
     pub provider_status: Vec<ProviderFetchStatus>,
@@ -197,6 +199,7 @@ mod tests {
     #[test]
     fn status_round_trips() {
         round_trip(StatusResponse {
+            warming: false,
             usage: vec![ProviderUsageSummary {
                 provider: Provider::Codex,
                 account: Some(AccountId("a".into())),

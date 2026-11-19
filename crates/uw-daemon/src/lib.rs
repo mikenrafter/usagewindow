@@ -2682,6 +2682,23 @@ pub async fn run_production_ticks(
     liveness: &dyn SessionLivenessChecker,
     interval: std::time::Duration,
 ) -> anyhow::Result<()> {
+    run_production_ticks_with_readiness(
+        store,
+        adapters,
+        liveness,
+        interval,
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    )
+    .await
+}
+
+async fn run_production_ticks_with_readiness(
+    store: Arc<SqliteDaemonStore>,
+    adapters: &HashMap<Provider, Arc<dyn HarnessAdapter>>,
+    liveness: &dyn SessionLivenessChecker,
+    interval: std::time::Duration,
+    warming: Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<()> {
     let interval = interval.max(StdDuration::from_millis(1));
     let mut policy_state = PolicyRuntimeState::default();
     let auto_reseed = auto_reseed_runtime_from_env();
@@ -2785,7 +2802,10 @@ pub async fn run_production_ticks(
                         Some(Ok((id, (provider, result)))) => {
                             task_providers.remove(&id);
                             if let Some(provider) = &provider { usage_running.remove(provider); }
-                            else { full_running = false; last_observation = Instant::now(); refresh_policy = true; }
+                            else {
+                                full_running = false; last_observation = Instant::now(); refresh_policy = true;
+                                if result.is_ok() { warming.store(false, std::sync::atomic::Ordering::Release); }
+                            }
                             if let Err(error) = result { tracing::error!(%error, "observation task failed"); }
                         }
                         Some(Err(error)) => {
@@ -3175,12 +3195,12 @@ fn with_compaction_fallback(
 /// configuration (SQLite path and adapter registry) is intentionally still a later
 /// wiring concern; this preserves the same cadence/ownership point for Phase 7.
 pub async fn run_daemon_loop() -> anyhow::Result<()> {
-    let local = local_api::LocalApi::bind()?;
     let path = std::env::var("UW_DB_PATH").unwrap_or_else(|_| {
         let home = std::env::var("HOME").unwrap_or_default();
         format!("{home}/.usagewindow/usagewindow.db")
     });
-    let store = Store::open(&path)?;
+    let db_path = path.clone();
+    let store = tokio::task::spawn_blocking(move || Store::open(&db_path)).await??;
     let daemon_store = Arc::new(SqliteDaemonStore::new(store));
     let cache_path = std::env::var("UW_CLAUDE_CACHE_PATH")
         .unwrap_or_else(|_| format!("{path}.claude-usage-cache.json"));
@@ -3289,16 +3309,28 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
         Err(error) => return Err(error.into()),
     };
     // CLAIM(local-api-boundary): only the private Unix listener skips login [local_api integration test].
-    let local_app = uw_web::app_with_shared_store(shared_store.clone(), adapters.clone());
-    let web_app = uw_web::app_with_shared_store_and_auth(shared_store, adapters.clone(), web_password_hash)?;
+    let warming = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let local_app = uw_web::app_with_runtime(
+        shared_store.clone(),
+        adapters.clone(),
+        None,
+        warming.clone(),
+    )?;
+    let web_app = uw_web::app_with_runtime(
+        shared_store,
+        adapters.clone(),
+        web_password_hash,
+        warming.clone(),
+    )?;
     let address = std::env::var("UW_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".into());
     let tcp = tokio::net::TcpListener::bind(address).await?;
+    let local = local_api::LocalApi::bind()?;
     local.publish(tcp.local_addr()?)?;
     tracing::info!(web_address = %tcp.local_addr()?, socket = %local.socket_path.display(), "usagewindow listening");
     tokio::select! {
         result = axum::serve(tcp, web_app) => result.map_err(Into::into),
         result = axum::serve(local.listener, local_app) => result.map_err(Into::into),
-        result = run_production_ticks(daemon_store, &adapters, &liveness, std::time::Duration::from_secs(60)) => result,
+        result = run_production_ticks_with_readiness(daemon_store, &adapters, &liveness, std::time::Duration::from_secs(60), warming) => result,
     }
 }
 

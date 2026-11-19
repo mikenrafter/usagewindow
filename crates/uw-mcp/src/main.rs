@@ -145,6 +145,7 @@ fn get_usage(args: &Value, deps: &Deps) -> Result<Value, String> {
         })
         .collect();
     serde_json::to_value(StatusResponse {
+        warming: false,
         usage,
         last_updated: Utc::now(),
         provider_status: store.fetch_statuses().map_err(|e| e.to_string())?,

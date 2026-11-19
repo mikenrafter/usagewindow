@@ -638,6 +638,7 @@ impl DirectReader for StoreReader {
             })
             .collect();
         Ok(StatusResponse {
+            warming: false,
             usage,
             last_updated: Utc::now(),
             provider_status: self.store.fetch_statuses()?,
@@ -756,6 +757,7 @@ mod tests {
                 Err(anyhow!("down"))
             } else {
                 Ok(StatusResponse {
+                    warming: false,
                     usage: vec![],
                     last_updated: Utc::now(),
                     provider_status: vec![],
@@ -827,6 +829,7 @@ mod tests {
     impl DirectReader for Direct {
         fn status(&mut self, _: &StatusArgs) -> Result<StatusResponse> {
             Ok(StatusResponse {
+                warming: false,
                 usage: vec![],
                 last_updated: Utc::now(),
                 provider_status: vec![],
@@ -901,6 +904,7 @@ mod tests {
             "/api/status",
             axum::routing::get(|| async {
                 axum::Json(StatusResponse {
+                    warming: false,
                     usage: vec![],
                     last_updated: Utc::now(),
                     provider_status: vec![],
