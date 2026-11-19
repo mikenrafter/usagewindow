@@ -16,6 +16,29 @@ use uw_core::model::*;
 pub trait TranscriptFileSystem: Send + Sync {
     async fn jsonl_files(&self) -> AdapterResult<Vec<String>>;
     async fn read_to_string(&self, path: &str) -> AdapterResult<String>;
+    /// Scan one transcript for session discovery. The real file system streams
+    /// it line by line; transcripts reach tens of MB and active ones change
+    /// every tick, so reading them whole each time inflated the daemon's heap.
+    async fn scan(&self, path: &str) -> AdapterResult<Option<DiscoveredSession>> {
+        Ok(scan_transcript(path, &self.read_to_string(path).await?))
+    }
+    /// Whether one transcript records a quota error; streamed like `scan`.
+    async fn has_quota_error(&self, path: &str) -> AdapterResult<bool> {
+        Ok(transcript_has_quota_error(&self.read_to_string(path).await?))
+    }
+}
+
+/// Calls `f` on each line of `path` without holding the whole file.
+fn for_each_line(path: &str, mut f: impl FnMut(&str) -> bool) -> std::io::Result<()> {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 || !f(line.trim_end_matches(['\n', '\r'])) {
+            return Ok(());
+        }
+    }
 }
 
 pub struct ClaudeTranscriptFileSystem;
@@ -62,7 +85,11 @@ fn assistant_text(message: &Value) -> Option<String> {
 /// - legacy `type:"error"` / `error.type:"rate_limit_error"` if a future
 ///   Claude release emits it
 fn transcript_has_quota_error(content: &str) -> bool {
-    content.lines().any(|line| {
+    content.lines().any(line_has_quota_error)
+}
+
+fn line_has_quota_error(line: &str) -> bool {
+    {
         let Ok(record) = serde_json::from_str::<Value>(line) else {
             return false;
         };
@@ -99,7 +126,7 @@ fn transcript_has_quota_error(content: &str) -> bool {
             }
             _ => false,
         }
-    })
+    }
 }
 
 pub fn filter_keepalive_transcript(content: &str) -> String {
@@ -139,6 +166,31 @@ impl TranscriptFileSystem for ClaudeTranscriptFileSystem {
         tokio::fs::read_to_string(path)
             .await
             .map_err(|e| AdapterError::Other(e.to_string()))
+    }
+    async fn scan(&self, path: &str) -> AdapterResult<Option<DiscoveredSession>> {
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            use std::io::BufRead;
+            let file = std::fs::File::open(&path).map_err(|e| AdapterError::Other(e.to_string()))?;
+            let lines = std::io::BufReader::new(file).lines().map_while(Result::ok);
+            Ok(scan_transcript_lines(&path, lines))
+        })
+        .await
+        .map_err(|e| AdapterError::Other(e.to_string()))?
+    }
+    async fn has_quota_error(&self, path: &str) -> AdapterResult<bool> {
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut found = false;
+            for_each_line(&path, |line| {
+                found = line_has_quota_error(line);
+                !found
+            })
+            .map_err(|e| AdapterError::Other(e.to_string()))?;
+            Ok(found)
+        })
+        .await
+        .map_err(|e| AdapterError::Other(e.to_string()))?
     }
 }
 
@@ -335,6 +387,10 @@ pub struct ClaudeCodeAdapter {
     spawner: Arc<dyn ProcessSpawner>,
     transcript_fs: Arc<dyn TranscriptFileSystem>,
     discovery_cache: Mutex<HashMap<String, CachedTranscript>>,
+    /// Transcript path to the session id its records carry, from discovery.
+    /// Kept apart from the cache because a file without readable metadata is
+    /// scanned but not cached.
+    known_ids: Mutex<HashMap<String, SessionId>>,
     auth_status: Arc<dyn AuthStatusReader>,
 }
 
@@ -370,6 +426,7 @@ impl ClaudeCodeAdapter {
             spawner: Arc::new(crate::process::TokioProcessSpawner),
             transcript_fs: Arc::new(ClaudeTranscriptFileSystem),
             discovery_cache: Mutex::new(HashMap::new()),
+            known_ids: Mutex::new(HashMap::new()),
             auth_status: Arc::new(ClaudeCliAuthStatusReader),
         }
     }
@@ -482,13 +539,25 @@ impl ClaudeCodeAdapter {
     }
 }
 impl ClaudeCodeAdapter {
+    /// Transcripts that belong to `session_id`: named after it (the main
+    /// file, or a subagent directory under it), or found by discovery to carry
+    /// its id in their records. This used to read every transcript on the
+    /// machine (2.6 GB on one host) per warm session per tick.
+    fn session_paths(&self, session_id: &SessionId, paths: Vec<String>) -> AdapterResult<Vec<String>> {
+        let known = self
+            .known_ids
+            .lock()
+            .map_err(|_| AdapterError::Other("session id map poisoned".into()))?;
+        Ok(paths
+            .into_iter()
+            .filter(|path| path.contains(&session_id.0) || known.get(path) == Some(session_id))
+            .collect())
+    }
+
     async fn has_quota_error_evidence(&self, session_id: &SessionId) -> AdapterResult<bool> {
-        for path in self.transcript_fs.jsonl_files().await? {
-            let content = self.transcript_fs.read_to_string(&path).await?;
-            if !path.contains(&session_id.0) && !content.contains(&session_id.0) {
-                continue;
-            }
-            if transcript_has_quota_error(&content) {
+        let paths = self.session_paths(session_id, self.transcript_fs.jsonl_files().await?)?;
+        for path in paths {
+            if self.transcript_fs.has_quota_error(&path).await? {
                 return Ok(true);
             }
         }
@@ -738,18 +807,27 @@ impl HarnessAdapter for ClaudeCodeAdapter {
 
     async fn export_transcript(&self, session: &SessionSummary) -> AdapterResult<String> {
         let mut matching = Vec::new();
-        for path in self.transcript_fs.jsonl_files().await? {
-            let content = self.transcript_fs.read_to_string(&path).await?;
-            if path.contains(&session.id.0) || content.contains(&session.id.0) {
-                matching.push(content);
-            }
+        for path in self.session_paths(&session.id, self.transcript_fs.jsonl_files().await?)? {
+            matching.push(self.transcript_fs.read_to_string(&path).await?);
         }
         Ok(filter_keepalive_transcript(&matching.join("\n")))
     }
 
     async fn discover_sessions(&self) -> AdapterResult<Vec<DiscoveredSession>> {
         let mut discovered = Vec::new();
-        for path in self.transcript_fs.jsonl_files().await? {
+        let paths = self.transcript_fs.jsonl_files().await?;
+        let present: std::collections::HashSet<&str> = paths.iter().map(String::as_str).collect();
+        // Forget transcripts that no longer exist, so the cache tracks the
+        // directory instead of every file it ever saw.
+        self.discovery_cache
+            .lock()
+            .map_err(|_| AdapterError::Other("discovery cache poisoned".into()))?
+            .retain(|path, _| present.contains(path.as_str()));
+        self.known_ids
+            .lock()
+            .map_err(|_| AdapterError::Other("session id map poisoned".into()))?
+            .retain(|path, _| present.contains(path.as_str()));
+        for path in paths {
             let fingerprint = tokio::fs::metadata(&path)
                 .await
                 .ok()
@@ -767,8 +845,11 @@ impl HarnessAdapter for ClaudeCodeAdapter {
                     continue;
                 }
             }
-            let content = self.transcript_fs.read_to_string(&path).await?;
-            if let Some(session) = scan_transcript(&path, &content) {
+            if let Some(session) = self.transcript_fs.scan(&path).await? {
+                self.known_ids
+                    .lock()
+                    .map_err(|_| AdapterError::Other("session id map poisoned".into()))?
+                    .insert(path.clone(), session.id.clone());
                 if let Some(fingerprint) = fingerprint {
                     self.discovery_cache
                         .lock()
@@ -789,6 +870,13 @@ impl HarnessAdapter for ClaudeCodeAdapter {
 }
 
 fn scan_transcript(path: &str, content: &str) -> Option<DiscoveredSession> {
+    scan_transcript_lines(path, content.lines())
+}
+
+fn scan_transcript_lines<S: AsRef<str>>(
+    path: &str,
+    lines: impl Iterator<Item = S>,
+) -> Option<DiscoveredSession> {
     let filename_id = std::path::Path::new(path)
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -805,7 +893,8 @@ fn scan_transcript(path: &str, content: &str) -> Option<DiscoveredSession> {
     let mut token_usage = Vec::new();
     let mut title = None;
 
-    for line in content.lines() {
+    for line in lines {
+        let line = line.as_ref();
         let Ok(record) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -1852,6 +1941,125 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// Several transcripts; records which paths were read.
+    struct TranscriptDir {
+        files: Mutex<Vec<(String, String)>>,
+        reads: Mutex<Vec<String>>,
+    }
+
+    impl TranscriptDir {
+        fn new(files: &[(&str, String)]) -> Self {
+            Self {
+                files: Mutex::new(files.iter().map(|(p, c)| (p.to_string(), c.clone())).collect()),
+                reads: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TranscriptFileSystem for TranscriptDir {
+        async fn jsonl_files(&self) -> AdapterResult<Vec<String>> {
+            Ok(self.files.lock().unwrap().iter().map(|(p, _)| p.clone()).collect())
+        }
+        async fn read_to_string(&self, path: &str) -> AdapterResult<String> {
+            self.reads.lock().unwrap().push(path.to_owned());
+            self.files
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(p, _)| p == path)
+                .map(|(_, c)| c.clone())
+                .ok_or_else(|| AdapterError::Other("missing".into()))
+        }
+    }
+
+    fn spend_limit_line(id: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","sessionId":"{id}","isApiErrorMessage":true,"message":{{"role":"assistant","content":[{{"type":"text","text":"You've hit your monthly spend limit."}}]}}}}"#
+        )
+    }
+
+    fn plain_adapter() -> ClaudeCodeAdapter {
+        adapter(200, Arc::new(Cache { entry: Mutex::new(None) }), Arc::new(Mutex::new(0)))
+    }
+
+    #[tokio::test]
+    async fn quota_check_reads_only_the_sessions_own_transcripts() {
+        // why: the leak. Every tick, each warm session's check read every
+        // transcript on the machine; it must read only its own.
+        // catches: filtering after reading (path || content contains id).
+        let (a, b) = ("3507fe61-2d6b-4aae-a0b6-4fe4eec12b40", "9b1f0c1e-0000-4000-8000-000000000001");
+        let dir = Arc::new(TranscriptDir::new(&[
+            (&format!("/p/{a}.jsonl"), spend_limit_line(a)),
+            (&format!("/p/{b}.jsonl"), format!(r#"{{"type":"user","sessionId":"{b}"}}"#)),
+            (&format!("/p/{b}/subagents/agent-1.jsonl"), format!(r#"{{"type":"user","sessionId":"{b}"}}"#)),
+        ]));
+        let adapter = plain_adapter().with_transcript_fs(dir.clone());
+        assert!(!adapter.has_quota_error_evidence(&SessionId(b.into())).await.unwrap());
+        let reads = dir.reads.lock().unwrap().clone();
+        assert_eq!(reads.len(), 2, "{reads:?}");
+        assert!(reads.iter().all(|path| path.contains(b)), "{reads:?}");
+    }
+
+    #[tokio::test]
+    async fn quota_check_finds_a_renamed_transcript_through_discovery() {
+        // why: transcripts whose file name is not the session id were found by
+        // content before; discovery's cache now carries that mapping.
+        let id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b40";
+        let dir = Arc::new(TranscriptDir::new(&[(
+            "/p/renamed.jsonl",
+            format!(r#"{{"timestamp":"2026-09-17T23:32:32Z","sessionId":"{id}","cwd":"/work"}}"#)
+                + "\n"
+                + &spend_limit_line(id),
+        )]));
+        let adapter = plain_adapter().with_transcript_fs(dir);
+        assert!(!adapter.has_quota_error_evidence(&SessionId(id.into())).await.unwrap());
+        adapter.discover_sessions().await.unwrap();
+        assert!(adapter.has_quota_error_evidence(&SessionId(id.into())).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn discovery_forgets_deleted_transcripts() {
+        let id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b40";
+        let path = format!("/p/{id}.jsonl");
+        let dir = Arc::new(TranscriptDir::new(&[(
+            &path,
+            format!(r#"{{"timestamp":"2026-09-17T23:32:32Z","sessionId":"{id}","cwd":"/work"}}"#),
+        )]));
+        let adapter = plain_adapter().with_transcript_fs(dir.clone());
+        assert_eq!(adapter.discover_sessions().await.unwrap().len(), 1);
+        assert!(adapter.known_ids.lock().unwrap().contains_key(&path));
+        dir.files.lock().unwrap().clear();
+        assert!(adapter.discover_sessions().await.unwrap().is_empty());
+        assert!(adapter.known_ids.lock().unwrap().is_empty());
+        assert!(adapter.discovery_cache.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn streamed_reads_match_whole_file_reads() {
+        // why: the real file system now streams; it must agree with the
+        // whole-string functions the fixtures and older code use.
+        let id = "3507fe61-2d6b-4aae-a0b6-4fe4eec12b40";
+        let dir = std::env::temp_dir().join(format!("uw-stream-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.jsonl"));
+        let content = format!(
+            "{}\n{}\r\n{}\n",
+            format!(r#"{{"timestamp":"2026-09-17T23:32:32Z","sessionId":"{id}","cwd":"/work"}}"#),
+            r#"{"type":"user","message":"x"}"#,
+            spend_limit_line(id)
+        );
+        std::fs::write(&path, &content).unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let fs = ClaudeTranscriptFileSystem;
+        assert_eq!(fs.scan(&path).await.unwrap(), scan_transcript(&path, &content));
+        assert!(fs.scan(&path).await.unwrap().is_some());
+        assert!(fs.has_quota_error(&path).await.unwrap());
+        std::fs::write(&path, content.replace("spend limit", "nothing")).unwrap();
+        assert!(!fs.has_quota_error(&path).await.unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
