@@ -11,7 +11,11 @@ impl Endpoint {
     }
 
     pub fn base_url(&self) -> &str {
-        if self.socket_path().is_some() { "http://localhost" } else { self.0.trim_end_matches('/') }
+        if self.socket_path().is_some() {
+            "http://localhost"
+        } else {
+            self.0.trim_end_matches('/')
+        }
     }
 
     pub fn blocking_client(&self) -> anyhow::Result<reqwest::blocking::Client> {
@@ -40,8 +44,11 @@ pub struct Discovery {
 }
 
 pub fn data_dir() -> PathBuf {
-    std::env::var_os("UW_DB_PATH").and_then(|p| PathBuf::from(p).parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".usagewindow"))
+    std::env::var_os("UW_DB_PATH")
+        .and_then(|p| PathBuf::from(p).parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".usagewindow")
+        })
 }
 
 pub fn default_directories() -> Vec<PathBuf> {
@@ -51,42 +58,69 @@ pub fn default_directories() -> Vec<PathBuf> {
     }
     paths.push(data_dir());
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".usagewindow");
-    if !paths.contains(&home) { paths.push(home); }
+    if !paths.contains(&home) {
+        paths.push(home);
+    }
     paths
 }
 
 pub fn default_socket_path() -> PathBuf {
-    std::env::var_os("UW_SOCKET_PATH").map(PathBuf::from)
+    std::env::var_os("UW_SOCKET_PATH")
+        .map(PathBuf::from)
         .unwrap_or_else(|| default_directories()[0].join("api.sock"))
 }
 
 impl Discovery {
     /// URL overrides are authoritative. Discovery ignores stale sockets and malformed files.
     pub fn from_environment(primary: &str) -> Self {
-        let secondary = if primary == "UW_API_URL" { "UW_DAEMON_URL" } else { "UW_API_URL" };
-        let explicit = [primary, secondary].into_iter().find_map(|key| std::env::var(key).ok().filter(|v| !v.is_empty()));
+        let secondary = if primary == "UW_API_URL" {
+            "UW_DAEMON_URL"
+        } else {
+            "UW_API_URL"
+        };
+        let explicit = [primary, secondary]
+            .into_iter()
+            .find_map(|key| std::env::var(key).ok().filter(|v| !v.is_empty()));
         let directories = default_directories();
         let mut socket_paths = Vec::new();
-        if let Some(path) = std::env::var_os("UW_SOCKET_PATH") { socket_paths.push(path.into()); }
+        if let Some(path) = std::env::var_os("UW_SOCKET_PATH") {
+            socket_paths.push(path.into());
+        }
         socket_paths.extend(directories.iter().map(|dir| dir.join("api.sock")));
         let mut endpoint_files = Vec::new();
-        if let Some(path) = std::env::var_os("UW_ENDPOINT_FILE") { endpoint_files.push(path.into()); }
+        if let Some(path) = std::env::var_os("UW_ENDPOINT_FILE") {
+            endpoint_files.push(path.into());
+        }
         endpoint_files.extend(directories.iter().map(|dir| dir.join("endpoint")));
-        Self { explicit, socket_paths, endpoint_files }
+        Self {
+            explicit,
+            socket_paths,
+            endpoint_files,
+        }
     }
 
     pub fn resolve(&self) -> Endpoint {
-        if let Some(endpoint) = &self.explicit { return Endpoint(endpoint.clone()); }
+        if let Some(endpoint) = &self.explicit {
+            return Endpoint(endpoint.clone());
+        }
         for path in &self.socket_paths {
-            if socket_reachable(path) { return Endpoint(format!("unix:{}", path.display())); }
+            if socket_reachable(path) {
+                return Endpoint(format!("unix:{}", path.display()));
+            }
         }
         for path in &self.endpoint_files {
-            let Some(endpoint) = std::fs::read(path).ok()
+            let Some(endpoint) = std::fs::read(path)
+                .ok()
                 .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                .and_then(|value| value.get("endpoint")?.as_str().map(str::to_owned)) else { continue; };
+                .and_then(|value| value.get("endpoint")?.as_str().map(str::to_owned))
+            else {
+                continue;
+            };
             let endpoint = Endpoint(endpoint);
             if endpoint.socket_path().is_some_and(socket_reachable)
-                || endpoint.0.starts_with("http://") || endpoint.0.starts_with("https://") {
+                || endpoint.0.starts_with("http://")
+                || endpoint.0.starts_with("https://")
+            {
                 return endpoint;
             }
         }
@@ -96,9 +130,16 @@ impl Discovery {
 
 /// A nonblocking probe keeps discovery bounded even when a daemon's accept queue is full.
 pub fn socket_reachable(path: &Path) -> bool {
-    let Ok(socket) = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None) else { return false; };
-    if socket.set_nonblocking(true).is_err() { return false; }
-    let Ok(address) = socket2::SockAddr::unix(path) else { return false; };
+    let Ok(socket) = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+    else {
+        return false;
+    };
+    if socket.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let Ok(address) = socket2::SockAddr::unix(path) else {
+        return false;
+    };
     match socket.connect(&address) {
         Ok(()) => true,
         Err(error) => matches!(error.kind(), std::io::ErrorKind::WouldBlock),
@@ -113,8 +154,15 @@ mod tests {
     // why: explicit URLs must win over an unrelated local daemon, including unix: overrides.
     #[test]
     fn explicit_endpoint_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("api.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
         for endpoint in ["http://127.0.0.1:9988", "unix:/custom/api.sock"] {
-            let discovery = Discovery { explicit: Some(endpoint.into()), socket_paths: vec![], endpoint_files: vec![] };
+            let discovery = Discovery {
+                explicit: Some(endpoint.into()),
+                socket_paths: vec![socket.clone()],
+                endpoint_files: vec![],
+            };
             assert_eq!(discovery.resolve(), Endpoint(endpoint.into()));
         }
     }
@@ -127,10 +175,23 @@ mod tests {
         drop(UnixListener::bind(&stale).unwrap());
         let live = dir.path().join("live.sock");
         let _listener = UnixListener::bind(&live).unwrap();
+        let lower = dir.path().join("lower.sock");
+        let _lower_listener = UnixListener::bind(&lower).unwrap();
         let file = dir.path().join("endpoint");
-        std::fs::write(&file, r#"{"endpoint":"http://127.0.0.1:9999","web_url":"http://127.0.0.1:9999"}"#).unwrap();
-        let discovery = Discovery { explicit: None, socket_paths: vec![stale, live.clone()], endpoint_files: vec![file] };
-        assert_eq!(discovery.resolve(), Endpoint(format!("unix:{}", live.display())));
+        std::fs::write(
+            &file,
+            r#"{"endpoint":"http://127.0.0.1:9999","web_url":"http://127.0.0.1:9999"}"#,
+        )
+        .unwrap();
+        let discovery = Discovery {
+            explicit: None,
+            socket_paths: vec![stale, live.clone(), lower],
+            endpoint_files: vec![file],
+        };
+        assert_eq!(
+            discovery.resolve(),
+            Endpoint(format!("unix:{}", live.display()))
+        );
     }
 
     // why: a daemon on a custom socket or ephemeral TCP port must be discoverable without client URL configuration.
@@ -141,9 +202,19 @@ mod tests {
         let _listener = UnixListener::bind(&socket).unwrap();
         let file = dir.path().join("endpoint");
         std::fs::write(&file, serde_json::json!({"endpoint":format!("unix:{}", socket.display()),"web_url":"http://127.0.0.1:48123"}).to_string()).unwrap();
-        let mut discovery = Discovery { explicit: None, socket_paths: vec![], endpoint_files: vec![file] };
-        assert_eq!(discovery.resolve(), Endpoint(format!("unix:{}", socket.display())));
+        let mut discovery = Discovery {
+            explicit: None,
+            socket_paths: vec![],
+            endpoint_files: vec![file],
+        };
+        assert_eq!(
+            discovery.resolve(),
+            Endpoint(format!("unix:{}", socket.display()))
+        );
         discovery.endpoint_files.clear();
-        assert_eq!(discovery.resolve(), Endpoint("http://127.0.0.1:7878".into()));
+        assert_eq!(
+            discovery.resolve(),
+            Endpoint("http://127.0.0.1:7878".into())
+        );
     }
 }

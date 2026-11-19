@@ -75,7 +75,7 @@ class LocalClients(unittest.TestCase):
         self.assertEqual(endpoint.stdout.strip(), self.published['endpoint'])
         hook = self.run_bin('uw-hook', input=json.dumps({
             'hook_event_name': 'SessionStart', 'session_id': 'hook-local',
-            'cwd': '/work', 'source': 'startup'}), env={**self.env, 'UW_HOOK_PROVIDER': 'codex'})
+            'cwd': '/work', 'source': 'startup'}), env={**self.env, 'UW_HOOK_PROVIDER': 'codex', 'UW_DAEMON_URL': self.published['endpoint'], 'UW_API_URL': self.published['web_url']})
         self.assertEqual(hook.returncode, 0, hook.stderr)
         self.assertEqual(self.request('GET', '/api/sessions/hook-local')[1]['summary']['id'], 'hook-local')
         compact = self.run_bin('uw', '--json', 'compact', 'ask', 'hook-local')
@@ -84,7 +84,8 @@ class LocalClients(unittest.TestCase):
         self.assertEqual(response['requests'][0]['session_id'], 'hook-local')
         mcp = self.run_bin('uw-mcp', '--stdio', input=json.dumps({
             'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
-            'params': {'name': 'get_resume_state', 'arguments': {'session_id': 'hook-local'}}}) + '\n')
+            'params': {'name': 'get_resume_state', 'arguments': {'session_id': 'hook-local'}}}) + '\n',
+            env={**self.env, 'UW_DAEMON_URL': self.published['endpoint'], 'UW_API_URL': self.published['web_url']})
         self.assertEqual(mcp.returncode, 0, mcp.stderr)
         reply = json.loads(mcp.stdout)
         self.assertNotIn('error', reply, reply)
@@ -117,6 +118,9 @@ class LocalClients(unittest.TestCase):
         for key in ['UW_API_URL', 'UW_DAEMON_URL']:
             explicit = self.run_bin('uw', 'endpoint', env={**env, key: 'unix:/explicit/api.sock'})
             self.assertEqual(explicit.stdout.strip(), 'unix:/explicit/api.sock')
+        preferred = self.run_bin('uw', 'endpoint', '--check', env={**env,
+            'UW_API_URL': self.published['endpoint'], 'UW_DAEMON_URL': self.published['web_url']})
+        self.assertEqual(preferred.returncode, 0, preferred.stderr)
         denied = self.run_bin('uw', 'endpoint', '--check', env={**env, 'UW_API_URL': self.published['web_url']})
         self.assertNotEqual(denied.returncode, 0)
         self.assertIn('401', denied.stderr)

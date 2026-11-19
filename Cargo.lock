@@ -1773,9 +1773,22 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "uw-client",
  "uw-core",
  "uw-daemon",
  "uw-store",
+]
+
+[[package]]
+name = "uw-client"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "socket2",
+ "tempfile",
 ]
 
 [[package]]
@@ -1800,11 +1813,13 @@ dependencies = [
  "chrono",
  "reqwest",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
  "uw-adapters",
+ "uw-client",
  "uw-core",
  "uw-policy",
  "uw-store",
@@ -1825,6 +1840,7 @@ dependencies = [
  "tokio",
  "tower",
  "uuid",
+ "uw-client",
  "uw-core",
  "uw-store",
 ]
