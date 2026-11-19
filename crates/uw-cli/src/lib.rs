@@ -394,7 +394,7 @@ pub fn endpoint(check: bool) -> Result<String> {
     let endpoint = uw_client::Discovery::from_environment("UW_API_URL").resolve();
     if check {
         endpoint.blocking_client()?.get(format!("{}/api/status", endpoint.base_url()))
-            .timeout(std::time::Duration::from_millis(250)).send()?.error_for_status()?;
+            .timeout(std::time::Duration::from_secs(5)).send()?.error_for_status()?;
     }
     Ok(endpoint.0)
 }
