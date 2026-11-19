@@ -2047,7 +2047,7 @@ mod tests {
         let path = dir.join(format!("{id}.jsonl"));
         let content = format!(
             "{}\n{}\r\n{}\n",
-            format!(r#"{{"timestamp":"2026-09-17T23:32:32Z","sessionId":"{id}","cwd":"/work"}}"#),
+            format_args!(r#"{{"timestamp":"2026-09-17T23:32:32Z","sessionId":"{id}","cwd":"/work"}}"#),
             r#"{"type":"user","message":"x"}"#,
             spend_limit_line(id)
         );
