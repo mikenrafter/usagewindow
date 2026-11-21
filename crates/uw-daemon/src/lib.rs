@@ -1880,13 +1880,15 @@ pub async fn run_policy_tick(
     let mut samples_by_account = SamplesByAccount::default();
     let mut windows_by_account = HashMap::new();
     for session in sessions {
-        if store.actions_inhibited(&session.harness).await? {
-            continue;
-        }
-
         let Some(adapter) = adapters.get(&session.harness) else {
             continue;
         };
+        if adapter.capabilities().observe_only {
+            continue;
+        }
+        if store.actions_inhibited(&session.harness).await? {
+            continue;
+        }
         let Some(profile) = profiles.get(&session.id) else {
             continue;
         };
@@ -1898,18 +1900,6 @@ pub async fn run_policy_tick(
             .or_insert_with(|| analyze_account_windows(&samples, session.account.as_ref()));
         let mut suppress_idle = false;
         for (key, (blocks, window_exceeded)) in windows {
-            if session.harness == Provider::Gemini
-                && matches!(&key.kind,
-                WindowKind::Custom(label) if label == "Claude and GPT models 5h")
-            {
-                continue;
-            }
-            if session.harness == Provider::Gemini
-                && matches!(&key.kind,
-                WindowKind::WeeklySurface(label) if label == "Claude and GPT models")
-            {
-                continue;
-            }
             let key = key.clone();
             let Some(block) = blocks.last() else {
                 continue;
@@ -8000,92 +7990,84 @@ mod tests {
             "observe-only Gemini adapter must never auto-schedule a resume marker"
         );
     }
-    // why: exhausting the Claude/GPT pool must not pause a Gemini session's keepalive.
+    // why: observe-only is provider-neutral and must skip policy side effects entirely.
     #[tokio::test]
-    async fn fix1_gemini_policy_ignores_claude_gpt_windows() {
-        let now = Utc::now();
-        let mut observed = session();
-        observed.harness = Provider::Gemini;
-        observed.last_seen = now;
-        let store = SqliteDaemonStore::new(Store::open_memory().unwrap());
-        store
-            .inner
-            .lock()
-            .unwrap()
-            .insert_session(&observed)
-            .unwrap();
-        store
-            .inner
-            .lock()
-            .unwrap()
-            .insert_token_usage_records(&observed.id, &boundary_token_usage(now))
-            .unwrap();
-        assert!(is_keepalive_eligible(
-            &observed,
-            &boundary_token_usage(now),
-            now
-        ));
-        store
-            .set_keepalive_enabled(&observed.id, true)
+    async fn fix2_observe_only_sessions_skip_policy_for_any_provider() {
+        for observe_only in [true, false] {
+            let now = Utc::now();
+            let provider = Provider::Other("future-observer".into());
+            let mut observed = session();
+            observed.harness = provider.clone();
+            observed.last_seen = now;
+            let store = SqliteDaemonStore::new(Store::open_memory().unwrap());
+            store
+                .inner
+                .lock()
+                .unwrap()
+                .insert_session(&observed)
+                .unwrap();
+            store
+                .inner
+                .lock()
+                .unwrap()
+                .insert_token_usage_records(&observed.id, &boundary_token_usage(now))
+                .unwrap();
+            assert!(is_keepalive_eligible(
+                &observed,
+                &boundary_token_usage(now),
+                now
+            ));
+            store
+                .set_keepalive_enabled(&observed.id, true)
+                .await
+                .unwrap();
+            let sample = UsageSample {
+                at: now,
+                fetched_at: Some(now),
+                source: UsageSource::ProviderReported,
+                provider: provider.clone(),
+                account: None,
+                plan: None,
+                credits: None,
+                windows: HashMap::from([(
+                    WindowKey {
+                        provider: provider.clone(),
+                        kind: WindowKind::Custom("exhausted-pool".into()),
+                    },
+                    UsageWindowState::new(100.0, true, true, None, None),
+                )]),
+            };
+            store
+                .inner
+                .lock()
+                .unwrap()
+                .insert_usage_sample(&sample)
+                .unwrap();
+            let mut capabilities = caps(false, false, false);
+            capabilities.observe_only = observe_only;
+            let adapter: Arc<dyn HarnessAdapter> = Arc::new(FakeAdapter {
+                capabilities,
+                compacted: Arc::new(StdMutex::new(0)),
+                advised: Arc::new(StdMutex::new(0)),
+            });
+            let adapters = HashMap::from([(provider, adapter)]);
+            let profiles = HashMap::from([(observed.id.clone(), ThresholdProfile::default())]);
+            run_policy_tick(
+                &store,
+                &store,
+                &adapters,
+                &AlwaysActive,
+                std::slice::from_ref(&observed),
+                &profiles,
+                &mut PolicyRuntimeState::default(),
+                now,
+            )
             .await
             .unwrap();
-        let sample = UsageSample {
-            at: now,
-            fetched_at: Some(now),
-            source: UsageSource::ProviderReported,
-            provider: Provider::Gemini,
-            account: None,
-            plan: None,
-            credits: None,
-            windows: HashMap::from([
-                (
-                    WindowKey {
-                        provider: Provider::Gemini,
-                        kind: WindowKind::Rolling { minutes: 300 },
-                    },
-                    UsageWindowState::new(10.0, false, true, None, None),
-                ),
-                (
-                    WindowKey {
-                        provider: Provider::Gemini,
-                        kind: WindowKind::Custom("Claude and GPT models 5h".into()),
-                    },
-                    UsageWindowState::new(100.0, true, true, None, None),
-                ),
-                (
-                    WindowKey {
-                        provider: Provider::Gemini,
-                        kind: WindowKind::WeeklySurface("Claude and GPT models".into()),
-                    },
-                    UsageWindowState::new(100.0, true, true, None, None),
-                ),
-            ]),
-        };
-        store
-            .inner
-            .lock()
-            .unwrap()
-            .insert_usage_sample(&sample)
-            .unwrap();
-        let adapter: Arc<dyn HarnessAdapter> = Arc::new(FakeAdapter {
-            capabilities: caps(false, false, false),
-            compacted: Arc::new(StdMutex::new(0)),
-            advised: Arc::new(StdMutex::new(0)),
-        });
-        let adapters = HashMap::from([(Provider::Gemini, adapter)]);
-        let profiles = HashMap::from([(observed.id.clone(), ThresholdProfile::default())]);
-        run_policy_tick(
-            &store,
-            &store,
-            &adapters,
-            &AlwaysActive,
-            std::slice::from_ref(&observed),
-            &profiles,
-            &mut PolicyRuntimeState::default(),
-            now,
-        )
-        .await
-        .unwrap();
-        assert!(store.keepalive_state(&observed.id).await.unwrap().enabled);
+            assert_eq!(
+                store.keepalive_state(&observed.id).await.unwrap().enabled,
+                observe_only
+            );
+        }
     }
 }

@@ -166,8 +166,9 @@ legacy duplicates cannot be reconstructed from a stable key that was never saved
 
 Discovery fingerprints include the SQLite database and WAL sizes and mtimes.
 Malformed quota rows are logged and skipped while valid sibling rows survive.
-A missing `agy` executable is unsupported. Gemini policy skips the known Claude
-and GPT pool keys, while observation and display retain those quota rows.
+A missing `agy` executable is unsupported. The per-session policy loop skips
+every adapter marked `observe_only`, while observation and display retain all
+reported quota rows.
 
 The meaning and policy applicability of the `Gemini 4 Argon` quota row remain
 unverified. Its existing mapping is unchanged pending evidence.
