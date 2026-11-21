@@ -86,8 +86,15 @@ fn get_usage(args: &Value, deps: &Deps) -> Result<Value, String> {
         .map_err(|e| e.to_string())?
     {
         let key = format!("{:?}:{:?}", sample.provider, sample.account);
-        if latest.get(&key).is_none_or(|old| old.at < sample.at) {
-            latest.insert(key, sample);
+        match latest.get_mut(&key) {
+            Some(old) if old.at == sample.at => old.windows.extend(sample.windows),
+            Some(old) if old.at < sample.at => {
+                *old = sample;
+            }
+            None => {
+                latest.insert(key, sample);
+            }
+            _ => {}
         }
     }
     let usage = latest
@@ -519,6 +526,13 @@ fn build_deps(path: &str) -> anyhow::Result<Deps> {
             ])) as Arc<dyn HarnessAdapter>,
         );
     }
+    if uw_adapters::antigravity::AntigravityAdapter::is_available_in_environment() {
+        adapters.insert(
+            Provider::Gemini,
+            Arc::new(uw_adapters::antigravity::AntigravityAdapter::real())
+                as Arc<dyn HarnessAdapter>,
+        );
+    }
     Ok(Deps {
         store: Arc::new(Mutex::new(Store::open(path)?)),
         adapters,
@@ -775,6 +789,62 @@ mod tests {
             serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
                 .unwrap();
         assert_eq!(usage["usage"][0]["windows"][0]["pct"], 84.0);
+    }
+
+    #[test]
+    fn get_usage_preserves_all_windows_from_multi_window_gemini_snapshot() {
+        // why: Store::latest_usage_samples_for returns one row per window with the
+        //      same `at` timestamp; get_usage must merge sibling windows at equal `at`.
+        // catches: keeping only one window per provider/account in MCP get_usage.
+        let deps = deps();
+        let now = Utc::now();
+        let sample = UsageSample {
+            at: now,
+            fetched_at: Some(now),
+            source: UsageSource::ProviderReported,
+            provider: Provider::Gemini,
+            account: None,
+            plan: None,
+            windows: HashMap::from([
+                (
+                    WindowKey {
+                        provider: Provider::Gemini,
+                        kind: WindowKind::Rolling { minutes: 300 },
+                    },
+                    UsageWindowState::new(61.0, false, true, None, None),
+                ),
+                (
+                    WindowKey {
+                        provider: Provider::Gemini,
+                        kind: WindowKind::Rolling { minutes: 10_080 },
+                    },
+                    UsageWindowState::new(17.0, false, true, None, None),
+                ),
+                (
+                    WindowKey {
+                        provider: Provider::Gemini,
+                        kind: WindowKind::WeeklySurface("Claude and GPT models".into()),
+                    },
+                    UsageWindowState::new(0.0, false, true, None, None),
+                ),
+            ]),
+            credits: None,
+        };
+        deps.store
+            .lock()
+            .unwrap()
+            .insert_usage_sample(&sample)
+            .unwrap();
+
+        let response = handle_request(
+            json!({"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"get_usage","arguments":{"provider":"Gemini"}}}),
+            &deps,
+        );
+        let usage: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(usage["usage"][0]["provider"], "Gemini");
+        assert_eq!(usage["usage"][0]["windows"].as_array().unwrap().len(), 3);
     }
     #[test]
     fn request_compaction_reports_codex_unsupported_without_inserting() {
