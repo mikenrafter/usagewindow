@@ -119,19 +119,16 @@ Relevant tables (verified 2026-11-20, read-only):
 
 ## Prompt cache TTL
 
-Antigravity's prompt cache is server-side and its TTL is not configurable by the client.
-As of 2026-11-21T05:24:08Z, an active probe (`ttl-probe.log`) observed cache hits at
-3-minute and 6-minute gaps, with upper-bound expiry still unmeasured.
+The probe log at `mstack.research/neon-trial/ttl-probe.log` records cache hits
+after 3, 6, 12 and 24 minutes. The 24-minute hit at 2026-11-21T06:00:21Z
+reported 8,334 cached tokens. No 48-minute result was present when porting.
+Expiry remains unmeasured; these hits do not guarantee future cache retention.
 
-Adapter and policy decision:
-
-- `uw_policy::GEMINI_CACHE_TTL` is `None` (unknown) — a single constant in
-  `crates/uw-policy/src/lib.rs` to update once the expiry is measured.
-- Because `default_cache_ttl(&Provider::Gemini)` returns `None`, `uw-daemon` never
-  inserts `Provider::Gemini` into `ThresholdProfile.cache_ttl_by_provider`, so
-  TTL-dependent policies (idle-compact, auto-reseed, keepalive) stay inactive.
-- Display/liveness paths that fall back to `uw_core::model::is_cache_warm` use the
-  shared 5-minute `CACHE_WARM_APPROXIMATION_MINUTES`, never Claude's 1-hour extended TTL.
+`uw_adapters::antigravity::GEMINI_CACHE_TTL` uses the longest observed hit,
+rounded down, minus a one-minute margin: 23 minutes. Discovery populates
+`DiscoveredSession.cache_ttl`; observation persists it to `SessionSummary.cache_ttl`.
+The deployed branch's existing per-session TTL consumers handle display and
+policy timing. Capability gates keep Gemini observe-only even with a known TTL.
 
 ## Capabilities (observe-only)
 
@@ -145,6 +142,7 @@ In this integration, `Provider::Gemini` is strictly observe-only:
 - `headless_resume: false`
 - `seed_modes: []`
 
-Both `AntigravityAdapter` and `T3CodeAdapter` refuse destructive operations (`compact`,
-`resume_session`, `interrupt`) for `Provider::Gemini` sessions until a dedicated
-research pass validates Antigravity compaction and resume semantics.
+`AntigravityAdapter` refuses all action methods. `T3CodeAdapter` refuses Gemini
+`compact` and `resume_session` before transport access. The daemon leaves Gemini out of compaction fallback wrapping and gates hard-boundary
+interrupts on compaction capability. Antigravity action semantics need a dedicated
+research pass before enabling delivery.
