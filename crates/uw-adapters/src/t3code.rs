@@ -24,12 +24,6 @@ pub enum T3CodeAuth {
 pub trait T3CodeTransport: Send + Sync {
     async fn post_dispatch(&self, payload: Value) -> AdapterResult<Value>;
     async fn post_interrupt(&self, payload: Value) -> AdapterResult<Value>;
-    /// Mutates T3Code's producer-owned external status overlay. `None` clears it.
-    async fn post_thread_status(
-        &self,
-        thread_id: &str,
-        status: Option<Value>,
-    ) -> AdapterResult<Value>;
     /// `GET /api/orchestration/threads/:thread_id`. Returns the raw response
     /// body; callers read `thread.session.status`/`lastError` out of it.
     async fn get_thread(&self, thread_id: &str) -> AdapterResult<Value>;
@@ -100,22 +94,6 @@ impl T3CodeTransport for T3CodeHttpTransport {
                 .json(&payload),
         );
         self.send(request, "interrupt").await
-    }
-
-    async fn post_thread_status(
-        &self,
-        thread_id: &str,
-        status: Option<Value>,
-    ) -> AdapterResult<Value> {
-        let request = self.authed(
-            self.client
-                .post(format!(
-                    "{}/api/orchestration/threads/{thread_id}/status",
-                    self.base_url
-                ))
-                .json(&json!({ "status": status })),
-        );
-        self.send(request, "thread status").await
     }
 
     async fn get_thread(&self, thread_id: &str) -> AdapterResult<Value> {
@@ -403,21 +381,6 @@ impl HarnessAdapter for T3CodeAdapter {
         Err(AdapterError::Unsupported)
     }
 
-    async fn set_external_status(
-        &self,
-        session: &SessionSummary,
-        status: Option<Value>,
-    ) -> AdapterResult<()> {
-        if session.harness == Provider::Gemini {
-            return Err(AdapterError::Unsupported);
-        }
-        let thread_id = self.owned_thread(session).await?;
-        self.transport
-            .post_thread_status(&thread_id.0, status)
-            .await
-            .map(|_| ())
-    }
-
     /// Verified against a live T3Code thread that actually hit a provider
     /// quota limit (`status: "error"`, `lastError` a plain string containing
     /// "usage limit" from a Codex-backed thread; see docs/research-t3code.md).
@@ -602,22 +565,6 @@ mod tests {
                 .unwrap()
                 .push(("interrupt".into(), payload));
             Ok(serde_json::json!({"sequence": 108563}))
-        }
-
-        async fn post_thread_status(
-            &self,
-            thread_id: &str,
-            status: Option<Value>,
-        ) -> AdapterResult<Value> {
-            self.call_times
-                .lock()
-                .unwrap()
-                .push(std::time::Instant::now());
-            self.calls.lock().unwrap().push((
-                "thread_status".into(),
-                serde_json::json!({"threadId": thread_id, "status": status}),
-            ));
-            Ok(serde_json::json!({"sequence": 108564}))
         }
 
         async fn get_thread(&self, thread_id: &str) -> AdapterResult<Value> {
@@ -855,41 +802,6 @@ mod tests {
         let calls = transport.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "get_thread");
-    }
-
-    #[tokio::test]
-    async fn sets_and_clears_external_status_through_the_owned_t3_thread() {
-        let owned_thread = serde_json::json!({
-            "thread": {
-                "id": session().id.0,
-                "session": {"status": "stopped", "providerName": "claudeAgent"}
-            }
-        });
-        let transport = std::sync::Arc::new(FakeTransport::with_thread(owned_thread));
-        let adapter = T3CodeAdapter::new(transport.clone());
-        let status = serde_json::json!({
-            "source": "usagewindow",
-            "key": "paused",
-            "text": "Paused",
-            "icon": "pause",
-            "color": "slate",
-            "notifyUser": false,
-            "expiresAt": null,
-            "clearsOn": "work",
-            "updatedAt": "2026-09-22T12:00:00.000Z"
-        });
-
-        adapter
-            .set_external_status(&session(), Some(status.clone()))
-            .await
-            .unwrap();
-        adapter.set_external_status(&session(), None).await.unwrap();
-
-        let calls = transport.calls.lock().unwrap();
-        assert_eq!(calls[1].0, "thread_status");
-        assert_eq!(calls[1].1["threadId"], session().id.0);
-        assert_eq!(calls[1].1["status"], status);
-        assert_eq!(calls[3].1["status"], Value::Null);
     }
 
     #[tokio::test]
@@ -1348,9 +1260,7 @@ mod tests {
                 json!({"thread":{"session":{"providerName":"codex"}}}),
             ));
             let adapter = T3CodeAdapter::with_state_db(transport.clone(), &path);
-            let result = adapter
-                .set_external_status(&session(), Some(json!({"text":"Paused"})))
-                .await;
+            let result = adapter.resume_session(&session(), None).await;
             let calls = transport.calls.lock().unwrap();
             if provider == "antigravity" {
                 assert!(matches!(result, Err(AdapterError::Unsupported)));
@@ -1362,7 +1272,7 @@ mod tests {
                         .iter()
                         .map(|(kind, _)| kind.as_str())
                         .collect::<Vec<_>>(),
-                    vec!["get_thread", "thread_status"]
+                    vec!["get_thread", "dispatch"]
                 );
             }
         }
@@ -1370,13 +1280,13 @@ mod tests {
 
     // why: a missing DB mapping must not permit writes when the live owner is Antigravity.
     #[tokio::test]
-    async fn fix2_owner_snapshot_blocks_antigravity_status_writes() {
+    async fn fix2_owner_snapshot_blocks_antigravity_resume_dispatch() {
         for provider in ["antigravity", "codex"] {
             let transport = Arc::new(FakeTransport::with_thread(
                 json!({"thread":{"session":{"providerName":provider}}}),
             ));
             let adapter = T3CodeAdapter::new(transport.clone());
-            let result = adapter.set_external_status(&session(), None).await;
+            let result = adapter.resume_session(&session(), None).await;
             let calls = transport.calls.lock().unwrap();
             if provider == "antigravity" {
                 assert!(matches!(result, Err(AdapterError::Unsupported)));
@@ -1394,7 +1304,7 @@ mod tests {
                         .iter()
                         .map(|(kind, _)| kind.as_str())
                         .collect::<Vec<_>>(),
-                    vec!["get_thread", "thread_status"]
+                    vec!["get_thread", "dispatch"]
                 );
             }
         }
@@ -1476,13 +1386,6 @@ mod tests {
             harness: Provider::Gemini,
             ..session()
         };
-        // why: observe-only includes metadata writes and clears, before any HTTP read.
-        for status in [Some(json!({"text": "Paused"})), None] {
-            assert!(matches!(
-                adapter.set_external_status(&gemini_session, status).await,
-                Err(AdapterError::Unsupported)
-            ));
-        }
         assert!(matches!(
             adapter.interrupt(&gemini_session.id).await,
             Err(AdapterError::Unsupported)

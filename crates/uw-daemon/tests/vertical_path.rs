@@ -206,14 +206,6 @@ async fn antigravity_observation_persists_gemini_windows_and_t3_sessions_observe
             *self.dispatches.lock().unwrap() += 1;
             Ok(serde_json::json!({"sequence": 2}))
         }
-        async fn post_thread_status(
-            &self,
-            _: &str,
-            _: Option<serde_json::Value>,
-        ) -> AdapterResult<serde_json::Value> {
-            *self.dispatches.lock().unwrap() += 1;
-            Ok(serde_json::json!({}))
-        }
         async fn get_thread(&self, id: &str) -> AdapterResult<serde_json::Value> {
             Ok(serde_json::json!({
                 "thread": {
