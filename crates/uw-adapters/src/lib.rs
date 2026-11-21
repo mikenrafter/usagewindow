@@ -1,5 +1,6 @@
 //! HarnessAdapter implementations for the supported agent harnesses.
 
+pub mod antigravity;
 pub mod claude_code;
 pub mod codex;
 pub mod cursor;
