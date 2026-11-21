@@ -31,3 +31,20 @@ before interrupting or enqueueing compaction.
 Verification runs on Boat `bx_f5vb4mfu`; local cargo and Nix builds are excluded.
 The handoff report in `mstack.research/neon-trial/report-uw-port.md` records check
 results, mutations, and remaining uncertainty. No UI or mock-up changes apply.
+
+## Fix round 1
+
+Review exposed a T3 metadata-write route through external status updates. A
+regression now exercises both setting and clearing status before transport access.
+Further read-only enforcement uses an explicit `observe_only` capability so
+future adapters can opt out without disabling Cursor or generic-hook fallback.
+
+The call-accounting regression reproduced double-counting when a late step row
+changed a call timestamp. The replacement keeps time as observed and persists a
+stable conversation/request identity, with idx only as a missing-ID fallback.
+Final-count rewrites use an upsert. Migration preserves unkeyed historical rows
+and separates their legacy deduplication from identified calls.
+
+Additional regressions cover WAL-only updates, malformed quota rows, an absent
+CLI, and mixed Gemini/Claude-GPT pools. Detailed red/green evidence and remaining
+uncertainty are in `mstack.research/neon-trial/report-uw-port-fix1.md`.

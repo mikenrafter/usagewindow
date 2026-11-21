@@ -146,3 +146,28 @@ In this integration, `Provider::Gemini` is strictly observe-only:
 `compact` and `resume_session` before transport access. The daemon leaves Gemini out of compaction fallback wrapping and gates hard-boundary
 interrupts on compaction capability. Antigravity action semantics need a dedicated
 research pass before enabling delivery.
+
+## Review fixes and remaining quota uncertainty
+
+A read-only scan on 2026-11-21 found 262 `gen_metadata` rows carrying a
+`request_id` entry in repeated protobuf field 1.20. Their IDs covered 15
+trajectories, with no repeated numeric suffix within a trajectory; the largest
+sample contained 70 calls. This is empirical evidence, not an upstream guarantee.
+The aggregate-only probe and result are in
+`mstack.research/neon-trial/uw-port-fix1-evidence/request-id-probe.{py,json}`.
+
+Call keys combine the native conversation ID with the full request ID. Missing
+request IDs fall back to the conversation ID plus `gen_metadata.idx`, in a separate
+namespace. The idx fallback cannot identify an edited call whose idx is reused
+without a request ID. The generic store upserts by nullable call key; timestamps
+and final token counts may change without inserting another identified call.
+Legacy rows without call keys retain their previous identity. Existing ambiguous
+legacy duplicates cannot be reconstructed from a stable key that was never saved.
+
+Discovery fingerprints include the SQLite database and WAL sizes and mtimes.
+Malformed quota rows are logged and skipped while valid sibling rows survive.
+A missing `agy` executable is unsupported. Gemini policy skips the known Claude
+and GPT pool keys, while observation and display retain those quota rows.
+
+The meaning and policy applicability of the `Gemini 4 Argon` quota row remain
+unverified. Its existing mapping is unchanged pending evidence.
