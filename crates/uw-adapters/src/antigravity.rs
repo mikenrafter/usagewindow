@@ -13,6 +13,9 @@ use uw_core::adapter::{
 };
 use uw_core::model::*;
 
+/// 24-minute cache hit in ttl-probe.log (2026-11-21), minus a one-minute margin.
+pub const GEMINI_CACHE_TTL: chrono::Duration = chrono::Duration::minutes(23);
+
 const AGY_USAGE_TIMEOUT_SECS: u64 = 20;
 
 /// Reads raw tab-separated quota output from Antigravity (`agy --print /usage`).
@@ -137,10 +140,10 @@ pub fn discover_profile_dir(
                 .filter(|path| path.is_dir())
                 .collect();
             candidates.sort();
-            if let Some(authed) = candidates
-                .iter()
-                .find(|dir| dir.join("antigravity-acp/antigravity-oauth-token").is_file())
-            {
+            if let Some(authed) = candidates.iter().find(|dir| {
+                dir.join("antigravity-acp/antigravity-oauth-token")
+                    .is_file()
+            }) {
                 return Some(authed.clone());
             }
             if let Some(acp) = candidates
@@ -416,16 +419,14 @@ fn read_conversation_usage(
     db_path: &Path,
     fallback_at: DateTime<Utc>,
 ) -> AdapterResult<(Vec<TokenUsageRecord>, Option<u64>, Option<String>)> {
-    let connection = rusqlite::Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|error| {
-        AdapterError::Other(format!(
-            "open Antigravity conversation database {}: {error}",
-            db_path.display()
-        ))
-    })?;
+    let connection =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| {
+                AdapterError::Other(format!(
+                    "open Antigravity conversation database {}: {error}",
+                    db_path.display()
+                ))
+            })?;
 
     let mut step_timestamps: HashMap<i64, DateTime<Utc>> = HashMap::new();
     let has_steps: bool = connection
@@ -515,6 +516,7 @@ fn read_conversation_usage(
             output_tokens: call.output_tokens,
             reasoning_output_tokens: 0,
             total_tokens,
+            context_pct: None,
         });
     }
     Ok((records, latest_context_tokens, latest_model))
@@ -542,11 +544,9 @@ fn read_t3_antigravity_threads(state_db: &Path) -> AdapterResult<Vec<T3Antigravi
     if !state_db.exists() {
         return Ok(Vec::new());
     }
-    let connection = rusqlite::Connection::open_with_flags(
-        state_db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|error| AdapterError::Other(format!("open T3Code state database: {error}")))?;
+    let connection =
+        rusqlite::Connection::open_with_flags(state_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| AdapterError::Other(format!("open T3Code state database: {error}")))?;
 
     for required in [
         "orchestration_v2_projection_threads",
@@ -624,9 +624,9 @@ fn read_t3_antigravity_threads(state_db: &Path) -> AdapterResult<Vec<T3Antigravi
          ORDER BY t.updated_at DESC"
     );
 
-    let mut statement = connection
-        .prepare(&sql)
-        .map_err(|error| AdapterError::Other(format!("query T3Code Antigravity threads: {error}")))?;
+    let mut statement = connection.prepare(&sql).map_err(|error| {
+        AdapterError::Other(format!("query T3Code Antigravity threads: {error}"))
+    })?;
     let rows = statement
         .query_map([], |row| {
             let thread_id: String = row.get(0)?;
@@ -650,7 +650,9 @@ fn read_t3_antigravity_threads(state_db: &Path) -> AdapterResult<Vec<T3Antigravi
                 workspace_root: workspace_root.filter(|value| !value.is_empty()),
             })
         })
-        .map_err(|error| AdapterError::Other(format!("scan T3Code Antigravity threads: {error}")))?;
+        .map_err(|error| {
+            AdapterError::Other(format!("scan T3Code Antigravity threads: {error}"))
+        })?;
 
     let mut out = Vec::new();
     for row in rows {
@@ -874,22 +876,27 @@ impl HarnessAdapter for AntigravityAdapter {
                     }
                 }
 
-                let model = conv_model
-                    .or(t3_model)
-                    .map(ModelId);
+                let model = conv_model.or(t3_model).map(ModelId);
                 let last_known_token_count = t3_used_tokens.or(conv_context_tokens);
                 let latest_token_at = token_usage.iter().map(|record| record.at).max();
-                let last_seen = [row.updated_at, row.provider_thread_updated_at, latest_token_at]
-                    .into_iter()
-                    .flatten()
-                    .max();
+                let last_seen = [
+                    row.updated_at,
+                    row.provider_thread_updated_at,
+                    latest_token_at,
+                ]
+                .into_iter()
+                .flatten()
+                .max();
 
                 discovered.push(DiscoveredSession {
                     id: SessionId(row.thread_id),
+                    lineage: SessionLineage::default(),
                     cwd,
                     model,
                     context_window_size,
                     last_known_token_count,
+                    last_known_context_pct: None,
+                    cache_ttl: Some(GEMINI_CACHE_TTL),
                     first_seen: row.created_at,
                     last_seen,
                     state_path,
@@ -957,13 +964,10 @@ mod tests {
     const SAMPLE_GEN_METADATA_CALL_0: &[u8] = &[
         0x0a, 0x37, // f1 len=55 (8 + 8 + 16 + 23)
         // f4 len=6: f2=34448, f3=126
-        0x22, 0x06, 0x10, 0x90, 0x8d, 0x02, 0x18, 0x7e,
-        // f9 len=6: f10 len=4: f1=44211
-        0x4a, 0x06, 0x52, 0x04, 0x08, 0xb3, 0xd9, 0x02,
-        // f19 len=13: "gemini-4-neon"
+        0x22, 0x06, 0x10, 0x90, 0x8d, 0x02, 0x18, 0x7e, // f9 len=6: f10 len=4: f1=44211
+        0x4a, 0x06, 0x52, 0x04, 0x08, 0xb3, 0xd9, 0x02, // f19 len=13: "gemini-4-neon"
         0x9a, 0x01, 0x0d, b'g', b'e', b'm', b'i', b'n', b'i', b'-', b'4', b'-', b'n', b'e', b'o',
-        b'n',
-        // f20 len=20: f1="last_step_index" (len 15), f2="0" (len 1)
+        b'n', // f20 len=20: f1="last_step_index" (len 15), f2="0" (len 1)
         0xa2, 0x01, 0x14, 0x0a, 0x0f, b'l', b'a', b's', b't', b'_', b's', b't', b'e', b'p', b'_',
         b'i', b'n', b'd', b'e', b'x', 0x12, 0x01, b'0',
     ];
@@ -978,11 +982,9 @@ mod tests {
         // f4 len=10: f2=2075, f3=540, f5=34449
         0x22, 0x0a, 0x10, 0x9b, 0x10, 0x18, 0x9c, 0x04, 0x28, 0x91, 0x8d, 0x02,
         // f9 len=6: f10 len=4: f1=46547
-        0x4a, 0x06, 0x52, 0x04, 0x08, 0xd3, 0xeb, 0x02,
-        // f19 len=13: "gemini-4-neon"
+        0x4a, 0x06, 0x52, 0x04, 0x08, 0xd3, 0xeb, 0x02, // f19 len=13: "gemini-4-neon"
         0x9a, 0x01, 0x0d, b'g', b'e', b'm', b'i', b'n', b'i', b'-', b'4', b'-', b'n', b'e', b'o',
-        b'n',
-        // f20 len=20: f1="last_step_index" (len 15), f2="2" (len 1)
+        b'n', // f20 len=20: f1="last_step_index" (len 15), f2="2" (len 1)
         0xa2, 0x01, 0x14, 0x0a, 0x0f, b'l', b'a', b's', b't', b'_', b's', b't', b'e', b'p', b'_',
         b'i', b'n', b'd', b'e', b'x', 0x12, 0x01, b'2',
     ];
@@ -1086,7 +1088,10 @@ mod tests {
             ),
             Err(AdapterError::Auth)
         ));
-        assert!(matches!(parse_usage_tsv("", now), Err(AdapterError::Other(_))));
+        assert!(matches!(
+            parse_usage_tsv("", now),
+            Err(AdapterError::Other(_))
+        ));
         assert!(matches!(
             parse_usage_tsv(
                 "Gemini Models\tFive Hour Limit Remaining\t50%\tnot-a-date\n",
@@ -1146,10 +1151,8 @@ mod tests {
         // why: T3 stores Antigravity auth under ~/.t3/userdata/providers/antigravity/<id>/
         //      antigravity-acp/antigravity-oauth-token; fallback is ~/.gemini.
         // catches: picking an unauthenticated directory or failing to fall back to ~/.gemini.
-        let root = std::env::temp_dir().join(format!(
-            "usagewindow-ag-profile-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("usagewindow-ag-profile-{}", uuid::Uuid::new_v4()));
         let t3 = root.join("t3");
         let empty_profile = t3.join("providers/antigravity/0000-empty");
         let authed_profile = t3.join("providers/antigravity/1111-authed");
@@ -1203,10 +1206,8 @@ mod tests {
         // proves: CLAIM(agy-env-strip)
         // catches: forwarding parent ANTIGRAVITY_* variables or omitting GEMINI_HOME
         //          / AGY_ACP_FORCE_FILE_STORAGE=1.
-        let dir = std::env::temp_dir().join(format!(
-            "usagewindow-agy-cli-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("usagewindow-agy-cli-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let profile = dir.join("profile");
         fs::create_dir_all(&profile).unwrap();
@@ -1242,10 +1243,8 @@ mod tests {
         // catches: keying by conversation UUID instead of T3 thread_id, double-counting
         //          cached input or failing to make cached_input_tokens a subset of
         //          input_tokens, or leaking deleted/non-antigravity threads.
-        let dir = std::env::temp_dir().join(format!(
-            "usagewindow-ag-discover-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("usagewindow-ag-discover-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let state_db = dir.join("statev2.sqlite");
         let conv_dir = dir.join("conversations");
@@ -1344,11 +1343,10 @@ mod tests {
             .unwrap();
         }
 
-        let adapter = AntigravityAdapter::new(Arc::new(FakeUsageReader(Err(
-            AdapterError::Unsupported,
-        ))))
-        .with_t3_state_db(state_db)
-        .with_conversations_dir(conv_dir);
+        let adapter =
+            AntigravityAdapter::new(Arc::new(FakeUsageReader(Err(AdapterError::Unsupported))))
+                .with_t3_state_db(state_db)
+                .with_conversations_dir(conv_dir);
 
         let sessions = adapter.discover_sessions().await.unwrap();
         assert_eq!(sessions.len(), 1);
@@ -1385,6 +1383,7 @@ mod tests {
                 output_tokens: 126,
                 reasoning_output_tokens: 0,
                 total_tokens: 34_574,
+                context_pct: None,
             }
         );
         // Call 1: new=2075, cached=34449, out=540 => input=36524 (cached is subset), total=37064
@@ -1399,8 +1398,13 @@ mod tests {
                 output_tokens: 540,
                 reasoning_output_tokens: 0,
                 total_tokens: 37_064,
+                context_pct: None,
             }
         );
+
+        // why: a 24-minute hit in ttl-probe.log permits a 23-minute safety TTL.
+        // catches: leaving Gemini on the five-minute legacy fallback.
+        assert_eq!(found.cache_ttl, Some(chrono::Duration::minutes(23)));
 
         // Second discovery hits the conversation cache cleanly and keeps parity.
         let second = adapter.discover_sessions().await.unwrap();
@@ -1413,12 +1417,12 @@ mod tests {
     async fn discover_sessions_returns_empty_when_state_db_is_missing() {
         // why: hosts without T3Code installed must not error on session discovery.
         // catches: failing the observation tick when statev2.sqlite does not exist.
-        let adapter = AntigravityAdapter::new(Arc::new(FakeUsageReader(Err(
-            AdapterError::Unsupported,
-        ))))
-        .with_t3_state_db(
-            std::env::temp_dir().join(format!("usagewindow-missing-{}.sqlite", uuid::Uuid::new_v4())),
-        );
+        let adapter =
+            AntigravityAdapter::new(Arc::new(FakeUsageReader(Err(AdapterError::Unsupported))))
+                .with_t3_state_db(std::env::temp_dir().join(format!(
+                    "usagewindow-missing-{}.sqlite",
+                    uuid::Uuid::new_v4()
+                )));
         assert_eq!(adapter.discover_sessions().await.unwrap(), Vec::new());
     }
 
@@ -1428,9 +1432,8 @@ mod tests {
         //      on Gemini sessions in this change.
         // catches: advertising any destructive capability or implementing an
         //          unintended action path.
-        let adapter = AntigravityAdapter::new(Arc::new(FakeUsageReader(Err(
-            AdapterError::Unsupported,
-        ))));
+        let adapter =
+            AntigravityAdapter::new(Arc::new(FakeUsageReader(Err(AdapterError::Unsupported))));
         assert_eq!(adapter.provider(), Provider::Gemini);
         let caps = adapter.capabilities();
         assert!(!caps.can_trigger_compaction);
@@ -1444,6 +1447,7 @@ mod tests {
         let now = Utc::now();
         let summary = SessionSummary {
             id: SessionId("t3-thread-neon-1".into()),
+            lineage: SessionLineage::default(),
             harness: Provider::Gemini,
             model: Some(ModelId("gemini-4-neon".into())),
             account: None,
@@ -1453,6 +1457,8 @@ mod tests {
             state_path: None,
             context_window_size: Some(1_048_576),
             last_known_token_count: Some(50_000),
+            last_known_context_pct: None,
+            cache_ttl: None,
             launch_mode: LaunchMode::Interactive,
             pid: None,
             stopped_reason: None,
@@ -1467,6 +1473,8 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             session_id: summary.id.clone(),
             kind: CompactionKind::OpportunisticIdle,
+            preempt: false,
+            resume_after_compaction: false,
             prompt: "/compact".into(),
             reason: "test".into(),
             status: CompactionStatus::Pending,

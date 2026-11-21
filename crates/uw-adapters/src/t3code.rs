@@ -209,11 +209,12 @@ impl T3CodeAdapter {
         let Some((provider_name, cursor_key)) = Self::provider_cursor(&session.harness) else {
             return Ok(None);
         };
-        let connection = rusqlite::Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|error| AdapterError::Other(format!("open T3Code state database: {error}")))?;
+        let connection =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|error| {
+                    AdapterError::Other(format!("open T3Code state database: {error}"))
+                })?;
+        let mut owners = Vec::new();
         if sqlite_table_exists(&connection, "orchestration_v2_projection_provider_threads")? {
             let mut statement = connection
                 .prepare(
@@ -238,50 +239,45 @@ impl T3CodeAdapter {
                 let (thread_id, payload) = row.map_err(|error| {
                     AdapterError::Other(format!("read T3Code v2 ownership row: {error}"))
                 })?;
-                if thread_id == session.id.0 {
-                    return Ok(Some(SessionId(thread_id)));
-                }
+                owners.push((thread_id.clone(), SessionId(thread_id.clone())));
                 if let Ok(value) = serde_json::from_str::<Value>(&payload)
-                    && value
+                    && let Some(native_id) = value
                         .pointer("/nativeThreadRef/nativeId")
                         .and_then(Value::as_str)
-                        == Some(session.id.0.as_str())
                 {
-                    return Ok(Some(SessionId(thread_id)));
+                    owners.push((native_id.to_owned(), SessionId(thread_id)));
                 }
             }
         }
-        if !sqlite_table_exists(&connection, "provider_session_runtime")? {
-            return Ok(None);
-        }
-        let mut statement = connection
-            .prepare(
-                "SELECT thread_id, resume_cursor_json
+        if sqlite_table_exists(&connection, "provider_session_runtime")? {
+            let mut statement = connection
+                .prepare(
+                    "SELECT thread_id, resume_cursor_json
                  FROM provider_session_runtime
                  WHERE provider_name = ?1",
-            )
-            .map_err(|error| {
-                AdapterError::Other(format!("read T3Code ownership table: {error}"))
-            })?;
-        let rows = statement
-            .query_map([provider_name], |row| {
-                let thread_id: String = row.get(0)?;
-                let cursor: String = row.get(1)?;
-                Ok((thread_id, cursor))
-            })
-            .map_err(|error| {
-                AdapterError::Other(format!("scan T3Code ownership table: {error}"))
-            })?;
-        let mut owners = Vec::new();
-        for row in rows {
-            let (thread_id, cursor) = row.map_err(|error| {
-                AdapterError::Other(format!("read T3Code ownership row: {error}"))
-            })?;
-            let cursor: Value = serde_json::from_str(&cursor).map_err(|error| {
-                AdapterError::Other(format!("parse T3Code resume cursor: {error}"))
-            })?;
-            if let Some(native_id) = cursor.get(cursor_key).and_then(Value::as_str) {
-                owners.push((native_id.to_owned(), SessionId(thread_id)));
+                )
+                .map_err(|error| {
+                    AdapterError::Other(format!("read T3Code ownership table: {error}"))
+                })?;
+            let rows = statement
+                .query_map([provider_name], |row| {
+                    let thread_id: String = row.get(0)?;
+                    let cursor: String = row.get(1)?;
+                    Ok((thread_id, cursor))
+                })
+                .map_err(|error| {
+                    AdapterError::Other(format!("scan T3Code ownership table: {error}"))
+                })?;
+            for row in rows {
+                let (thread_id, cursor) = row.map_err(|error| {
+                    AdapterError::Other(format!("read T3Code ownership row: {error}"))
+                })?;
+                let cursor: Value = serde_json::from_str(&cursor).map_err(|error| {
+                    AdapterError::Other(format!("parse T3Code resume cursor: {error}"))
+                })?;
+                if let Some(native_id) = cursor.get(cursor_key).and_then(Value::as_str) {
+                    owners.push((native_id.to_owned(), SessionId(thread_id)));
+                }
             }
         }
         for candidate in session.lineage.ownership_candidates(&session.id) {
@@ -1272,6 +1268,20 @@ mod tests {
             Some(SessionId("t3-thread-cl-001".into()))
         );
 
+        // why: preferring statev2 must retain descendant ownership routing.
+        let child_v2 = SessionSummary {
+            id: SessionId("unmapped-child".into()),
+            lineage: SessionLineage {
+                parent: Some(claude_v2.id.clone()),
+                ..Default::default()
+            },
+            ..claude_v2.clone()
+        };
+        assert_eq!(
+            adapter.native_owner(&child_v2).unwrap(),
+            Some(SessionId("t3-thread-cl-001".into()))
+        );
+
         fs::remove_file(path).unwrap();
     }
 
@@ -1322,6 +1332,8 @@ mod tests {
         let request = CompactionRequest {
             id: uuid::Uuid::new_v4(),
             session_id: gemini_session.id.clone(),
+            preempt: false,
+            resume_after_compaction: false,
             kind: CompactionKind::AgentRequested,
             prompt: "/compact".into(),
             reason: "test".into(),
@@ -1330,7 +1342,9 @@ mod tests {
         };
 
         assert!(matches!(
-            adapter.resume_session(&gemini_session, Some("continue")).await,
+            adapter
+                .resume_session(&gemini_session, Some("continue"))
+                .await,
             Err(AdapterError::Unsupported)
         ));
         assert!(matches!(
@@ -1348,10 +1362,8 @@ mod tests {
     fn default_state_db_prefers_statev2_over_legacy_state_sqlite() {
         // why: live T3Code writes to statev2.sqlite while leaving stale state.sqlite behind.
         // catches: hardcoding state.sqlite and missing all v2 Antigravity threads.
-        let dir = std::env::temp_dir().join(format!(
-            "usagewindow-t3-userdata-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("usagewindow-t3-userdata-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let v1 = dir.join("state.sqlite");
         let v2 = dir.join("statev2.sqlite");
