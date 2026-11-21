@@ -212,34 +212,27 @@ pub fn parse_usage_tsv(output: &str, at: DateTime<Utc>) -> AdapterResult<UsageSa
         if pool.is_empty() || window_label.is_empty() {
             continue;
         }
-        let remaining: f32 = pct_text
-            .strip_suffix('%')
-            .unwrap_or(pct_text)
-            .trim()
-            .parse()
-            .map_err(|_| {
-                AdapterError::Other(format!("invalid Antigravity remaining percent: {pct_text}"))
-            })?;
-        if !remaining.is_finite() {
-            return Err(AdapterError::Other(format!(
-                "non-finite Antigravity remaining percent: {pct_text}"
-            )));
-        }
+        let remaining = pct_text.strip_suffix('%').unwrap_or(pct_text).trim().parse::<f32>();
+        let remaining = match remaining {
+            Ok(value) if value.is_finite() => value,
+            _ => {
+                tracing::warn!(pool, window_label, "skipping invalid Antigravity remaining percent");
+                continue;
+            }
+        };
         let remaining_clamped = remaining.clamp(0.0, 100.0);
         let used_pct = (100.0 - remaining_clamped).clamp(0.0, 100.0);
         let exceeded = remaining_clamped <= 0.0;
         let resets_at = if reset_text.is_empty() || reset_text == "-" || reset_text == "N/A" {
             None
         } else {
-            Some(
-                DateTime::parse_from_rfc3339(reset_text)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .map_err(|_| {
-                        AdapterError::Other(format!(
-                            "invalid Antigravity reset timestamp: {reset_text}"
-                        ))
-                    })?,
-            )
+            match DateTime::parse_from_rfc3339(reset_text) {
+                Ok(value) => Some(value.with_timezone(&Utc)),
+                Err(_) => {
+                    tracing::warn!(pool, window_label, "skipping invalid Antigravity reset timestamp");
+                    continue;
+                }
+            }
         };
         let kind = map_window_kind(pool, window_label);
         windows.insert(
@@ -1112,6 +1105,18 @@ mod tests {
     async fn fix1_missing_agy_is_unsupported() {
         let reader = AgyCliUsageReader::new("/missing-uw-fix1/agy", None);
         assert!(matches!(reader.read_usage_tsv().await, Err(AdapterError::Unsupported)));
+    }
+
+    // why: one malformed quota row must not discard healthy sibling windows.
+    #[test]
+    fn fix1_malformed_usage_rows_do_not_drop_healthy_windows() {
+        for malformed in ["bad%\t-", "NaN%\t-", "50%\tbad-date"] {
+            let output = format!("Gemini Models\tFive Hour Limit Remaining\t70%\t-\nOther\tBad row\t{malformed}\nGemini Models\tWeekly Limit Remaining\t80%\t-\n");
+            let sample = parse_usage_tsv(&output, Utc::now()).unwrap();
+            assert_eq!(sample.windows.len(), 2);
+            assert_eq!(sample.windows[&WindowKey { provider: Provider::Gemini, kind: WindowKind::Rolling { minutes: 300 } }].pct, 30.0);
+            assert_eq!(sample.windows[&WindowKey { provider: Provider::Gemini, kind: WindowKind::Rolling { minutes: 10080 } }].pct, 20.0);
+        }
     }
 
     #[test]
