@@ -1898,12 +1898,16 @@ pub async fn run_policy_tick(
             .or_insert_with(|| analyze_account_windows(&samples, session.account.as_ref()));
         let mut suppress_idle = false;
         for (key, (blocks, window_exceeded)) in windows {
-            if session.harness == Provider::Gemini && matches!(&key.kind,
-                WindowKind::Custom(label) if label == "Claude and GPT models 5h") {
+            if session.harness == Provider::Gemini
+                && matches!(&key.kind,
+                WindowKind::Custom(label) if label == "Claude and GPT models 5h")
+            {
                 continue;
             }
-            if session.harness == Provider::Gemini && matches!(&key.kind,
-                WindowKind::WeeklySurface(label) if label == "Claude and GPT models") {
+            if session.harness == Provider::Gemini
+                && matches!(&key.kind,
+                WindowKind::WeeklySurface(label) if label == "Claude and GPT models")
+            {
                 continue;
             }
             let key = key.clone();
@@ -7909,19 +7913,57 @@ mod tests {
         struct RenamedObservation(Arc<dyn HarnessAdapter>);
         #[async_trait]
         impl HarnessAdapter for RenamedObservation {
-            fn provider(&self) -> Provider { Provider::Other("future-observer".into()) }
-            fn capabilities(&self) -> Capabilities { self.0.capabilities() }
-            async fn fetch_usage(&self, _: Option<&AccountId>) -> AdapterResult<UsageSample> { Err(AdapterError::Unsupported) }
-            async fn detect_stop(&self, _: &SessionId) -> AdapterResult<Option<StopReason>> { Ok(None) }
-            async fn emit_status(&self, _: &SessionId, _: StatusEvent) -> AdapterResult<DeliveryOutcome> { Err(AdapterError::Unsupported) }
-            async fn advise(&self, _: &SessionId, _: &str) -> AdapterResult<DeliveryOutcome> { Err(AdapterError::Unsupported) }
-            async fn compact(&self, _: &SessionSummary, _: &CompactionRequest) -> AdapterResult<DeliveryOutcome> { Err(AdapterError::Unsupported) }
-            async fn resume_session(&self, _: &SessionSummary, _: Option<&str>) -> AdapterResult<()> { Err(AdapterError::Unsupported) }
+            fn provider(&self) -> Provider {
+                Provider::Other("future-observer".into())
+            }
+            fn capabilities(&self) -> Capabilities {
+                self.0.capabilities()
+            }
+            async fn fetch_usage(&self, _: Option<&AccountId>) -> AdapterResult<UsageSample> {
+                Err(AdapterError::Unsupported)
+            }
+            async fn detect_stop(&self, _: &SessionId) -> AdapterResult<Option<StopReason>> {
+                Ok(None)
+            }
+            async fn emit_status(
+                &self,
+                _: &SessionId,
+                _: StatusEvent,
+            ) -> AdapterResult<DeliveryOutcome> {
+                Err(AdapterError::Unsupported)
+            }
+            async fn advise(&self, _: &SessionId, _: &str) -> AdapterResult<DeliveryOutcome> {
+                Err(AdapterError::Unsupported)
+            }
+            async fn compact(
+                &self,
+                _: &SessionSummary,
+                _: &CompactionRequest,
+            ) -> AdapterResult<DeliveryOutcome> {
+                Err(AdapterError::Unsupported)
+            }
+            async fn resume_session(
+                &self,
+                _: &SessionSummary,
+                _: Option<&str>,
+            ) -> AdapterResult<()> {
+                Err(AdapterError::Unsupported)
+            }
         }
         let renamed: Arc<dyn HarnessAdapter> = Arc::new(RenamedObservation(adapter.clone()));
         assert!(adapter.capabilities().observe_only);
-        assert!(!with_compaction_fallback(renamed.clone(), meta.clone()).capabilities().can_trigger_compaction);
-        assert!(!uw_adapters::fallback::FallbackCompactionAdapter::new(renamed, meta.clone()).capabilities().can_trigger_compaction);
+        assert!(
+            !with_compaction_fallback(renamed.clone(), meta.clone())
+                .capabilities()
+                .can_trigger_compaction
+        );
+        let direct = uw_adapters::fallback::FallbackCompactionAdapter::new(renamed, meta.clone());
+        assert!(!direct.capabilities().can_trigger_compaction);
+        assert!(matches!(
+            direct.compact(&gemini_session, &request()).await,
+            Err(AdapterError::Unsupported)
+        ));
+        assert_eq!(*meta.compacted.lock().unwrap(), 0);
         let adapter = with_compaction_fallback(adapter, meta);
         assert!(!adapter.capabilities().can_trigger_compaction);
         let adapters = HashMap::from([(Provider::Gemini, adapter)]);
@@ -7966,23 +8008,84 @@ mod tests {
         observed.harness = Provider::Gemini;
         observed.last_seen = now;
         let store = SqliteDaemonStore::new(Store::open_memory().unwrap());
-        store.inner.lock().unwrap().insert_session(&observed).unwrap();
-        store.set_keepalive_enabled(&observed.id, true).await.unwrap();
+        store
+            .inner
+            .lock()
+            .unwrap()
+            .insert_session(&observed)
+            .unwrap();
+        store
+            .inner
+            .lock()
+            .unwrap()
+            .insert_token_usage_records(&observed.id, &boundary_token_usage(now))
+            .unwrap();
+        assert!(is_keepalive_eligible(
+            &observed,
+            &boundary_token_usage(now),
+            now
+        ));
+        store
+            .set_keepalive_enabled(&observed.id, true)
+            .await
+            .unwrap();
         let sample = UsageSample {
-            at: now, fetched_at: Some(now), source: UsageSource::ProviderReported,
-            provider: Provider::Gemini, account: None, plan: None, credits: None,
+            at: now,
+            fetched_at: Some(now),
+            source: UsageSource::ProviderReported,
+            provider: Provider::Gemini,
+            account: None,
+            plan: None,
+            credits: None,
             windows: HashMap::from([
-                (WindowKey { provider: Provider::Gemini, kind: WindowKind::Rolling { minutes: 300 } }, UsageWindowState::new(10.0, false, true, None, None)),
-                (WindowKey { provider: Provider::Gemini, kind: WindowKind::Custom("Claude and GPT models 5h".into()) }, UsageWindowState::new(100.0, true, true, None, None)),
-                (WindowKey { provider: Provider::Gemini, kind: WindowKind::WeeklySurface("Claude and GPT models".into()) }, UsageWindowState::new(100.0, true, true, None, None)),
+                (
+                    WindowKey {
+                        provider: Provider::Gemini,
+                        kind: WindowKind::Rolling { minutes: 300 },
+                    },
+                    UsageWindowState::new(10.0, false, true, None, None),
+                ),
+                (
+                    WindowKey {
+                        provider: Provider::Gemini,
+                        kind: WindowKind::Custom("Claude and GPT models 5h".into()),
+                    },
+                    UsageWindowState::new(100.0, true, true, None, None),
+                ),
+                (
+                    WindowKey {
+                        provider: Provider::Gemini,
+                        kind: WindowKind::WeeklySurface("Claude and GPT models".into()),
+                    },
+                    UsageWindowState::new(100.0, true, true, None, None),
+                ),
             ]),
         };
-        store.inner.lock().unwrap().insert_usage_sample(&sample).unwrap();
-        let adapter: Arc<dyn HarnessAdapter> = Arc::new(FakeAdapter { capabilities: caps(false, false, false), compacted: Arc::new(StdMutex::new(0)), advised: Arc::new(StdMutex::new(0)) });
+        store
+            .inner
+            .lock()
+            .unwrap()
+            .insert_usage_sample(&sample)
+            .unwrap();
+        let adapter: Arc<dyn HarnessAdapter> = Arc::new(FakeAdapter {
+            capabilities: caps(false, false, false),
+            compacted: Arc::new(StdMutex::new(0)),
+            advised: Arc::new(StdMutex::new(0)),
+        });
         let adapters = HashMap::from([(Provider::Gemini, adapter)]);
         let profiles = HashMap::from([(observed.id.clone(), ThresholdProfile::default())]);
-        run_policy_tick(&store, &store, &adapters, &AlwaysActive, &[observed.clone()], &profiles, &mut PolicyRuntimeState::default(), now).await.unwrap();
+        run_policy_tick(
+            &store,
+            &store,
+            &adapters,
+            &AlwaysActive,
+            std::slice::from_ref(&observed),
+            &profiles,
+            &mut PolicyRuntimeState::default(),
+            now,
+        )
+        .await
+        .unwrap();
         assert!(store.keepalive_state(&observed.id).await.unwrap().enabled);
     }
-
 }
