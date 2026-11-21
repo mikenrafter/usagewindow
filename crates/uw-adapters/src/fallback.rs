@@ -42,6 +42,7 @@ impl HarnessAdapter for MessageCompactionAdapter {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            observe_only: false,
             can_trigger_compaction: true,
             can_advise_mid_turn: false,
             can_inject_at_session_start: false,
@@ -89,7 +90,11 @@ impl HarnessAdapter for FallbackCompactionAdapter {
     }
     fn capabilities(&self) -> Capabilities {
         let mut capabilities = self.native.capabilities();
-        capabilities.can_trigger_compaction |= self.meta.capabilities().can_trigger_compaction;
+        if capabilities.observe_only {
+            capabilities.can_trigger_compaction = false;
+        } else {
+            capabilities.can_trigger_compaction |= self.meta.capabilities().can_trigger_compaction;
+        }
         capabilities
     }
     async fn fetch_usage(&self, account: Option<&AccountId>) -> AdapterResult<UsageSample> {
@@ -127,6 +132,9 @@ impl HarnessAdapter for FallbackCompactionAdapter {
         session: &SessionSummary,
         request: &CompactionRequest,
     ) -> AdapterResult<DeliveryOutcome> {
+        if self.native.capabilities().observe_only {
+            return Err(AdapterError::Unsupported);
+        }
         match self.native.compact(session, request).await {
             Ok(DeliveryOutcome::Unsupported) => self.meta.compact(session, request).await,
             Ok(outcome) => Ok(outcome),
@@ -202,6 +210,7 @@ mod tests {
         }
         fn capabilities(&self) -> Capabilities {
             Capabilities {
+                observe_only: false,
                 can_trigger_compaction: self.can_trigger_compaction,
                 can_advise_mid_turn: false,
                 can_inject_at_session_start: false,

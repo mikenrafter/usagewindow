@@ -517,6 +517,7 @@ impl ClaudeCodeAdapter {
     }
     pub fn capabilities_static() -> Capabilities {
         Capabilities {
+            observe_only: false,
             can_trigger_compaction: true,
             can_advise_mid_turn: true,
             can_inject_at_session_start: true,
@@ -1563,6 +1564,7 @@ mod tests {
         assert_eq!(
             ClaudeCodeAdapter::capabilities_static(),
             Capabilities {
+                observe_only: false,
                 can_trigger_compaction: true,
                 can_advise_mid_turn: true,
                 can_inject_at_session_start: true,

@@ -64,6 +64,7 @@ impl HarnessAdapter for SequenceAdapter {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            observe_only: false,
             can_trigger_compaction: self.compact,
             can_advise_mid_turn: false,
             can_inject_at_session_start: false,

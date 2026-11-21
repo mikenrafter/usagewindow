@@ -731,6 +731,7 @@ impl AntigravityAdapter {
 
     pub fn capabilities_static() -> Capabilities {
         Capabilities {
+            observe_only: true,
             can_trigger_compaction: false,
             can_advise_mid_turn: false,
             can_inject_at_session_start: false,

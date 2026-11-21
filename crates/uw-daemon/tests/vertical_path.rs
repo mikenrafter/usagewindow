@@ -23,6 +23,7 @@ impl HarnessAdapter for FakeAdapter {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            observe_only: false,
             can_trigger_compaction: false,
             can_advise_mid_turn: false,
             can_inject_at_session_start: true,

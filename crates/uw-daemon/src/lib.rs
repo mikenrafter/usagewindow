@@ -3373,7 +3373,7 @@ fn with_compaction_fallback(
     native: Arc<dyn HarnessAdapter>,
     meta: Arc<dyn HarnessAdapter>,
 ) -> Arc<dyn HarnessAdapter> {
-    if native.provider() == Provider::Gemini {
+    if native.capabilities().observe_only {
         return native;
     }
     Arc::new(uw_adapters::fallback::FallbackCompactionAdapter::new(
@@ -3616,6 +3616,7 @@ mod tests {
     }
     fn caps(compact: bool, advise: bool, start: bool) -> Capabilities {
         Capabilities {
+            observe_only: false,
             can_trigger_compaction: compact,
             can_advise_mid_turn: advise,
             can_inject_at_session_start: start,
@@ -7902,6 +7903,23 @@ mod tests {
             compacted: Arc::new(StdMutex::new(0)),
             advised: Arc::new(StdMutex::new(0)),
         });
+        // An observe-only adapter with a future provider name must stay read-only.
+        struct RenamedObservation(Arc<dyn HarnessAdapter>);
+        #[async_trait]
+        impl HarnessAdapter for RenamedObservation {
+            fn provider(&self) -> Provider { Provider::Other("future-observer".into()) }
+            fn capabilities(&self) -> Capabilities { self.0.capabilities() }
+            async fn fetch_usage(&self, _: Option<&AccountId>) -> AdapterResult<UsageSample> { Err(AdapterError::Unsupported) }
+            async fn detect_stop(&self, _: &SessionId) -> AdapterResult<Option<StopReason>> { Ok(None) }
+            async fn emit_status(&self, _: &SessionId, _: StatusEvent) -> AdapterResult<DeliveryOutcome> { Err(AdapterError::Unsupported) }
+            async fn advise(&self, _: &SessionId, _: &str) -> AdapterResult<DeliveryOutcome> { Err(AdapterError::Unsupported) }
+            async fn compact(&self, _: &SessionSummary, _: &CompactionRequest) -> AdapterResult<DeliveryOutcome> { Err(AdapterError::Unsupported) }
+            async fn resume_session(&self, _: &SessionSummary, _: Option<&str>) -> AdapterResult<()> { Err(AdapterError::Unsupported) }
+        }
+        let renamed: Arc<dyn HarnessAdapter> = Arc::new(RenamedObservation(adapter.clone()));
+        assert!(adapter.capabilities().observe_only);
+        assert!(!with_compaction_fallback(renamed.clone(), meta.clone()).capabilities().can_trigger_compaction);
+        assert!(!uw_adapters::fallback::FallbackCompactionAdapter::new(renamed, meta.clone()).capabilities().can_trigger_compaction);
         let adapter = with_compaction_fallback(adapter, meta);
         assert!(!adapter.capabilities().can_trigger_compaction);
         let adapters = HashMap::from([(Provider::Gemini, adapter)]);
@@ -7937,7 +7955,8 @@ mod tests {
                 .is_empty(),
             "observe-only Gemini adapter must never auto-schedule a resume marker"
         );
-    }    // why: exhausting the Claude/GPT pool must not pause a Gemini session's keepalive.
+    }
+    // why: exhausting the Claude/GPT pool must not pause a Gemini session's keepalive.
     #[tokio::test]
     async fn fix1_gemini_policy_ignores_claude_gpt_windows() {
         let now = Utc::now();

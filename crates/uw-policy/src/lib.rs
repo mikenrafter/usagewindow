@@ -1501,6 +1501,7 @@ mod tests {
 
     fn caps() -> Capabilities {
         Capabilities {
+            observe_only: false,
             can_trigger_compaction: true,
             can_advise_mid_turn: true,
             can_inject_at_session_start: true,

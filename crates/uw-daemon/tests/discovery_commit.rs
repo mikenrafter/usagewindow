@@ -172,6 +172,7 @@ impl HarnessAdapter for MultipleSources {
     }
     fn capabilities(&self) -> uw_core::adapter::Capabilities {
         uw_core::adapter::Capabilities {
+            observe_only: false,
             can_trigger_compaction: false,
             can_advise_mid_turn: false,
             can_inject_at_session_start: false,

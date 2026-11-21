@@ -2322,6 +2322,7 @@ mod tests {
         let adapters: HashMap<Provider, Arc<dyn HarnessAdapter>> = HashMap::from([(
             Provider::Codex,
             Arc::new(StubAdapter(uw_core::adapter::Capabilities {
+                observe_only: false,
                 can_trigger_compaction: true,
                 can_advise_mid_turn: false,
                 can_inject_at_session_start: true,
@@ -2482,6 +2483,7 @@ mod tests {
 
     fn unsupported_caps() -> uw_core::adapter::Capabilities {
         uw_core::adapter::Capabilities {
+            observe_only: false,
             can_trigger_compaction: false,
             can_advise_mid_turn: false,
             can_inject_at_session_start: false,
@@ -3162,6 +3164,7 @@ mod tests {
         }
         fn capabilities(&self) -> uw_core::adapter::Capabilities {
             uw_core::adapter::Capabilities {
+                observe_only: false,
                 can_trigger_compaction: false,
                 can_advise_mid_turn: false,
                 can_inject_at_session_start: true,

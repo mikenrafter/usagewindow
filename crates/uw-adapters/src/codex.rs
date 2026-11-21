@@ -234,6 +234,7 @@ impl CodexAdapter {
 
     pub fn capabilities_static() -> Capabilities {
         Capabilities {
+            observe_only: false,
             can_trigger_compaction: true,
             can_advise_mid_turn: true,
             can_inject_at_session_start: true,
@@ -1283,6 +1284,7 @@ done
         assert_eq!(
             CodexAdapter::capabilities_static(),
             Capabilities {
+                observe_only: false,
                 can_trigger_compaction: true,
                 can_advise_mid_turn: true,
                 can_inject_at_session_start: true,

@@ -808,6 +808,7 @@ mod tests {
             Arc::new(FakeAdapter {
                 provider: Provider::Codex,
                 capabilities: Capabilities {
+                    observe_only: false,
                     can_trigger_compaction: false,
                     can_advise_mid_turn: false,
                     can_inject_at_session_start: true,
@@ -1114,6 +1115,7 @@ mod tests {
             Arc::new(FakeAdapter {
                 provider: Provider::ClaudeCode,
                 capabilities: Capabilities {
+                    observe_only: false,
                     can_trigger_compaction: true,
                     can_advise_mid_turn: false,
                     can_inject_at_session_start: true,

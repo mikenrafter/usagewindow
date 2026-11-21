@@ -19,6 +19,9 @@ pub enum AdapterError {
 pub type AdapterResult<T> = Result<T, AdapterError>;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
+    /// Observation must never be promoted to action by a delivery fallback.
+    #[serde(default)]
+    pub observe_only: bool,
     /// Whether the harness exposes a destructive compaction command (false for Codex,
     /// whose compaction is automatic and opaque).
     pub can_trigger_compaction: bool,

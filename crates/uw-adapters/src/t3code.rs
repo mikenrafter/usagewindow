@@ -307,6 +307,7 @@ impl T3CodeAdapter {
 
     pub fn capabilities_static() -> Capabilities {
         Capabilities {
+            observe_only: false,
             can_trigger_compaction: true,
             can_advise_mid_turn: false,
             can_inject_at_session_start: false,
@@ -1109,6 +1110,7 @@ mod tests {
         assert_eq!(
             T3CodeAdapter::capabilities_static(),
             Capabilities {
+                observe_only: false,
                 can_trigger_compaction: true,
                 can_advise_mid_turn: false,
                 can_inject_at_session_start: false,
