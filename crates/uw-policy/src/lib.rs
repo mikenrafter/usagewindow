@@ -13,6 +13,24 @@ const ROLLOVER_TOLERANCE: Duration = Duration::minutes(2);
 const CACHE_WRITE_MIN_PCT: f32 = 0.1;
 const CACHE_WRITE_MAX_PCT: f32 = 20.0;
 
+/// Server-side prompt-cache TTL for `Provider::Gemini` (Antigravity).
+/// `None` means unmeasured/unknown — update this single constant once the live
+/// TTL probe determines expiry. Never default to Claude's 1-hour extended TTL.
+pub const GEMINI_CACHE_TTL: Option<Duration> = None;
+
+/// Default prompt-cache TTL per provider for timing-dependent policies
+/// (idle-compact, auto-reseed, keepalive). `None` keeps those policies
+/// inactive when a provider's cache TTL is unknown.
+pub fn default_cache_ttl(provider: &Provider) -> Option<Duration> {
+    match provider {
+        Provider::ClaudeCode | Provider::Codex => {
+            Some(Duration::minutes(uw_core::model::CACHE_WARM_APPROXIMATION_MINUTES))
+        }
+        Provider::Gemini => GEMINI_CACHE_TTL,
+        Provider::Cursor | Provider::Other(_) => None,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CacheCostObservation {
     pub at: DateTime<Utc>,
@@ -1001,6 +1019,31 @@ mod tests {
             c,
             &caps
         ));
+    }
+
+    #[test]
+    fn default_cache_ttl_treats_gemini_as_unknown_and_never_one_hour() {
+        // why: Antigravity prompt-cache TTL is server-side and unmeasured;
+        //      uw must treat Gemini as unknown (None) rather than Claude's 1h
+        //      extended TTL, while preserving 5m for ClaudeCode/Codex.
+        // catches: returning Some(Duration::hours(1)) or hardcoding 5m for Gemini
+        //          when policy triggers must stay inactive until measured.
+        assert_eq!(GEMINI_CACHE_TTL, None);
+        assert_eq!(default_cache_ttl(&Provider::Gemini), None);
+        assert_eq!(
+            default_cache_ttl(&Provider::ClaudeCode),
+            Some(Duration::minutes(
+                uw_core::model::CACHE_WARM_APPROXIMATION_MINUTES
+            ))
+        );
+        assert_eq!(
+            default_cache_ttl(&Provider::Codex),
+            Some(Duration::minutes(
+                uw_core::model::CACHE_WARM_APPROXIMATION_MINUTES
+            ))
+        );
+        assert_eq!(default_cache_ttl(&Provider::Cursor), None);
+        assert_eq!(default_cache_ttl(&Provider::Other("custom".into())), None);
     }
 
     fn caps() -> Capabilities {
