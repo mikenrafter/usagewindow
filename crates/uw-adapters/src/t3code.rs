@@ -291,6 +291,22 @@ impl T3CodeAdapter {
         Ok(None)
     }
 
+    fn is_antigravity_thread(&self, id: &SessionId) -> AdapterResult<bool> {
+        let Some(path) = self.state_db.as_ref().filter(|path| path.exists()) else {
+            return Ok(false);
+        };
+        let connection =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|error| AdapterError::Other(error.to_string()))?;
+        if !sqlite_table_exists(&connection, "orchestration_v2_projection_provider_threads")? {
+            return Ok(false);
+        }
+        connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM orchestration_v2_projection_provider_threads WHERE provider='antigravity' AND (thread_id=?1 OR json_extract(payload_json,'$.nativeThreadRef.nativeId')=?1))",
+            [&id.0], |row| row.get(0),
+        ).map_err(|error| AdapterError::Other(error.to_string()))
+    }
+
     async fn owned_thread(&self, session: &SessionSummary) -> AdapterResult<SessionId> {
         let thread_id = match &session.harness {
             Provider::Other(name) if name == "t3code" => session.id.clone(),
@@ -298,7 +314,18 @@ impl T3CodeAdapter {
                 .native_owner(session)?
                 .ok_or(AdapterError::Unsupported)?,
         };
+        if self.is_antigravity_thread(&thread_id)? {
+            return Err(AdapterError::Unsupported);
+        }
         match self.transport.get_thread(&thread_id.0).await {
+            Ok(snapshot)
+                if snapshot
+                    .pointer("/thread/session/providerName")
+                    .and_then(Value::as_str)
+                    == Some("antigravity") =>
+            {
+                Err(AdapterError::Unsupported)
+            }
             Ok(_) => Ok(thread_id),
             Err(AdapterError::Other(_)) => Err(AdapterError::Unsupported),
             Err(error) => Err(error),
@@ -436,6 +463,17 @@ impl HarnessAdapter for T3CodeAdapter {
     }
 
     async fn interrupt(&self, session_id: &SessionId) -> AdapterResult<DeliveryOutcome> {
+        if self.is_antigravity_thread(session_id)? {
+            return Err(AdapterError::Unsupported);
+        }
+        let snapshot = self.transport.get_thread(&session_id.0).await?;
+        if snapshot
+            .pointer("/thread/session/providerName")
+            .and_then(Value::as_str)
+            == Some("antigravity")
+        {
+            return Err(AdapterError::Unsupported);
+        }
         self.transport
             .post_interrupt(Self::interrupt_payload(&session_id.0))
             .await
@@ -1336,8 +1374,15 @@ mod tests {
         };
         // why: observe-only includes metadata writes and clears, before any HTTP read.
         for status in [Some(json!({"text": "Paused"})), None] {
-            assert!(matches!(adapter.set_external_status(&gemini_session, status).await, Err(AdapterError::Unsupported)));
+            assert!(matches!(
+                adapter.set_external_status(&gemini_session, status).await,
+                Err(AdapterError::Unsupported)
+            ));
         }
+        assert!(matches!(
+            adapter.interrupt(&gemini_session.id).await,
+            Err(AdapterError::Unsupported)
+        ));
         assert!(transport.calls.lock().unwrap().is_empty());
         let request = CompactionRequest {
             id: uuid::Uuid::new_v4(),
