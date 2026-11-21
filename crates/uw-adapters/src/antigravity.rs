@@ -83,7 +83,13 @@ impl AntigravityUsageReader for AgyCliUsageReader {
 
         let child = command
             .spawn()
-            .map_err(|error| AdapterError::Transient(format!("spawn {}: {error}", self.program)))?;
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    AdapterError::Unsupported
+                } else {
+                    AdapterError::Transient(format!("spawn {}: {error}", self.program))
+                }
+            })?;
         let output = tokio::time::timeout(
             StdDuration::from_secs(AGY_USAGE_TIMEOUT_SECS),
             child.wait_with_output(),
@@ -1099,6 +1105,13 @@ mod tests {
             ),
             Err(AdapterError::Other(_))
         ));
+    }
+
+    // why: a missing optional CLI is unsupported, never a retryable provider outage.
+    #[tokio::test]
+    async fn fix1_missing_agy_is_unsupported() {
+        let reader = AgyCliUsageReader::new("/missing-uw-fix1/agy", None);
+        assert!(matches!(reader.read_usage_tsv().await, Err(AdapterError::Unsupported)));
     }
 
     #[test]
