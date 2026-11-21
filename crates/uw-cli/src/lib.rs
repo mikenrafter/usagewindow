@@ -567,8 +567,15 @@ impl DirectReader for StoreReader {
                 }
             }
             let key = format!("{:?}:{:?}", s.provider, s.account);
-            if latest.get(&key).is_none_or(|old| old.at < s.at) {
-                latest.insert(key, s);
+            match latest.get_mut(&key) {
+                Some(old) if old.at == s.at => old.windows.extend(s.windows),
+                Some(old) if old.at < s.at => {
+                    *old = s;
+                }
+                None => {
+                    latest.insert(key, s);
+                }
+                _ => {}
             }
         }
         let usage = latest
@@ -880,5 +887,83 @@ mod tests {
             direct: Direct,
         };
         fallback.status(&StatusArgs::default()).unwrap();
+    }
+
+    #[test]
+    fn store_reader_status_preserves_all_windows_from_multi_window_gemini_snapshot() {
+        // why: Store persists one usage_samples row per window sharing the same `at`
+        //      timestamp; `uw status --json` direct DB fallback must merge all windows
+        //      from the latest snapshot instead of keeping only the first row.
+        // catches: `if latest.get(&key).is_none_or(|old| old.at < s.at)` dropping
+        //          sibling windows (e.g. weekly or Claude/GPT pool) with equal `at`.
+        let path = std::env::temp_dir().join(format!(
+            "usagewindow-cli-gemini-status-{}-{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path_str = path.to_string_lossy().into_owned();
+        let store = Store::open(&path_str).unwrap();
+        let now = Utc::now();
+        let sample = UsageSample {
+            at: now,
+            fetched_at: Some(now),
+            source: UsageSource::ProviderReported,
+            provider: Provider::Gemini,
+            account: None,
+            plan: None,
+            windows: std::collections::HashMap::from([
+                (
+                    WindowKey {
+                        provider: Provider::Gemini,
+                        kind: WindowKind::Rolling { minutes: 300 },
+                    },
+                    UsageWindowState::new(61.0, false, true, None, None),
+                ),
+                (
+                    WindowKey {
+                        provider: Provider::Gemini,
+                        kind: WindowKind::Rolling { minutes: 10_080 },
+                    },
+                    UsageWindowState::new(17.0, false, true, None, None),
+                ),
+                (
+                    WindowKey {
+                        provider: Provider::Gemini,
+                        kind: WindowKind::Custom("Claude and GPT models 5h".into()),
+                    },
+                    UsageWindowState::new(0.0, false, true, None, None),
+                ),
+                (
+                    WindowKey {
+                        provider: Provider::Gemini,
+                        kind: WindowKind::WeeklySurface("Claude and GPT models".into()),
+                    },
+                    UsageWindowState::new(0.0, false, true, None, None),
+                ),
+            ]),
+            credits: None,
+        };
+        store.insert_usage_sample(&sample).unwrap();
+        store
+            .record_fetch_success(&Provider::Gemini, None, now)
+            .unwrap();
+        drop(store);
+
+        let mut reader = StoreReader::open(&path_str).unwrap();
+        let status = reader.status(&StatusArgs::default()).unwrap();
+        assert_eq!(status.usage.len(), 1);
+        assert_eq!(status.usage[0].provider, Provider::Gemini);
+        assert_eq!(status.usage[0].windows.len(), 4);
+        assert!(status.usage[0].windows.iter().any(|w| {
+            w.window == WindowKind::Rolling { minutes: 300 } && (w.pct - 61.0).abs() < f32::EPSILON
+        }));
+        assert!(status.usage[0].windows.iter().any(|w| {
+            w.window == WindowKind::Rolling { minutes: 10_080 }
+                && (w.pct - 17.0).abs() < f32::EPSILON
+        }));
+
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path_str}{suffix}"));
+        }
     }
 }
