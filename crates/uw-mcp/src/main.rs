@@ -291,9 +291,7 @@ fn daemon_request<T: serde::de::DeserializeOwned>(
 fn get_usage(args: &Value, deps: &Deps) -> Result<Value, String> {
     let provider = args.get("provider").and_then(Value::as_str);
     let account = args.get("account").and_then(Value::as_str);
-    let mut request = deps
-        .client
-        .get(format!("{}/api/status", deps.daemon_url));
+    let mut request = deps.client.get(format!("{}/api/status", deps.daemon_url));
     if let Some(provider) = provider {
         request = request.query(&[("provider", provider)]);
     }
@@ -318,10 +316,7 @@ fn call_tool(
             let session_id = session_id_argument(args, caller_session_id)?;
             let detail: SessionDetail = daemon_request(
                 deps.client
-                    .get(format!(
-                        "{}/api/sessions/{}",
-                        deps.daemon_url, session_id.0
-                    ))
+                    .get(format!("{}/api/sessions/{}", deps.daemon_url, session_id.0))
                     .send()
                     .map_err(|error| error.to_string())?,
             )?;
@@ -738,7 +733,8 @@ fn main() -> anyhow::Result<()> {
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
-        let address = std::env::var("UW_MCP_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:7880".into());
+        let address =
+            std::env::var("UW_MCP_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:7880".into());
         let listener = tokio::net::TcpListener::bind(&address).await?;
         axum::serve(listener, http_app(Arc::clone(&deps))).await?;
         Ok(())
