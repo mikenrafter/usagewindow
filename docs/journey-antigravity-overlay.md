@@ -7,7 +7,7 @@ cache TTL fields and scheduling machinery.
 The port retains the pilot's quota parsing, conversation token accounting,
 statev2 discovery, and equal-timestamp sibling-window merge. T3Code conflict
 resolution keeps the overlay branch's ownership and lineage routing, reason-aware
-compaction instructions, and external-status transport. Gemini compact and resume
+compaction instructions, and (since removed; see the last section) external-status transport. Gemini compact and resume
 refusals run before ownership lookup or delivery. The v2 pilot lookup initially
 skipped parent ownership. A failing child-session regression exposed that mismatch;
 both database formats now feed the existing direct-first lineage candidate order.
@@ -34,9 +34,8 @@ results, mutations, and remaining uncertainty. No UI or mock-up changes apply.
 
 ## Fix round 1
 
-Review exposed a T3 metadata-write route through external status updates. A
-regression now exercises both setting and clearing status before transport access.
-Further read-only enforcement uses an explicit `observe_only` capability so
+Review exposed a T3 metadata-write route through external status updates (the
+route is gone; see the last section). Further read-only enforcement uses an explicit `observe_only` capability so
 future adapters can opt out without disabling Cursor or generic-hook fallback.
 
 The call-accounting regression reproduced double-counting when a late step row
@@ -66,3 +65,20 @@ The policy loop now skips adapters marked observe-only before consulting quota
 windows or applying policy side effects. The previous Antigravity quota labels
 were removed from the daemon. The replacement regression uses an unfamiliar
 provider and runs both flag values to show ordinary policy behavior still runs.
+
+## Removal of the T3Code status overlay
+
+Owner decision, 2026-11-21: the status overlay is non-functional and should not
+ship in usagewindow. Review also found it dead in production wiring: the daemon
+registers T3Code as `FallbackCompactionAdapter(t3code, paseo)`, and that wrapper never
+delegated `set_external_status`, so every call returned the trait default
+`Unsupported` and the daemon swallowed it at debug level.
+
+Removed: the `HarnessAdapter::set_external_status` trait method, the T3Code adapter
+implementation and its `post_thread_status` transport route, the daemon's
+`sync_t3_external_status` loop with the status resolver and timestamp helper, and
+their tests. T3 session discovery, resume, compaction, the owner-routing barriers,
+the Antigravity observe-only adapter, cache-TTL handling and quota windows are
+unchanged. The two owner-barrier regressions that drove their check through
+`set_external_status` now drive it through `resume_session`, which shares the same
+`owned_thread` guard, so that coverage stays.
