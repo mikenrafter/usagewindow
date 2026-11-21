@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uw_core::adapter::{
@@ -205,6 +205,14 @@ async fn antigravity_observation_persists_gemini_windows_and_t3_sessions_observe
             *self.dispatches.lock().unwrap() += 1;
             Ok(serde_json::json!({"sequence": 2}))
         }
+        async fn post_thread_status(
+            &self,
+            _: &str,
+            _: Option<serde_json::Value>,
+        ) -> AdapterResult<serde_json::Value> {
+            *self.dispatches.lock().unwrap() += 1;
+            Ok(serde_json::json!({}))
+        }
         async fn get_thread(&self, id: &str) -> AdapterResult<serde_json::Value> {
             Ok(serde_json::json!({
                 "thread": {
@@ -270,9 +278,9 @@ async fn antigravity_observation_persists_gemini_windows_and_t3_sessions_observe
     let t3_transport = Arc::new(RecordingT3Transport {
         dispatches: Mutex::new(0),
     });
-    let t3_adapter: Arc<dyn HarnessAdapter> = Arc::new(
-        uw_adapters::t3code::T3CodeAdapter::new(t3_transport.clone()),
-    );
+    let t3_adapter: Arc<dyn HarnessAdapter> = Arc::new(uw_adapters::t3code::T3CodeAdapter::new(
+        t3_transport.clone(),
+    ));
     let adapters = HashMap::from([
         (Provider::Gemini, ag_adapter),
         (Provider::Other("t3code".into()), t3_adapter),
@@ -280,7 +288,9 @@ async fn antigravity_observation_persists_gemini_windows_and_t3_sessions_observe
 
     let db_str = uw_db.to_string_lossy().into_owned();
     let store = Arc::new(SqliteDaemonStore::new(Store::open(&db_str).unwrap()));
-    let report = run_observation_tick(store.as_ref(), &adapters).await.unwrap();
+    let report = run_observation_tick(store.as_ref(), &adapters)
+        .await
+        .unwrap();
     assert_eq!(report.samples_recorded, 1);
     assert_eq!(report.sessions_discovered, 1);
     // t3code.fetch_usage is Unsupported (1 adapter error), Antigravity has 0 errors.
@@ -297,6 +307,7 @@ async fn antigravity_observation_persists_gemini_windows_and_t3_sessions_observe
         created_at: now,
         status: ResumeStatus::Scheduled,
         message: Some("should not fire".into()),
+        preempt: false,
     };
     store.insert_resume_marker(marker).await.unwrap();
     run_resume_tick(store.as_ref(), &adapters, now)
@@ -314,6 +325,18 @@ async fn antigravity_observation_persists_gemini_windows_and_t3_sessions_observe
     assert_eq!(session.model, Some(ModelId("gemini-4-neon".into())));
     assert_eq!(session.context_window_size, Some(1_048_576));
     assert_eq!(session.last_known_token_count, Some(46_547));
+    // why: discovery must persist the measured TTL for shared cache-warm consumers.
+    assert_eq!(session.cache_ttl, Some(Duration::minutes(23)));
+    assert!(is_cache_warm_for(
+        session.last_seen,
+        session.last_seen + Duration::minutes(23),
+        session.prompt_cache_ttl()
+    ));
+    assert!(!is_cache_warm_for(
+        session.last_seen,
+        session.last_seen + Duration::minutes(23) + Duration::seconds(1),
+        session.prompt_cache_ttl()
+    ));
     assert_eq!(
         reader.resolve_session_title(&thread_id).unwrap().as_deref(),
         Some("Neon Integration Run")

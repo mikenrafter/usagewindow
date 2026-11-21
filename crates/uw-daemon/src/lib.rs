@@ -1,10 +1,10 @@
 //! Polling and delivery orchestration. Decisions are kept separate from I/O so
 //! policy behavior can be tested with synthetic state and fake adapters/stores.
 
-mod local_api;
 mod cadence;
 #[cfg(test)]
 mod cadence_regression_tests;
+mod local_api;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -517,7 +517,8 @@ fn apply_threshold_values(
 impl DaemonStore for SqliteDaemonStore {
     async fn actions_inhibited(&self, provider: &Provider) -> anyhow::Result<bool> {
         let provider = provider.clone();
-        self.blocking(move |store| Ok(store.actions_inhibited(&provider)?)).await
+        self.blocking(move |store| Ok(store.actions_inhibited(&provider)?))
+            .await
     }
 
     async fn pending_compactions(&self) -> anyhow::Result<Vec<CompactionRequest>> {
@@ -627,7 +628,8 @@ impl DaemonStore for SqliteDaemonStore {
 impl ReseedStore for SqliteDaemonStore {
     async fn reseed_inhibited(&self, provider: &Provider) -> anyhow::Result<bool> {
         let provider = provider.clone();
-        self.blocking(move |store| Ok(store.actions_inhibited(&provider)?)).await
+        self.blocking(move |store| Ok(store.actions_inhibited(&provider)?))
+            .await
     }
 
     async fn insert_reseed_summary(&self, summary: ReseedSummary) -> anyhow::Result<()> {
@@ -658,7 +660,8 @@ impl ReseedStore for SqliteDaemonStore {
 impl KeepaliveStore for SqliteDaemonStore {
     async fn keepalive_inhibited(&self, provider: &Provider) -> anyhow::Result<bool> {
         let provider = provider.clone();
-        self.blocking(move |store| Ok(store.actions_inhibited(&provider)?)).await
+        self.blocking(move |store| Ok(store.actions_inhibited(&provider)?))
+            .await
     }
 
     async fn keepalive_sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
@@ -743,8 +746,14 @@ impl ObservationStore for SqliteDaemonStore {
                 harness: provider,
                 model: found.model,
                 account,
-                first_seen: found.first_seen.or_else(|| known.as_ref().map(|s| s.first_seen)).unwrap_or(now),
-                last_seen: found.last_seen.or_else(|| known.as_ref().map(|s| s.last_seen)).unwrap_or(now),
+                first_seen: found
+                    .first_seen
+                    .or_else(|| known.as_ref().map(|s| s.first_seen))
+                    .unwrap_or(now),
+                last_seen: found
+                    .last_seen
+                    .or_else(|| known.as_ref().map(|s| s.last_seen))
+                    .unwrap_or(now),
                 cwd: found.cwd,
                 state_path: found.state_path,
                 context_window_size: found.context_window_size,
@@ -1162,7 +1171,10 @@ pub async fn run_reseed(
     summarizer: &dyn Summarizer,
     store: &dyn ReseedStore,
 ) -> anyhow::Result<SessionId> {
-    anyhow::ensure!(!store.reseed_inhibited(&session.harness).await?, "active behavior is inhibited");
+    anyhow::ensure!(
+        !store.reseed_inhibited(&session.harness).await?,
+        "active behavior is inhibited"
+    );
     let transcript = adapter.export_transcript(session).await?;
     let before = transcript.split_whitespace().count() as u64;
     let summary = summarizer
@@ -1180,7 +1192,10 @@ pub async fn run_reseed(
             created_at: Utc::now(),
         })
         .await?;
-    anyhow::ensure!(!store.reseed_inhibited(&session.harness).await?, "active behavior is inhibited");
+    anyhow::ensure!(
+        !store.reseed_inhibited(&session.harness).await?,
+        "active behavior is inhibited"
+    );
     let new_id = adapter
         .seed_new_session(
             SeedMode::InitialPrompt,
@@ -1238,7 +1253,9 @@ pub async fn run_reseed_auto_tick(
     time_since_last_reseed: Duration,
     profile: &ThresholdProfile,
 ) -> anyhow::Result<Option<SessionId>> {
-    if store.reseed_inhibited(&session.harness).await? { return Ok(None); }
+    if store.reseed_inhibited(&session.harness).await? {
+        return Ok(None);
+    }
     let should = uw_policy::should_auto_reseed(
         now - session.last_seen,
         session.cache_ttl.unwrap_or(cache_ttl),
@@ -1278,7 +1295,9 @@ where
 {
     let mut reseeded = 0;
     for session in sessions {
-        if store.actions_inhibited(&session.harness).await? { continue; }
+        if store.actions_inhibited(&session.harness).await? {
+            continue;
+        }
 
         let Some(profile) = profiles.get(&session.id) else {
             continue;
@@ -1553,7 +1572,9 @@ pub async fn run_keepalive_tick(
 ) -> anyhow::Result<u32> {
     let mut sent = 0;
     for session in store.keepalive_sessions().await? {
-        if store.keepalive_inhibited(&session.harness).await? { continue; }
+        if store.keepalive_inhibited(&session.harness).await? {
+            continue;
+        }
 
         let records = token_records
             .get(&session.id)
@@ -1614,7 +1635,9 @@ pub async fn run_compaction_tick(
             continue;
         }
         let session = store.compaction_owner(&request.session_id).await?;
-        if store.actions_inhibited(&session.harness).await? { continue; }
+        if store.actions_inhibited(&session.harness).await? {
+            continue;
+        }
         let Some(adapter) = adapters.get(&session.harness) else {
             store
                 .update_compaction(request.id, CompactionStatus::Failed("no adapter".into()))
@@ -1691,7 +1714,14 @@ pub async fn run_compaction_tick(
                     session
                 };
                 if store.actions_inhibited(&session.harness).await? {
-                    store.update_compaction(request.id, CompactionStatus::Failed("active behavior inhibited after claim".into())).await?;
+                    store
+                        .update_compaction(
+                            request.id,
+                            CompactionStatus::Failed(
+                                "active behavior inhibited after claim".into(),
+                            ),
+                        )
+                        .await?;
                     continue;
                 }
                 let result = adapter.compact(&session, &request).await;
@@ -1850,7 +1880,9 @@ pub async fn run_policy_tick(
     let mut samples_by_account = SamplesByAccount::default();
     let mut windows_by_account = HashMap::new();
     for session in sessions {
-        if store.actions_inhibited(&session.harness).await? { continue; }
+        if store.actions_inhibited(&session.harness).await? {
+            continue;
+        }
 
         let Some(adapter) = adapters.get(&session.harness) else {
             continue;
@@ -2075,7 +2107,9 @@ impl IdleEpisodeTracker {
         profile: &ThresholdProfile,
         adapter: &dyn HarnessAdapter,
     ) -> anyhow::Result<bool> {
-        if store.actions_inhibited(&session.harness).await? { return Ok(false); }
+        if store.actions_inhibited(&session.harness).await? {
+            return Ok(false);
+        }
         if !idle || !activity_is_idle(adapter, session).await {
             self.enqueued.remove(&session.id);
             return Ok(false);
@@ -2154,7 +2188,9 @@ async fn handle_hard_boundary(
     adapter: &dyn HarnessAdapter,
     active: bool,
 ) -> anyhow::Result<()> {
-    if store.actions_inhibited(&session.harness).await? { return Ok(()); }
+    if store.actions_inhibited(&session.harness).await? {
+        return Ok(());
+    }
     let requests = store.compaction_requests_for_session(&session.id).await?;
     let latest = requests
         .iter()
@@ -2271,7 +2307,9 @@ async fn reconcile_resume_marker_with_token_rates(
     sessions: &[SessionSummary],
     token_rates: &HashMap<SessionId, f64>,
 ) -> anyhow::Result<bool> {
-    if store.actions_inhibited(&session.harness).await? { return Ok(false); }
+    if store.actions_inhibited(&session.harness).await? {
+        return Ok(false);
+    }
     let token_burn_rate = scaled_token_burn_rate(block, session, sessions, token_rates);
     match store.active_resume_marker(&session.id).await? {
         Some(marker) if marker.resume_at.is_none() => {
@@ -2511,7 +2549,9 @@ pub async fn run_preempt_resume_tick(
     let mut token_rates = HashMap::new();
     let mut token_records = HashMap::new();
     for session in sessions {
-        if store.actions_inhibited(&session.harness).await? { continue; }
+        if store.actions_inhibited(&session.harness).await? {
+            continue;
+        }
         let burn_lookback = uw_policy::burn_rate_lookback(&session.harness);
         let records = store.token_usage(&session.id).await?;
         token_records.insert(session.id.clone(), records.clone());
@@ -2531,7 +2571,9 @@ pub async fn run_preempt_resume_tick(
     let mut seen_windows = HashSet::new();
     let mut moved = 0usize;
     for session in sessions {
-        if store.actions_inhibited(&session.harness).await? { continue; }
+        if store.actions_inhibited(&session.harness).await? {
+            continue;
+        }
         // Samples depend only on provider and account; loading them once per
         // session reread ~10k rows for each of ~1,000 sessions every tick.
         let samples = samples_by_account.load(store, session).await?;
@@ -2673,7 +2715,9 @@ pub async fn run_resume_tick(
     let mut samples_by_account = SamplesByAccount::default();
     for marker in store.due_resume_markers(now).await? {
         let session = store.resume_owner(&marker.session_id).await?;
-        if store.actions_inhibited(&session.harness).await? { continue; }
+        if store.actions_inhibited(&session.harness).await? {
+            continue;
+        }
         let samples = samples_by_account.load(store, &session).await?;
         if let Some(resume_at) = exhausted_window_resume_at(&samples, now) {
             store.defer_resume(marker.id, resume_at).await?;
@@ -2688,7 +2732,12 @@ pub async fn run_resume_tick(
             continue;
         }
         if store.actions_inhibited(&session.harness).await? {
-            store.update_resume(marker.id, ResumeStatus::Failed("active behavior inhibited after claim".into())).await?;
+            store
+                .update_resume(
+                    marker.id,
+                    ResumeStatus::Failed("active behavior inhibited after claim".into()),
+                )
+                .await?;
             continue;
         }
         let mut route_errors = Vec::new();
@@ -3316,6 +3365,9 @@ fn with_compaction_fallback(
     native: Arc<dyn HarnessAdapter>,
     meta: Arc<dyn HarnessAdapter>,
 ) -> Arc<dyn HarnessAdapter> {
+    if native.provider() == Provider::Gemini {
+        return native;
+    }
     Arc::new(uw_adapters::fallback::FallbackCompactionAdapter::new(
         native, meta,
     ))
@@ -3368,7 +3420,7 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
         );
     }
     if uw_adapters::antigravity::AntigravityAdapter::is_available_in_environment() {
-        adapters.insert(
+        native_adapters.insert(
             Provider::Gemini,
             Arc::new(uw_adapters::antigravity::AntigravityAdapter::real()),
         );
@@ -4413,13 +4465,7 @@ mod tests {
                     provider: session.harness.clone(),
                     kind: WindowKind::Rolling { minutes: 300 },
                 },
-                UsageWindowState::new(
-                    10.0,
-                    false,
-                    true,
-                    Some(now + Duration::hours(1)),
-                    None,
-                ),
+                UsageWindowState::new(10.0, false, true, Some(now + Duration::hours(1)), None),
             )]),
             credits: None,
         }
@@ -4462,7 +4508,10 @@ mod tests {
                 assert_eq!(*store.sample_loads.lock().unwrap(), pass * expected_loads);
                 assert_eq!(*store.enqueues.lock().unwrap(), 0);
                 // Both empty and populated histories must be cached within a pass.
-                store.samples = sessions.iter().map(|s| sample_for_session(s, now)).collect();
+                store.samples = sessions
+                    .iter()
+                    .map(|s| sample_for_session(s, now))
+                    .collect();
             }
         }
     }
@@ -4482,7 +4531,10 @@ mod tests {
                     0,
                 );
                 assert_eq!(*store.sample_loads.lock().unwrap(), pass * expected_loads);
-                store.samples = sessions.iter().map(|s| sample_for_session(s, now)).collect();
+                store.samples = sessions
+                    .iter()
+                    .map(|s| sample_for_session(s, now))
+                    .collect();
             }
         }
     }
@@ -7781,6 +7833,7 @@ mod tests {
         let now = Utc::now();
         let gemini_session = SessionSummary {
             id: SessionId("t3-thread-gemini-96".into()),
+            lineage: SessionLineage::default(),
             harness: Provider::Gemini,
             model: Some(ModelId("gemini-4-neon".into())),
             account: None,
@@ -7790,6 +7843,8 @@ mod tests {
             state_path: None,
             context_window_size: Some(1_048_576),
             last_known_token_count: Some(250_000),
+            last_known_context_pct: None,
+            cache_ttl: Some(Duration::minutes(23)),
             launch_mode: LaunchMode::Interactive,
             pid: None,
             stopped_reason: None,
@@ -7817,22 +7872,32 @@ mod tests {
                     plan: None,
                     windows: HashMap::from([(
                         key.clone(),
-                        UsageWindowState::new(pct, false, true, Some(now + Duration::hours(2)), None),
+                        UsageWindowState::new(
+                            pct,
+                            false,
+                            true,
+                            Some(now + Duration::hours(2)),
+                            None,
+                        ),
                     )]),
                     credits: None,
                 })
                 .unwrap();
         }
         let store = SqliteDaemonStore::new(inner);
-        let adapter: Arc<dyn HarnessAdapter> =
-            Arc::new(uw_adapters::antigravity::AntigravityAdapter::new(Arc::new(
-                StubUsage,
-            )));
+        let adapter: Arc<dyn HarnessAdapter> = Arc::new(
+            uw_adapters::antigravity::AntigravityAdapter::new(Arc::new(StubUsage)),
+        );
+        // why: production fallback wiring must not promote observe-only adapters.
+        let meta = Arc::new(FakeAdapter {
+            capabilities: caps(true, true, true),
+            compacted: Arc::new(StdMutex::new(0)),
+            advised: Arc::new(StdMutex::new(0)),
+        });
+        let adapter = with_compaction_fallback(adapter, meta);
+        assert!(!adapter.capabilities().can_trigger_compaction);
         let adapters = HashMap::from([(Provider::Gemini, adapter)]);
-        let mut profile = ThresholdProfile::default();
-        if let Some(ttl) = uw_policy::default_cache_ttl(&Provider::Gemini) {
-            profile.cache_ttl_by_provider.insert(Provider::Gemini, ttl);
-        }
+        let profile = ThresholdProfile::default();
         let profiles = HashMap::from([(gemini_session.id.clone(), profile)]);
         let mut runtime = PolicyRuntimeState::default();
 
