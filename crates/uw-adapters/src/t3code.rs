@@ -1328,6 +1328,110 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    // why: a persisted t3code harness tag must not bypass the native owner write barrier.
+    #[tokio::test]
+    async fn fix2_owner_database_blocks_antigravity_even_with_t3code_harness() {
+        for provider in ["antigravity", "codex"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("state.sqlite");
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection.execute_batch("CREATE TABLE orchestration_v2_projection_provider_threads(thread_id TEXT, provider TEXT, payload_json TEXT);").unwrap();
+            connection
+                .execute(
+                    "INSERT INTO orchestration_v2_projection_provider_threads VALUES(?1,?2,'{}')",
+                    rusqlite::params![session().id.0, provider],
+                )
+                .unwrap();
+            drop(connection);
+            // A mutable snapshot isolates the DB guard from the independent snapshot guard.
+            let transport = Arc::new(FakeTransport::with_thread(
+                json!({"thread":{"session":{"providerName":"codex"}}}),
+            ));
+            let adapter = T3CodeAdapter::with_state_db(transport.clone(), &path);
+            let result = adapter
+                .set_external_status(&session(), Some(json!({"text":"Paused"})))
+                .await;
+            let calls = transport.calls.lock().unwrap();
+            if provider == "antigravity" {
+                assert!(matches!(result, Err(AdapterError::Unsupported)));
+                assert!(calls.is_empty());
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    calls
+                        .iter()
+                        .map(|(kind, _)| kind.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["get_thread", "thread_status"]
+                );
+            }
+        }
+    }
+
+    // why: a missing DB mapping must not permit writes when the live owner is Antigravity.
+    #[tokio::test]
+    async fn fix2_owner_snapshot_blocks_antigravity_status_writes() {
+        for provider in ["antigravity", "codex"] {
+            let transport = Arc::new(FakeTransport::with_thread(
+                json!({"thread":{"session":{"providerName":provider}}}),
+            ));
+            let adapter = T3CodeAdapter::new(transport.clone());
+            let result = adapter.set_external_status(&session(), None).await;
+            let calls = transport.calls.lock().unwrap();
+            if provider == "antigravity" {
+                assert!(matches!(result, Err(AdapterError::Unsupported)));
+                assert_eq!(
+                    calls
+                        .iter()
+                        .map(|(kind, _)| kind.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["get_thread"]
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    calls
+                        .iter()
+                        .map(|(kind, _)| kind.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["get_thread", "thread_status"]
+                );
+            }
+        }
+    }
+
+    // why: direct interruption must consult the live provider when no DB mapping exists.
+    #[tokio::test]
+    async fn fix2_interrupt_snapshot_blocks_antigravity() {
+        for provider in ["antigravity", "codex"] {
+            let transport = Arc::new(FakeTransport::with_thread(
+                json!({"thread":{"session":{"providerName":provider}}}),
+            ));
+            let adapter = T3CodeAdapter::new(transport.clone());
+            let result = adapter.interrupt(&session().id).await;
+            let calls = transport.calls.lock().unwrap();
+            if provider == "antigravity" {
+                assert!(matches!(result, Err(AdapterError::Unsupported)));
+                assert_eq!(
+                    calls
+                        .iter()
+                        .map(|(kind, _)| kind.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["get_thread"]
+                );
+            } else {
+                assert_eq!(result.unwrap(), DeliveryOutcome::Delivered);
+                assert_eq!(
+                    calls
+                        .iter()
+                        .map(|(kind, _)| kind.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["get_thread", "interrupt"]
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn gemini_sessions_are_observe_only_for_t3code_resume_and_compact() {
         // why: destructive actions (compaction, resume) must not fire for Gemini
