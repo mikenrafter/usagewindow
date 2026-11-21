@@ -168,3 +168,165 @@ async fn observation_and_claimed_resume_cross_the_sqlite_boundary() {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
 }
+
+#[tokio::test]
+async fn antigravity_observation_persists_gemini_windows_and_t3_sessions_observe_only() {
+    // why: end-to-end vertical path for Antigravity/Gemini: quota TSV ->
+    //      Provider::Gemini windows, T3 statev2 + conversation DB -> Gemini
+    //      session keyed by T3 thread id with cached/uncached token usage,
+    //      and observe-only refusal on due resume even with T3Code registered.
+    // catches: dropped sibling windows, wrong session id or harness, or
+    //          T3Code firing resume on a Gemini session.
+    struct FakeUsage;
+    #[async_trait]
+    impl uw_adapters::antigravity::AntigravityUsageReader for FakeUsage {
+        async fn read_usage_tsv(&self) -> AdapterResult<String> {
+            Ok(concat!(
+                "Gemini Models\tWeekly Limit Remaining\t83%\t2026-11-28T03:15:21Z\n",
+                "Gemini Models\tFive Hour Limit Remaining\t39%\t2026-11-21T08:15:21Z\n",
+                "Claude and GPT models\tWeekly Limit Remaining\t100%\t2026-11-28T05:23:27Z\n",
+                "Claude and GPT models\tFive Hour Limit Remaining\t100%\t2026-11-21T10:23:27Z\n",
+                "Gemini 4 Argon\tGemini 4 Argon Weekly Limit\t100%\t2026-11-28T05:23:27Z\n",
+            )
+            .into())
+        }
+    }
+
+    struct RecordingT3Transport {
+        dispatches: Mutex<u32>,
+    }
+    #[async_trait]
+    impl uw_adapters::t3code::T3CodeTransport for RecordingT3Transport {
+        async fn post_dispatch(&self, _: serde_json::Value) -> AdapterResult<serde_json::Value> {
+            *self.dispatches.lock().unwrap() += 1;
+            Ok(serde_json::json!({"sequence": 1}))
+        }
+        async fn post_interrupt(&self, _: serde_json::Value) -> AdapterResult<serde_json::Value> {
+            *self.dispatches.lock().unwrap() += 1;
+            Ok(serde_json::json!({"sequence": 2}))
+        }
+        async fn get_thread(&self, id: &str) -> AdapterResult<serde_json::Value> {
+            Ok(serde_json::json!({
+                "thread": {
+                    "id": id,
+                    "session": {"status": "idle", "providerName": "antigravity"}
+                }
+            }))
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("uw-ag-vertical-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let uw_db = root.join("usagewindow.db");
+    let t3_db = root.join("statev2.sqlite");
+    let conv_dir = root.join("conversations");
+    std::fs::create_dir_all(&conv_dir).unwrap();
+
+    // Synthetic statev2.sqlite matching live T3 v2 schema
+    {
+        let t3_store = Store::open(&t3_db.to_string_lossy()).unwrap();
+        t3_store.connection().execute_batch(
+            "CREATE TABLE projection_projects (project_id TEXT PRIMARY KEY, workspace_root TEXT NOT NULL);
+             CREATE TABLE orchestration_v2_projection_threads (
+                 thread_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, title TEXT NOT NULL,
+                 default_provider TEXT NOT NULL, active_provider_thread_id TEXT,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL, archived_at TEXT,
+                 deleted_at TEXT, payload_json TEXT NOT NULL
+             );
+             CREATE TABLE orchestration_v2_projection_provider_threads (
+                 provider_thread_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL,
+                 provider TEXT NOT NULL, provider_session_id TEXT NOT NULL,
+                 status TEXT NOT NULL, updated_at TEXT NOT NULL, payload_json TEXT NOT NULL
+             );
+             CREATE TABLE orchestration_v2_projection_provider_sessions (
+                 provider_session_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL,
+                 provider TEXT NOT NULL, status TEXT NOT NULL,
+                 updated_at TEXT NOT NULL, payload_json TEXT NOT NULL
+             );
+             INSERT INTO projection_projects VALUES ('proj-1', '/workspace/mstack');
+             INSERT INTO orchestration_v2_projection_threads VALUES (
+                 'f360e6a4-2efd-4016-b759-01a2bca774fd', 'proj-1', 'Neon Integration Run',
+                 'antigravity', 'pt-neon', '2026-11-21T05:18:00Z', '2026-11-21T05:22:00Z',
+                 NULL, NULL, '{\"modelSelection\":{\"model\":\"gemini-4-neon\"}}'
+             );
+             INSERT INTO orchestration_v2_projection_provider_threads VALUES (
+                 'pt-neon', 'f360e6a4-2efd-4016-b759-01a2bca774fd', 'antigravity', 'ps-neon',
+                 'active', '2026-11-21T05:22:30Z',
+                 '{\"nativeThreadRef\":{\"driver\":\"antigravity\",\"nativeId\":\"22222222-3333-4444-5555-666666666666\"},\"contextUsage\":{\"usedTokens\":46547,\"maxTokens\":1048576}}'
+             );
+             INSERT INTO orchestration_v2_projection_provider_sessions VALUES (
+                 'ps-neon', 'f360e6a4-2efd-4016-b759-01a2bca774fd', 'antigravity', 'ready',
+                 '2026-11-21T05:18:00Z', '{\"cwd\":\"/workspace/mstack\"}'
+             );",
+        )
+        .unwrap();
+    }
+
+    let ag_adapter: Arc<dyn HarnessAdapter> = Arc::new(
+        uw_adapters::antigravity::AntigravityAdapter::new(Arc::new(FakeUsage))
+            .with_t3_state_db(t3_db)
+            .with_conversations_dir(conv_dir),
+    );
+    let t3_transport = Arc::new(RecordingT3Transport {
+        dispatches: Mutex::new(0),
+    });
+    let t3_adapter: Arc<dyn HarnessAdapter> = Arc::new(
+        uw_adapters::t3code::T3CodeAdapter::new(t3_transport.clone()),
+    );
+    let adapters = HashMap::from([
+        (Provider::Gemini, ag_adapter),
+        (Provider::Other("t3code".into()), t3_adapter),
+    ]);
+
+    let db_str = uw_db.to_string_lossy().into_owned();
+    let store = Arc::new(SqliteDaemonStore::new(Store::open(&db_str).unwrap()));
+    let report = run_observation_tick(store.as_ref(), &adapters).await.unwrap();
+    assert_eq!(report.samples_recorded, 1);
+    assert_eq!(report.sessions_discovered, 1);
+    // t3code.fetch_usage is Unsupported (1 adapter error), Antigravity has 0 errors.
+    assert_eq!(report.adapter_errors, 1);
+
+    let thread_id = SessionId("f360e6a4-2efd-4016-b759-01a2bca774fd".into());
+    let now = Utc::now();
+    let marker = ResumeMarker {
+        id: uuid::Uuid::new_v4(),
+        session_id: thread_id.clone(),
+        reason: ResumeReason::ManuallyMarked,
+        resume_at: Some(now),
+        requested_at: None,
+        created_at: now,
+        status: ResumeStatus::Scheduled,
+        message: Some("should not fire".into()),
+    };
+    store.insert_resume_marker(marker).await.unwrap();
+    run_resume_tick(store.as_ref(), &adapters, now)
+        .await
+        .unwrap();
+    assert_eq!(
+        *t3_transport.dispatches.lock().unwrap(),
+        0,
+        "T3Code must never dispatch a resume turn for a Provider::Gemini session"
+    );
+
+    let reader = Store::open(&db_str).unwrap();
+    let session = reader.read_session(&thread_id).unwrap();
+    assert_eq!(session.harness, Provider::Gemini);
+    assert_eq!(session.model, Some(ModelId("gemini-4-neon".into())));
+    assert_eq!(session.context_window_size, Some(1_048_576));
+    assert_eq!(session.last_known_token_count, Some(46_547));
+    assert_eq!(
+        reader.resolve_session_title(&thread_id).unwrap().as_deref(),
+        Some("Neon Integration Run")
+    );
+    assert!(matches!(
+        reader.resume_markers_for_session(&thread_id).unwrap()[0].status,
+        ResumeStatus::Failed(_)
+    ));
+
+    let samples = reader.usage_samples_for(&Provider::Gemini, None).unwrap();
+    assert_eq!(samples.len(), 5);
+
+    drop(reader);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}

@@ -1889,14 +1889,16 @@ pub async fn run_policy_tick(
                 keepalive_store
                     .set_keepalive_enabled(&session.id, false)
                     .await?;
-                if should_enqueue_hard_boundary_compaction(
-                    session,
-                    now,
-                    current_pct,
-                    window_exceeded,
-                    stopped_on_this_window,
-                    profile,
-                ) {
+                if adapter.capabilities().can_trigger_compaction
+                    && should_enqueue_hard_boundary_compaction(
+                        session,
+                        now,
+                        current_pct,
+                        window_exceeded,
+                        stopped_on_this_window,
+                        profile,
+                    )
+                {
                     handle_hard_boundary(
                         store,
                         session,
@@ -3363,6 +3365,12 @@ pub async fn run_daemon_loop() -> anyhow::Result<()> {
         native_adapters.insert(
             Provider::Cursor,
             Arc::new(uw_adapters::cursor::CursorAdapter::real(cursor_auth)),
+        );
+    }
+    if uw_adapters::antigravity::AntigravityAdapter::is_available_in_environment() {
+        adapters.insert(
+            Provider::Gemini,
+            Arc::new(uw_adapters::antigravity::AntigravityAdapter::real()),
         );
     }
     if let Ok(command) = std::env::var("UW_GENERIC_USAGE_COMMAND") {
@@ -7753,5 +7761,108 @@ mod tests {
 
         assert_eq!(sent, 0);
         assert_eq!(*store.recorded_pings.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn hard_boundary_does_not_enqueue_compaction_for_observe_only_gemini_adapter() {
+        // why: uw's destructive actions (compaction, interrupt, resume) must not
+        //      fire for Provider::Gemini sessions even when usage crosses the 95%
+        //      hard quota boundary.
+        // catches: run_policy_tick calling handle_hard_boundary without checking
+        //          adapter.capabilities().can_trigger_compaction.
+        struct StubUsage;
+        #[async_trait]
+        impl uw_adapters::antigravity::AntigravityUsageReader for StubUsage {
+            async fn read_usage_tsv(&self) -> AdapterResult<String> {
+                Ok("Gemini Models\tFive Hour Limit Remaining\t4%\t2026-11-21T08:15:21Z\n".into())
+            }
+        }
+
+        let now = Utc::now();
+        let gemini_session = SessionSummary {
+            id: SessionId("t3-thread-gemini-96".into()),
+            harness: Provider::Gemini,
+            model: Some(ModelId("gemini-4-neon".into())),
+            account: None,
+            first_seen: now - Duration::minutes(10),
+            last_seen: now - Duration::minutes(1),
+            cwd: "/workspace/mstack".into(),
+            state_path: None,
+            context_window_size: Some(1_048_576),
+            last_known_token_count: Some(250_000),
+            launch_mode: LaunchMode::Interactive,
+            pid: None,
+            stopped_reason: None,
+            superseded_stop_reason: None,
+            superseded_stop_reason_at: None,
+            superseded_stop_reason_note: None,
+            resume_marker: None,
+            superseded_by: None,
+            reseeded_from: None,
+        };
+        let key = WindowKey {
+            provider: Provider::Gemini,
+            kind: WindowKind::Rolling { minutes: 300 },
+        };
+        let inner = Store::open_memory().unwrap();
+        inner.insert_session(&gemini_session).unwrap();
+        for (offset_mins, pct) in [(30, 60.0), (0, 96.0)] {
+            inner
+                .insert_usage_sample(&UsageSample {
+                    at: now - Duration::minutes(offset_mins),
+                    fetched_at: Some(now - Duration::minutes(offset_mins)),
+                    source: UsageSource::ProviderReported,
+                    provider: Provider::Gemini,
+                    account: None,
+                    plan: None,
+                    windows: HashMap::from([(
+                        key.clone(),
+                        UsageWindowState::new(pct, false, true, Some(now + Duration::hours(2)), None),
+                    )]),
+                    credits: None,
+                })
+                .unwrap();
+        }
+        let store = SqliteDaemonStore::new(inner);
+        let adapter: Arc<dyn HarnessAdapter> =
+            Arc::new(uw_adapters::antigravity::AntigravityAdapter::new(Arc::new(
+                StubUsage,
+            )));
+        let adapters = HashMap::from([(Provider::Gemini, adapter)]);
+        let mut profile = ThresholdProfile::default();
+        if let Some(ttl) = uw_policy::default_cache_ttl(&Provider::Gemini) {
+            profile.cache_ttl_by_provider.insert(Provider::Gemini, ttl);
+        }
+        let profiles = HashMap::from([(gemini_session.id.clone(), profile)]);
+        let mut runtime = PolicyRuntimeState::default();
+
+        run_policy_tick(
+            &store,
+            &store,
+            &adapters,
+            &AlwaysActive,
+            std::slice::from_ref(&gemini_session),
+            &profiles,
+            &mut runtime,
+            now,
+        )
+        .await
+        .unwrap();
+
+        let guard = store.inner.lock().unwrap();
+        assert!(
+            guard
+                .compaction_requests_for_session(&gemini_session.id)
+                .unwrap()
+                .is_empty(),
+            "observe-only Gemini adapter must never enqueue a hard-boundary compaction request"
+        );
+        assert!(
+            guard
+                .resume_markers_for_session(&gemini_session.id)
+                .unwrap()
+                .is_empty(),
+            "observe-only Gemini adapter must never auto-schedule a resume marker"
+        );
     }
 }
