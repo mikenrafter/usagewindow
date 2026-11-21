@@ -380,6 +380,9 @@ impl HarnessAdapter for T3CodeAdapter {
         session: &SessionSummary,
         status: Option<Value>,
     ) -> AdapterResult<()> {
+        if session.harness == Provider::Gemini {
+            return Err(AdapterError::Unsupported);
+        }
         let thread_id = self.owned_thread(session).await?;
         self.transport
             .post_thread_status(&thread_id.0, status)
@@ -1329,6 +1332,11 @@ mod tests {
             harness: Provider::Gemini,
             ..session()
         };
+        // why: observe-only includes metadata writes and clears, before any HTTP read.
+        for status in [Some(json!({"text": "Paused"})), None] {
+            assert!(matches!(adapter.set_external_status(&gemini_session, status).await, Err(AdapterError::Unsupported)));
+        }
+        assert!(transport.calls.lock().unwrap().is_empty());
         let request = CompactionRequest {
             id: uuid::Uuid::new_v4(),
             session_id: gemini_session.id.clone(),
