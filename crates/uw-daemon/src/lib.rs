@@ -7593,7 +7593,7 @@ mod tests {
             context_window_size: Some(1_048_576),
             last_known_token_count: Some(250_000),
             last_known_context_pct: None,
-            cache_ttl: Some(Duration::minutes(23)),
+            cache_ttl: Some(Duration::minutes(3)),
             launch_mode: LaunchMode::Interactive,
             pid: None,
             stopped_reason: None,

@@ -318,16 +318,18 @@ async fn antigravity_observation_persists_gemini_windows_and_t3_sessions_observe
     assert_eq!(session.model, Some(ModelId("gemini-4-neon".into())));
     assert_eq!(session.context_window_size, Some(1_048_576));
     assert_eq!(session.last_known_token_count, Some(46_547));
-    // why: discovery must persist the measured TTL for shared cache-warm consumers.
-    assert_eq!(session.cache_ttl, Some(Duration::minutes(23)));
+    // why: discovery must persist the measured 3-minute per-conversation TTL
+    //      (4 m hit / 5 m miss minus 1 m margin) for shared cache-warm consumers.
+    // catches: persisting the stale 23-minute shared-prefix TTL or 5-minute default.
+    assert_eq!(session.cache_ttl, Some(Duration::minutes(3)));
     assert!(is_cache_warm_for(
         session.last_seen,
-        session.last_seen + Duration::minutes(23),
+        session.last_seen + Duration::minutes(3),
         session.prompt_cache_ttl()
     ));
     assert!(!is_cache_warm_for(
         session.last_seen,
-        session.last_seen + Duration::minutes(23) + Duration::seconds(1),
+        session.last_seen + Duration::minutes(3) + Duration::seconds(1),
         session.prompt_cache_ttl()
     ));
     assert_eq!(

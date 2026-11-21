@@ -119,13 +119,35 @@ Relevant tables (verified 2026-11-20, read-only):
 
 ## Prompt cache TTL
 
-The probe log at `mstack.research/neon-trial/ttl-probe.log` records cache hits
-after 3, 6, 12 and 24 minutes. The 24-minute hit at 2026-11-21T06:00:21Z
-reported 8,334 cached tokens. No 48-minute result was present when porting.
-Expiry remains unmeasured; these hits do not guarantee future cache retention.
+Two sets of probes on 2026-11-21 separated the shared system prefix from
+per-conversation context caching on Gemini 4 Neon through Antigravity:
 
-`uw_adapters::antigravity::GEMINI_CACHE_TTL` uses the longest observed hit,
-rounded down, minus a one-minute margin: 23 minutes. Discovery populates
+- **Small-context probe (`mstack.research/neon-trial/ttl-probe.log`, ~14k–15k
+  context):** recorded ~7.6k–8.3k cached tokens after idle gaps of 3, 6, 12,
+  24, and 48 minutes (`7,639` at 3 m, `7,881` at 6 m, `8,115` at 12 m,
+  `8,334` at 24 m at 2026-11-21T06:00:21Z, and `7,641` at 48 m after a
+  restart). Those hits only reflected the ~7.6k shared system prefix, which
+  stays warm much longer than conversation history.
+- **Large-context probe (`mstack.research/neon-trial/ttl-probe-large.log`,
+  ~70k tokens of conversation-specific context, `ctx` ~82k–84k):**
+  - `start` (`09:09:27Z`): `new_in=68787`, `cached=0`, `ctx=82029`
+  - `gap=1m` (`09:10:32Z`): `new_in=2816`, `cached=66730`, `ctx=82816` (hit)
+  - `gap=5m` (`09:15:40Z`): `new_in=69779`, `cached=0`, `ctx=83077` (miss)
+  - `gap=10m` (`09:25:46Z`): `new_in=69998`, `cached=0`, `ctx=83324` (miss)
+  - `gap=20m` (`09:45:52Z`): `new_in=70217`, `cached=0`, `ctx=83571` (miss)
+- **Fine-grained large-context probe (`mstack.research/neon-trial/ttl-probe-fine.log`,
+  each gap after a warm call, `ctx` ~82k–83k):**
+  - `start` (`09:59:46Z`): `new_in=60604`, `cached=8192`, `ctx=82029`
+  - `gap=2m` (`10:01:51Z`): `new_in=3616`, `cached=65536`, `ctx=82413` (hit)
+  - `gap=3m` (`10:04:56Z`): `new_in=2283`, `cached=67103`, `ctx=82675` (hit)
+  - `gap=4m` (`10:09:01Z`): `new_in=2268`, `cached=67337`, `ctx=82922` (hit)
+
+The per-conversation cache lifetime is therefore between 4 and 5 minutes
+(cached through 4 minutes, fully uncached at 5 minutes). These probes are
+empirical observations, not an upstream guarantee.
+
+`uw_adapters::antigravity::GEMINI_CACHE_TTL` is set to 3 minutes (one minute
+under the last measured 4-minute per-conversation hit). Discovery populates
 `DiscoveredSession.cache_ttl`; observation persists it to `SessionSummary.cache_ttl`.
 The deployed branch's existing per-session TTL consumers handle display and
 policy timing. Capability gates keep Gemini observe-only even with a known TTL.

@@ -13,8 +13,9 @@ use uw_core::adapter::{
 };
 use uw_core::model::*;
 
-/// 24-minute cache hit in ttl-probe.log (2026-11-21), minus a one-minute margin.
-pub const GEMINI_CACHE_TTL: chrono::Duration = chrono::Duration::minutes(23);
+/// 4-minute per-conversation cache hit in ttl-probe-fine.log (5-minute miss in
+/// ttl-probe-large.log, 2026-11-21), minus a one-minute margin.
+pub const GEMINI_CACHE_TTL: chrono::Duration = chrono::Duration::minutes(3);
 
 const AGY_USAGE_TIMEOUT_SECS: u64 = 20;
 
@@ -1492,9 +1493,11 @@ mod tests {
             }
         );
 
-        // why: a 24-minute hit in ttl-probe.log permits a 23-minute safety TTL.
-        // catches: leaving Gemini on the five-minute legacy fallback.
-        assert_eq!(found.cache_ttl, Some(chrono::Duration::minutes(23)));
+        // why: 4-minute hit in ttl-probe-fine.log and 5-minute miss in
+        //      ttl-probe-large.log (2026-11-21) give a 3-minute safety TTL
+        //      (one minute under the last measured per-conversation hit).
+        // catches: keeping the stale 23-minute shared-prefix TTL or falling back to 5 minutes.
+        assert_eq!(found.cache_ttl, Some(chrono::Duration::minutes(3)));
 
         // Second discovery hits the conversation cache cleanly and keeps parity.
         let second = adapter.discover_sessions().await.unwrap();
