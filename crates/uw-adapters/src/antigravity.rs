@@ -408,7 +408,7 @@ pub fn parse_step_timestamp(blob: &[u8]) -> Option<DateTime<Utc>> {
 
 #[derive(Clone, Debug)]
 struct CachedConversation {
-    fingerprint: (u64, Option<std::time::SystemTime>),
+    fingerprint: ((u64, Option<std::time::SystemTime>), Option<(u64, Option<std::time::SystemTime>)>),
     records: Vec<TokenUsageRecord>,
     latest_context_tokens: Option<u64>,
     model: Option<String>,
@@ -833,7 +833,8 @@ impl HarnessAdapter for AntigravityAdapter {
                     if let Ok(metadata) = std::fs::metadata(&db_path) {
                         state_path = Some(db_path.to_string_lossy().into_owned());
                         let modified = metadata.modified().ok();
-                        let fingerprint = (metadata.len(), modified);
+                        let wal = std::fs::metadata(format!("{}-wal", db_path.display())).ok();
+                        let fingerprint = ((metadata.len(), modified), wal.map(|m| (m.len(), m.modified().ok())));
                         let fallback_at = modified
                             .map(DateTime::<Utc>::from)
                             .or(row.provider_thread_updated_at)
@@ -1428,6 +1429,17 @@ mod tests {
         let second = adapter.discover_sessions().await.unwrap();
         assert_eq!(second, sessions);
 
+        // why: SQLite can append calls entirely in WAL while the main file is unchanged.
+        let writer = rusqlite::Connection::open(&conv_db_path).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        adapter.discover_sessions().await.unwrap();
+        let before = fs::metadata(&conv_db_path).unwrap();
+        writer.execute("INSERT INTO gen_metadata(idx,data,size) VALUES(2,?1,?2)", rusqlite::params![SAMPLE_GEN_METADATA_CALL_0, SAMPLE_GEN_METADATA_CALL_0.len() as i64]).unwrap();
+        let after = fs::metadata(&conv_db_path).unwrap();
+        assert_eq!((before.len(), before.modified().unwrap()), (after.len(), after.modified().unwrap()));
+        assert_eq!(adapter.discover_sessions().await.unwrap()[0].token_usage.len(), 3);
+        drop(writer);
         fs::remove_dir_all(dir).unwrap();
     }
 
