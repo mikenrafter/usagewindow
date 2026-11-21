@@ -674,7 +674,7 @@ impl Store {
         let tx = self.connection.unchecked_transaction()?;
         for record in records {
             tx.execute(
-                "INSERT INTO session_token_usage(session_id,at,model,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,context_pct,call_key) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO UPDATE SET at=excluded.at,model=excluded.model,input_tokens=excluded.input_tokens,cached_input_tokens=excluded.cached_input_tokens,cache_write_input_tokens=excluded.cache_write_input_tokens,output_tokens=excluded.output_tokens,reasoning_output_tokens=excluded.reasoning_output_tokens,total_tokens=excluded.total_tokens,context_pct=excluded.context_pct,call_key=excluded.call_key WHERE session_token_usage.at IS NOT excluded.at OR session_token_usage.model IS NOT excluded.model OR session_token_usage.input_tokens IS NOT excluded.input_tokens OR session_token_usage.cached_input_tokens IS NOT excluded.cached_input_tokens OR session_token_usage.cache_write_input_tokens IS NOT excluded.cache_write_input_tokens OR session_token_usage.output_tokens IS NOT excluded.output_tokens OR session_token_usage.reasoning_output_tokens IS NOT excluded.reasoning_output_tokens OR session_token_usage.total_tokens IS NOT excluded.total_tokens OR session_token_usage.context_pct IS NOT excluded.context_pct OR session_token_usage.call_key IS NOT excluded.call_key",
+                "INSERT INTO session_token_usage(session_id,at,model,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,context_pct,call_key) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id,call_key) WHERE call_key IS NOT NULL DO UPDATE SET at=excluded.at,model=excluded.model,input_tokens=excluded.input_tokens,cached_input_tokens=excluded.cached_input_tokens,cache_write_input_tokens=excluded.cache_write_input_tokens,output_tokens=excluded.output_tokens,reasoning_output_tokens=excluded.reasoning_output_tokens,total_tokens=excluded.total_tokens,context_pct=excluded.context_pct,call_key=excluded.call_key WHERE session_token_usage.at IS NOT excluded.at OR session_token_usage.model IS NOT excluded.model OR session_token_usage.input_tokens IS NOT excluded.input_tokens OR session_token_usage.cached_input_tokens IS NOT excluded.cached_input_tokens OR session_token_usage.cache_write_input_tokens IS NOT excluded.cache_write_input_tokens OR session_token_usage.output_tokens IS NOT excluded.output_tokens OR session_token_usage.reasoning_output_tokens IS NOT excluded.reasoning_output_tokens OR session_token_usage.total_tokens IS NOT excluded.total_tokens OR session_token_usage.context_pct IS NOT excluded.context_pct OR session_token_usage.call_key IS NOT excluded.call_key ON CONFLICT DO NOTHING",
                 params![
                     session_id.0,
                     record.at,
@@ -2126,6 +2126,37 @@ mod tests {
 
         assert_eq!(s.token_usage_for_session(&sid).unwrap(), records);
     }
+    // why: providers without stable call keys retain their original first-wins deduplication.
+    #[test]
+    fn fix2_unkeyed_records_keep_first_on_legacy_key_conflict() {
+        let store = Store::open_memory().unwrap();
+        let sid = SessionId("unkeyed-first-wins".into());
+        store.insert_session(&session(&sid)).unwrap();
+        let first = TokenUsageRecord {
+            call_key: None,
+            at: "2026-11-21T00:00:00Z".parse().unwrap(),
+            model: Some(ModelId("first-model".into())),
+            input_tokens: 100,
+            cached_input_tokens: 40,
+            cache_write_input_tokens: 5,
+            output_tokens: 20,
+            reasoning_output_tokens: 3,
+            total_tokens: 120,
+            context_pct: Some(10.0),
+        };
+        let mut later = first.clone();
+        later.model = Some(ModelId("later-model".into()));
+        later.cached_input_tokens = 80;
+        later.cache_write_input_tokens = 10;
+        later.reasoning_output_tokens = 8;
+        later.context_pct = Some(50.0);
+        store
+            .insert_token_usage_records(&sid, std::slice::from_ref(&first))
+            .unwrap();
+        store.insert_token_usage_records(&sid, &[later]).unwrap();
+        assert_eq!(store.token_usage_for_session(&sid).unwrap(), vec![first]);
+    }
+
     // why: upgrading existing stores must preserve history and allow identical identified calls.
     #[test]
     fn fix1_call_key_migration_preserves_legacy_rows_and_read_fallback() {
