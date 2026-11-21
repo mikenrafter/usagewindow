@@ -48,3 +48,21 @@ and separates their legacy deduplication from identified calls.
 Additional regressions cover WAL-only updates, malformed quota rows, an absent
 CLI, and mixed Gemini/Claude-GPT pools. Detailed red/green evidence and remaining
 uncertainty are in `mstack.research/neon-trial/report-uw-port-fix1.md`.
+
+## Fix round 2
+
+The store upsert now targets only non-null call keys. Unkeyed legacy conflicts
+keep the first row, preserving native-provider ingestion behavior. The regression
+uses identical legacy key fields and different model/cache/reasoning/context
+fields, so a broad update cannot pass it.
+
+Three owner-routing regressions isolate the database guard, the live snapshot
+guard, and the interrupt snapshot guard. Each includes an allowed-provider control
+and fails when its individual barrier is disabled. The database case uses a
+session tagged as the T3Code harness and a mutable snapshot so the snapshot guard
+cannot hide a missing database barrier.
+
+The policy loop now skips adapters marked observe-only before consulting quota
+windows or applying policy side effects. The previous Antigravity quota labels
+were removed from the daemon. The replacement regression uses an unfamiliar
+provider and runs both flag values to show ordinary policy behavior still runs.
