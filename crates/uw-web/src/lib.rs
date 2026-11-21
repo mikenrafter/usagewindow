@@ -176,7 +176,10 @@ pub fn app_with_runtime(
     let auth = Arc::new(WebAuth::new(password_hash)?);
     let protected = Router::new()
         .route("/api/status", get(status))
-        .route("/api/action-inhibits", get(action_inhibits_get).post(action_inhibits_set))
+        .route(
+            "/api/action-inhibits",
+            get(action_inhibits_get).post(action_inhibits_set),
+        )
         .route("/api/sessions", get(sessions).post(create_session))
         .route(
             "/api/sessions/{id}",
@@ -1235,17 +1238,22 @@ fn parse_scope(value: Option<&str>) -> Option<ThresholdScope> {
 async fn action_inhibits_get(
     State(state): State<AppState>,
 ) -> Result<Json<ActionInhibits>, (StatusCode, String)> {
-    Ok(Json(read(state, |store| Ok(store.action_inhibits()?)).await?))
+    Ok(Json(
+        read(state, |store| Ok(store.action_inhibits()?)).await?,
+    ))
 }
 
 async fn action_inhibits_set(
     State(state): State<AppState>,
     Json(request): Json<ActionInhibitRequest>,
 ) -> Result<Json<ActionInhibits>, (StatusCode, String)> {
-    Ok(Json(read(state, move |store| {
-        store.set_action_inhibit(request.provider.as_ref(), request.inhibited)?;
-        Ok(store.action_inhibits()?)
-    }).await?))
+    Ok(Json(
+        read(state, move |store| {
+            store.set_action_inhibit(request.provider.as_ref(), request.inhibited)?;
+            Ok(store.action_inhibits()?)
+        })
+        .await?,
+    ))
 }
 
 async fn thresholds_get(
@@ -1686,21 +1694,53 @@ mod tests {
         let shared = Arc::new(Mutex::new(Store::open_memory().unwrap()));
         let router = app_with_shared_store(shared.clone(), HashMap::new());
         for (provider, inhibited) in [(Some(Provider::Codex), true), (None, true), (None, false)] {
-            let response = router.clone().oneshot(
-                Request::post("/api/action-inhibits")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&ActionInhibitRequest { provider, inhibited }).unwrap())).unwrap(),
-            ).await.unwrap();
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::post("/api/action-inhibits")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&ActionInhibitRequest {
+                                provider,
+                                inhibited,
+                            })
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
         }
-        let response = router.oneshot(Request::get("/api/action-inhibits").body(Body::empty()).unwrap()).await.unwrap();
+        let response = router
+            .oneshot(
+                Request::get("/api/action-inhibits")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let settings: ActionInhibits = serde_json::from_slice(&body).unwrap();
         assert!(!settings.global);
         assert_eq!(settings.providers, vec![Provider::Codex]);
-        assert!(shared.lock().unwrap().actions_inhibited(&Provider::Codex).unwrap());
-        assert!(!shared.lock().unwrap().actions_inhibited(&Provider::ClaudeCode).unwrap());
+        assert!(
+            shared
+                .lock()
+                .unwrap()
+                .actions_inhibited(&Provider::Codex)
+                .unwrap()
+        );
+        assert!(
+            !shared
+                .lock()
+                .unwrap()
+                .actions_inhibited(&Provider::ClaudeCode)
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1865,6 +1905,7 @@ mod tests {
             .insert_token_usage_records(
                 &active.id,
                 &[TokenUsageRecord {
+                    call_key: None,
                     at: Utc::now(),
                     model: active.model.clone(),
                     input_tokens: 100,
@@ -1881,6 +1922,7 @@ mod tests {
             .insert_token_usage_records(
                 &idle.id,
                 &[TokenUsageRecord {
+                    call_key: None,
                     at: Utc::now() - Duration::hours(1),
                     model: idle.model.clone(),
                     input_tokens: 80,
@@ -1897,6 +1939,7 @@ mod tests {
             .insert_token_usage_records(
                 &outside.id,
                 &[TokenUsageRecord {
+                    call_key: None,
                     at: Utc::now() - Duration::hours(30),
                     model: outside.model.clone(),
                     input_tokens: 80,
@@ -2701,6 +2744,7 @@ mod tests {
             .insert_token_usage_records(
                 &active.id,
                 &[TokenUsageRecord {
+                    call_key: None,
                     at: Utc::now(),
                     model: active.model.clone(),
                     input_tokens: 10,
@@ -2758,6 +2802,7 @@ mod tests {
             .insert_token_usage_records(
                 &cursor_session.id,
                 &[TokenUsageRecord {
+                    call_key: None,
                     at: Utc::now(),
                     model: None,
                     input_tokens: 0,

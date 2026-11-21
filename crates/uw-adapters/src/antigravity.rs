@@ -81,15 +81,13 @@ impl AntigravityUsageReader for AgyCliUsageReader {
             .env("AGY_ACP_FORCE_FILE_STORAGE", "1")
             .env("AGY_CLI_DISABLE_AUTO_UPDATE", "1");
 
-        let child = command
-            .spawn()
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    AdapterError::Unsupported
-                } else {
-                    AdapterError::Transient(format!("spawn {}: {error}", self.program))
-                }
-            })?;
+        let child = command.spawn().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                AdapterError::Unsupported
+            } else {
+                AdapterError::Transient(format!("spawn {}: {error}", self.program))
+            }
+        })?;
         let output = tokio::time::timeout(
             StdDuration::from_secs(AGY_USAGE_TIMEOUT_SECS),
             child.wait_with_output(),
@@ -212,11 +210,19 @@ pub fn parse_usage_tsv(output: &str, at: DateTime<Utc>) -> AdapterResult<UsageSa
         if pool.is_empty() || window_label.is_empty() {
             continue;
         }
-        let remaining = pct_text.strip_suffix('%').unwrap_or(pct_text).trim().parse::<f32>();
+        let remaining = pct_text
+            .strip_suffix('%')
+            .unwrap_or(pct_text)
+            .trim()
+            .parse::<f32>();
         let remaining = match remaining {
             Ok(value) if value.is_finite() => value,
             _ => {
-                tracing::warn!(pool, window_label, "skipping invalid Antigravity remaining percent");
+                tracing::warn!(
+                    pool,
+                    window_label,
+                    "skipping invalid Antigravity remaining percent"
+                );
                 continue;
             }
         };
@@ -229,7 +235,11 @@ pub fn parse_usage_tsv(output: &str, at: DateTime<Utc>) -> AdapterResult<UsageSa
             match DateTime::parse_from_rfc3339(reset_text) {
                 Ok(value) => Some(value.with_timezone(&Utc)),
                 Err(_) => {
-                    tracing::warn!(pool, window_label, "skipping invalid Antigravity reset timestamp");
+                    tracing::warn!(
+                        pool,
+                        window_label,
+                        "skipping invalid Antigravity reset timestamp"
+                    );
                     continue;
                 }
             }
@@ -271,6 +281,7 @@ pub struct GenCallUsage {
     pub context_tokens: Option<u64>,
     pub model: Option<String>,
     pub last_step_index: Option<i64>,
+    pub request_id: Option<String>,
 }
 
 enum WireValue<'a> {
@@ -372,6 +383,19 @@ pub fn parse_gen_metadata_blob(blob: &[u8]) -> Option<GenCallUsage> {
         .map(str::to_owned);
 
     let mut last_step_index = None;
+    let mut request_id = None;
+    for (field, value) in &one {
+        if *field == 20
+            && let WireValue::Bytes(entry_bytes) = value
+            && let Some(entry) = parse_proto_fields(entry_bytes)
+            && first_bytes(&entry, 1) == Some(b"request_id")
+            && let Some(raw) = first_bytes(&entry, 2)
+            && let Ok(text) = std::str::from_utf8(raw)
+            && !text.is_empty()
+        {
+            request_id = Some(text.to_owned());
+        }
+    }
     for (field, value) in &one {
         if *field == 20
             && let WireValue::Bytes(entry_bytes) = value
@@ -392,6 +416,7 @@ pub fn parse_gen_metadata_blob(blob: &[u8]) -> Option<GenCallUsage> {
         context_tokens,
         model,
         last_step_index,
+        request_id,
     })
 }
 
@@ -406,9 +431,11 @@ pub fn parse_step_timestamp(blob: &[u8]) -> Option<DateTime<Utc>> {
     Utc.timestamp_opt(seconds, nanos).single()
 }
 
+type FileFingerprint = (u64, Option<std::time::SystemTime>);
+
 #[derive(Clone, Debug)]
 struct CachedConversation {
-    fingerprint: ((u64, Option<std::time::SystemTime>), Option<(u64, Option<std::time::SystemTime>)>),
+    fingerprint: (FileFingerprint, Option<FileFingerprint>),
     records: Vec<TokenUsageRecord>,
     latest_context_tokens: Option<u64>,
     model: Option<String>,
@@ -476,7 +503,7 @@ fn read_conversation_usage(
     let mut latest_context_tokens = None;
     let mut latest_model = None;
     for row in rows {
-        let (_idx, blob) =
+        let (idx, blob) =
             row.map_err(|error| AdapterError::Other(format!("read gen_metadata row: {error}")))?;
         let Some(call) = parse_gen_metadata_blob(&blob) else {
             continue;
@@ -507,6 +534,23 @@ fn read_conversation_usage(
             .saturating_add(call.cached_input_tokens);
         let total_tokens = input_tokens.saturating_add(call.output_tokens);
         records.push(TokenUsageRecord {
+            call_key: Some(
+                serde_json::to_string(&(
+                    db_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .ok_or_else(|| {
+                            AdapterError::Other("conversation id is not UTF-8".into())
+                        })?,
+                    if call.request_id.is_some() {
+                        "request"
+                    } else {
+                        "idx"
+                    },
+                    call.request_id.unwrap_or_else(|| idx.to_string()),
+                ))
+                .map_err(|error| AdapterError::Other(error.to_string()))?,
+            ),
             at,
             model: call.model.map(ModelId),
             input_tokens,
@@ -835,7 +879,10 @@ impl HarnessAdapter for AntigravityAdapter {
                         state_path = Some(db_path.to_string_lossy().into_owned());
                         let modified = metadata.modified().ok();
                         let wal = std::fs::metadata(format!("{}-wal", db_path.display())).ok();
-                        let fingerprint = ((metadata.len(), modified), wal.map(|m| (m.len(), m.modified().ok())));
+                        let fingerprint = (
+                            (metadata.len(), modified),
+                            wal.map(|m| (m.len(), m.modified().ok())),
+                        );
                         let fallback_at = modified
                             .map(DateTime::<Utc>::from)
                             .or(row.provider_thread_updated_at)
@@ -1106,18 +1153,37 @@ mod tests {
     #[tokio::test]
     async fn fix1_missing_agy_is_unsupported() {
         let reader = AgyCliUsageReader::new("/missing-uw-fix1/agy", None);
-        assert!(matches!(reader.read_usage_tsv().await, Err(AdapterError::Unsupported)));
+        assert!(matches!(
+            reader.read_usage_tsv().await,
+            Err(AdapterError::Unsupported)
+        ));
     }
 
     // why: one malformed quota row must not discard healthy sibling windows.
     #[test]
     fn fix1_malformed_usage_rows_do_not_drop_healthy_windows() {
         for malformed in ["bad%\t-", "NaN%\t-", "50%\tbad-date"] {
-            let output = format!("Gemini Models\tFive Hour Limit Remaining\t70%\t-\nOther\tBad row\t{malformed}\nGemini Models\tWeekly Limit Remaining\t80%\t-\n");
+            let output = format!(
+                "Gemini Models\tFive Hour Limit Remaining\t70%\t-\nOther\tBad row\t{malformed}\nGemini Models\tWeekly Limit Remaining\t80%\t-\n"
+            );
             let sample = parse_usage_tsv(&output, Utc::now()).unwrap();
             assert_eq!(sample.windows.len(), 2);
-            assert_eq!(sample.windows[&WindowKey { provider: Provider::Gemini, kind: WindowKind::Rolling { minutes: 300 } }].pct, 30.0);
-            assert_eq!(sample.windows[&WindowKey { provider: Provider::Gemini, kind: WindowKind::Rolling { minutes: 10080 } }].pct, 20.0);
+            assert_eq!(
+                sample.windows[&WindowKey {
+                    provider: Provider::Gemini,
+                    kind: WindowKind::Rolling { minutes: 300 }
+                }]
+                    .pct,
+                30.0
+            );
+            assert_eq!(
+                sample.windows[&WindowKey {
+                    provider: Provider::Gemini,
+                    kind: WindowKind::Rolling { minutes: 10080 }
+                }]
+                    .pct,
+                20.0
+            );
         }
     }
 
@@ -1138,6 +1204,7 @@ mod tests {
                 context_tokens: Some(44_211),
                 model: Some("gemini-4-neon".into()),
                 last_step_index: Some(0),
+                request_id: None,
             }
         );
 
@@ -1151,6 +1218,7 @@ mod tests {
                 context_tokens: Some(46_547),
                 model: Some("gemini-4-neon".into()),
                 last_step_index: Some(2),
+                request_id: None,
             }
         );
 
@@ -1395,6 +1463,7 @@ mod tests {
         assert_eq!(
             found.token_usage[0],
             TokenUsageRecord {
+                call_key: Some(r#"["11111111-2222-3333-4444-555555555555","idx","0"]"#.into()),
                 at: Utc.with_ymd_and_hms(2026, 11, 21, 5, 18, 29).unwrap(),
                 model: Some(ModelId("gemini-4-neon".into())),
                 input_tokens: 34_448,
@@ -1410,6 +1479,7 @@ mod tests {
         assert_eq!(
             found.token_usage[1],
             TokenUsageRecord {
+                call_key: Some(r#"["11111111-2222-3333-4444-555555555555","idx","1"]"#.into()),
                 at: Utc.with_ymd_and_hms(2026, 11, 21, 5, 18, 33).unwrap(),
                 model: Some(ModelId("gemini-4-neon".into())),
                 input_tokens: 36_524,
@@ -1436,10 +1506,26 @@ mod tests {
         writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
         adapter.discover_sessions().await.unwrap();
         let before = fs::metadata(&conv_db_path).unwrap();
-        writer.execute("INSERT INTO gen_metadata(idx,data,size) VALUES(2,?1,?2)", rusqlite::params![SAMPLE_GEN_METADATA_CALL_0, SAMPLE_GEN_METADATA_CALL_0.len() as i64]).unwrap();
+        writer
+            .execute(
+                "INSERT INTO gen_metadata(idx,data,size) VALUES(2,?1,?2)",
+                rusqlite::params![
+                    SAMPLE_GEN_METADATA_CALL_0,
+                    SAMPLE_GEN_METADATA_CALL_0.len() as i64
+                ],
+            )
+            .unwrap();
         let after = fs::metadata(&conv_db_path).unwrap();
-        assert_eq!((before.len(), before.modified().unwrap()), (after.len(), after.modified().unwrap()));
-        assert_eq!(adapter.discover_sessions().await.unwrap()[0].token_usage.len(), 3);
+        assert_eq!(
+            (before.len(), before.modified().unwrap()),
+            (after.len(), after.modified().unwrap())
+        );
+        assert_eq!(
+            adapter.discover_sessions().await.unwrap()[0]
+                .token_usage
+                .len(),
+            3
+        );
         drop(writer);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1455,6 +1541,115 @@ mod tests {
                     uuid::Uuid::new_v4()
                 )));
         assert_eq!(adapter.discover_sessions().await.unwrap(), Vec::new());
+    }
+
+    // why: a late step timestamp or rewritten gen row must update one persisted call.
+    #[test]
+    fn fix1_late_steps_and_rewritten_calls_keep_stable_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation-a.db");
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer.execute_batch("CREATE TABLE gen_metadata(idx INTEGER PRIMARY KEY,data BLOB); CREATE TABLE steps(idx INTEGER PRIMARY KEY,metadata BLOB);").unwrap();
+        // The captured field 1.20 is a repeated key/value message.
+        fn with_request_id(blob: &[u8], id: &str) -> Vec<u8> {
+            let mut body = blob[2..].to_vec();
+            let mut entry = vec![0x0a, 10];
+            entry.extend_from_slice(b"request_id");
+            entry.extend_from_slice(&[0x12, id.len() as u8]);
+            entry.extend_from_slice(id.as_bytes());
+            body.extend_from_slice(&[0xa2, 0x01, entry.len() as u8]);
+            body.extend(entry);
+            let mut output = vec![0x0a, body.len() as u8];
+            output.extend(body);
+            output
+        }
+        let first_blob = with_request_id(SAMPLE_GEN_METADATA_CALL_0, "trajectory-0");
+        let edited_blob = with_request_id(SAMPLE_GEN_METADATA_CALL_1, "trajectory-1");
+        writer
+            .execute("INSERT INTO gen_metadata VALUES(0,?1)", [&first_blob])
+            .unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 11, 21, 5, 0, 0).unwrap();
+        let summary = SessionSummary {
+            id: SessionId("t3-thread-neon-1".into()),
+            lineage: SessionLineage::default(),
+            harness: Provider::Gemini,
+            model: Some(ModelId("gemini-4-neon".into())),
+            account: None,
+            first_seen: now,
+            last_seen: now,
+            cwd: "/tmp".into(),
+            state_path: None,
+            context_window_size: Some(1_048_576),
+            last_known_token_count: Some(50_000),
+            last_known_context_pct: None,
+            cache_ttl: None,
+            launch_mode: LaunchMode::Interactive,
+            pid: None,
+            stopped_reason: None,
+            superseded_stop_reason: None,
+            superseded_stop_reason_at: None,
+            superseded_stop_reason_note: None,
+            resume_marker: None,
+            superseded_by: None,
+            reseeded_from: None,
+        };
+
+        let store = uw_store::Store::open_memory().unwrap();
+        store.insert_session(&summary).unwrap();
+        let first = read_conversation_usage(&path, now).unwrap().0;
+        store
+            .insert_token_usage_records(&summary.id, &first)
+            .unwrap();
+        writer
+            .execute("INSERT INTO steps VALUES(1,?1)", [SAMPLE_STEP_TS_1])
+            .unwrap();
+        let second = read_conversation_usage(&path, now + chrono::Duration::minutes(1))
+            .unwrap()
+            .0;
+        assert_ne!(first[0].at, second[0].at);
+        store
+            .insert_token_usage_records(&summary.id, &second)
+            .unwrap();
+        assert_eq!(store.token_usage_for_session(&summary.id).unwrap(), second);
+        let finalized_blob = with_request_id(SAMPLE_GEN_METADATA_CALL_1, "trajectory-0");
+        writer
+            .execute(
+                "UPDATE gen_metadata SET data=?1 WHERE idx=0",
+                [&finalized_blob],
+            )
+            .unwrap();
+        let finalized = read_conversation_usage(&path, now).unwrap().0;
+        store
+            .insert_token_usage_records(&summary.id, &finalized)
+            .unwrap();
+        assert_eq!(
+            store.token_usage_for_session(&summary.id).unwrap(),
+            finalized
+        );
+        writer
+            .execute(
+                "UPDATE gen_metadata SET data=?1 WHERE idx=0",
+                [&edited_blob],
+            )
+            .unwrap();
+        let edited = read_conversation_usage(&path, now).unwrap().0;
+        assert_ne!(
+            edited[0].call_key, first[0].call_key,
+            "request identity must survive idx reuse"
+        );
+        store
+            .insert_token_usage_records(&summary.id, &edited)
+            .unwrap();
+        assert_eq!(store.token_usage_for_session(&summary.id).unwrap().len(), 2);
+        let other_path = dir.path().join("conversation-b.db");
+        drop(writer);
+        std::fs::copy(&path, &other_path).unwrap();
+        let other = read_conversation_usage(&other_path, now).unwrap().0;
+        assert_ne!(other[0].call_key, edited[0].call_key);
+        store
+            .insert_token_usage_records(&summary.id, &other)
+            .unwrap();
+        assert_eq!(store.token_usage_for_session(&summary.id).unwrap().len(), 3);
     }
 
     #[tokio::test]

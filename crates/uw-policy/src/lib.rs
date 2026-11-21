@@ -866,6 +866,7 @@ mod tests {
         output: u64,
     ) -> TokenUsageRecord {
         TokenUsageRecord {
+            call_key: None,
             at: at(minutes),
             model: Some(uw_core::model::ModelId("gpt-5.6-luna".into())),
             input_tokens: input,

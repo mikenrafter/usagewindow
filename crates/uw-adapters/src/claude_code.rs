@@ -42,7 +42,9 @@ pub trait TranscriptFileSystem: Send + Sync {
     }
     /// Whether one transcript records a quota error; streamed like `scan`.
     async fn has_quota_error(&self, path: &str) -> AdapterResult<bool> {
-        Ok(transcript_has_quota_error(&self.read_to_string(path).await?))
+        Ok(transcript_has_quota_error(
+            &self.read_to_string(path).await?,
+        ))
     }
 }
 
@@ -629,7 +631,11 @@ impl ClaudeCodeAdapter {
     /// file, or a subagent directory under it), or found by discovery to carry
     /// its id in their records. This used to read every transcript on the
     /// machine (2.6 GB on one host) per warm session per tick.
-    fn session_paths(&self, session_id: &SessionId, paths: Vec<String>) -> AdapterResult<Vec<String>> {
+    fn session_paths(
+        &self,
+        session_id: &SessionId,
+        paths: Vec<String>,
+    ) -> AdapterResult<Vec<String>> {
         let known = self
             .known_ids
             .lock()
@@ -1010,7 +1016,9 @@ struct TranscriptScan {
 
 impl TranscriptScan {
     fn observe(&mut self, line: &str) {
-        if line.trim().is_empty() { return; }
+        if line.trim().is_empty() {
+            return;
+        }
         if self.invalid {
             return;
         }
@@ -1117,6 +1125,7 @@ impl TranscriptScan {
             }
             self.last_known_token_count = Some(total);
             self.token_usage.push(TokenUsageRecord {
+                call_key: None,
                 at,
                 model: self.model.clone(),
                 input_tokens: total_input,
@@ -2146,7 +2155,12 @@ mod tests {
     impl TranscriptDir {
         fn new(files: &[(&str, String)]) -> Self {
             Self {
-                files: Mutex::new(files.iter().map(|(p, c)| (p.to_string(), c.clone())).collect()),
+                files: Mutex::new(
+                    files
+                        .iter()
+                        .map(|(p, c)| (p.to_string(), c.clone()))
+                        .collect(),
+                ),
                 reads: Mutex::new(Vec::new()),
             }
         }
@@ -2155,7 +2169,13 @@ mod tests {
     #[async_trait::async_trait]
     impl TranscriptFileSystem for TranscriptDir {
         async fn jsonl_files(&self) -> AdapterResult<Vec<String>> {
-            Ok(self.files.lock().unwrap().iter().map(|(p, _)| p.clone()).collect())
+            Ok(self
+                .files
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(p, _)| p.clone())
+                .collect())
         }
         async fn read_to_string(&self, path: &str) -> AdapterResult<String> {
             self.reads.lock().unwrap().push(path.to_owned());
@@ -2176,7 +2196,13 @@ mod tests {
     }
 
     fn plain_adapter() -> ClaudeCodeAdapter {
-        adapter(200, Arc::new(Cache { entry: Mutex::new(None) }), Arc::new(Mutex::new(0)))
+        adapter(
+            200,
+            Arc::new(Cache {
+                entry: Mutex::new(None),
+            }),
+            Arc::new(Mutex::new(0)),
+        )
     }
 
     #[tokio::test]
@@ -2184,14 +2210,28 @@ mod tests {
         // why: the leak. Every tick, each warm session's check read every
         // transcript on the machine; it must read only its own.
         // catches: filtering after reading (path || content contains id).
-        let (a, b) = ("3507fe61-2d6b-4aae-a0b6-4fe4eec12b40", "9b1f0c1e-0000-4000-8000-000000000001");
+        let (a, b) = (
+            "3507fe61-2d6b-4aae-a0b6-4fe4eec12b40",
+            "9b1f0c1e-0000-4000-8000-000000000001",
+        );
         let dir = Arc::new(TranscriptDir::new(&[
             (&format!("/p/{a}.jsonl"), spend_limit_line(a)),
-            (&format!("/p/{b}.jsonl"), format!(r#"{{"type":"user","sessionId":"{b}"}}"#)),
-            (&format!("/p/{b}/subagents/agent-1.jsonl"), format!(r#"{{"type":"user","sessionId":"{b}"}}"#)),
+            (
+                &format!("/p/{b}.jsonl"),
+                format!(r#"{{"type":"user","sessionId":"{b}"}}"#),
+            ),
+            (
+                &format!("/p/{b}/subagents/agent-1.jsonl"),
+                format!(r#"{{"type":"user","sessionId":"{b}"}}"#),
+            ),
         ]));
         let adapter = plain_adapter().with_transcript_fs(dir.clone());
-        assert!(!adapter.has_quota_error_evidence(&SessionId(b.into())).await.unwrap());
+        assert!(
+            !adapter
+                .has_quota_error_evidence(&SessionId(b.into()))
+                .await
+                .unwrap()
+        );
         let reads = dir.reads.lock().unwrap().clone();
         assert_eq!(reads.len(), 2, "{reads:?}");
         assert!(reads.iter().all(|path| path.contains(b)), "{reads:?}");
@@ -2209,9 +2249,19 @@ mod tests {
                 + &spend_limit_line(id),
         )]));
         let adapter = plain_adapter().with_transcript_fs(dir);
-        assert!(!adapter.has_quota_error_evidence(&SessionId(id.into())).await.unwrap());
+        assert!(
+            !adapter
+                .has_quota_error_evidence(&SessionId(id.into()))
+                .await
+                .unwrap()
+        );
         adapter.discover_sessions().await.unwrap();
-        assert!(adapter.has_quota_error_evidence(&SessionId(id.into())).await.unwrap());
+        assert!(
+            adapter
+                .has_quota_error_evidence(&SessionId(id.into()))
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2241,7 +2291,9 @@ mod tests {
         let path = dir.join(format!("{id}.jsonl"));
         let content = format!(
             "{}\n{}\r\n{}\n",
-            format_args!(r#"{{"timestamp":"2026-09-17T23:32:32Z","sessionId":"{id}","cwd":"/work"}}"#),
+            format_args!(
+                r#"{{"timestamp":"2026-09-17T23:32:32Z","sessionId":"{id}","cwd":"/work"}}"#
+            ),
             r#"{"type":"user","message":"x"}"#,
             spend_limit_line(id)
         );

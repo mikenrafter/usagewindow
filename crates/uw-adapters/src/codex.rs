@@ -553,7 +553,10 @@ impl HarnessAdapter for CodexAdapter {
                 .lock()
                 .map_err(|e| AdapterError::Other(e.to_string()))?;
             if let Some(scan) = cache.get_mut(std::path::Path::new(&path))
-                && scan.header.as_ref().is_some_and(|(known, _, _)| known == &id.0)
+                && scan
+                    .header
+                    .as_ref()
+                    .is_some_and(|(known, _, _)| known == &id.0)
             {
                 crate::jsonl::acknowledge_usage(&mut scan.token_usage, &records);
             }
@@ -746,7 +749,9 @@ struct RolloutScan {
 }
 impl RolloutScan {
     fn observe(&mut self, line: &str) {
-        if line.trim().is_empty() { return; }
+        if line.trim().is_empty() {
+            return;
+        }
         let record = serde_json::from_str::<Value>(line);
         match &record {
             Ok(record) => self.activity.observe(record),
@@ -828,6 +833,7 @@ impl RolloutScan {
                     return;
                 };
                 let token_usage_record = TokenUsageRecord {
+                    call_key: None,
                     at: timestamp,
                     model: self.usage_model.clone(),
                     input_tokens: usage
@@ -1827,6 +1833,7 @@ done
         assert_eq!(
             found.token_usage,
             vec![TokenUsageRecord {
+                call_key: None,
                 at: DateTime::parse_from_rfc3339("2026-09-17T23:32:34Z")
                     .unwrap()
                     .with_timezone(&Utc),
@@ -1929,6 +1936,7 @@ done
         assert_eq!(
             appended[0].token_usage,
             vec![TokenUsageRecord {
+                call_key: None,
                 at: DateTime::parse_from_rfc3339("2026-09-17T23:33:00Z")
                     .unwrap()
                     .with_timezone(&Utc),

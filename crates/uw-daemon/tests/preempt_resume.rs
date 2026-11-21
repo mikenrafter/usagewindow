@@ -68,6 +68,7 @@ fn seed(store: &Store, session: &SessionSummary, now: DateTime<Utc>, resets_at: 
     let records = [30, 20, 10, 0]
         .into_iter()
         .map(|minutes_ago| TokenUsageRecord {
+            call_key: None,
             at: now - Duration::minutes(minutes_ago),
             model: session.model.clone(),
             input_tokens: 10_000,

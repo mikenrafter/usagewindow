@@ -641,6 +641,7 @@ impl CursorAdapter {
         session.last_known_context_pct = Some(usage.context_pct);
         if let Some(at) = usage.last_updated_at.or(session.last_seen) {
             session.token_usage.push(TokenUsageRecord {
+                call_key: None,
                 at,
                 model: None,
                 input_tokens: 0,

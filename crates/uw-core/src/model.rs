@@ -721,6 +721,7 @@ mod tests {
             reseeded_from: None,
         };
         let recent = vec![TokenUsageRecord {
+            call_key: None,
             at: now - Duration::minutes(5),
             model: None,
             input_tokens: 10,
@@ -747,6 +748,7 @@ mod tests {
         use crate::adapter::TokenUsageRecord;
         let now = Utc::now();
         let records = vec![TokenUsageRecord {
+            call_key: None,
             at: now - Duration::minutes(5),
             model: None,
             input_tokens: 0,
@@ -765,6 +767,7 @@ mod tests {
         use crate::adapter::TokenUsageRecord;
         let now = Utc::now();
         let records = vec![TokenUsageRecord {
+            call_key: None,
             at: now - Duration::minutes(5),
             model: None,
             input_tokens: 0,
@@ -783,6 +786,7 @@ mod tests {
         use crate::adapter::TokenUsageRecord;
         let now = Utc::now();
         let records = vec![TokenUsageRecord {
+            call_key: None,
             at: now - Duration::minutes(SESSION_ACTIVE_TOKEN_LOOKBACK_MINUTES + 1),
             model: None,
             input_tokens: 0,

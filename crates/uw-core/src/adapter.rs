@@ -105,6 +105,9 @@ pub struct DiscoveredSession {
 /// harness exposes them. `reasoning_output_tokens` is a subtype of output.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsageRecord {
+    /// Stable source-call identity, scoped to a session; absent on legacy records.
+    #[serde(default)]
+    pub call_key: Option<String>,
     pub at: DateTime<Utc>,
     pub model: Option<ModelId>,
     pub input_tokens: u64,

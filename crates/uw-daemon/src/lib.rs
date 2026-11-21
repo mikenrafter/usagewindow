@@ -6966,6 +6966,7 @@ mod tests {
         let token_records = HashMap::from([(
             session.id.clone(),
             vec![TokenUsageRecord {
+                call_key: None,
                 at: now - Duration::minutes(4),
                 model: None,
                 input_tokens: 10,
@@ -7239,6 +7240,7 @@ mod tests {
 
     fn boundary_token_usage(now: DateTime<Utc>) -> Vec<TokenUsageRecord> {
         vec![TokenUsageRecord {
+            call_key: None,
             at: now - Duration::minutes(4),
             model: None,
             input_tokens: 100,

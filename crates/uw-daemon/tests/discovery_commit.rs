@@ -246,6 +246,7 @@ fn discovered(path: &str, at: Option<DateTime<Utc>>, tokens: u64) -> DiscoveredS
         token_usage: at
             .filter(|_| tokens > 0)
             .map(|at| uw_core::adapter::TokenUsageRecord {
+                call_key: None,
                 at,
                 model: None,
                 input_tokens: tokens - 2,

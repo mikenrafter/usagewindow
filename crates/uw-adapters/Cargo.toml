@@ -22,4 +22,5 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 rusqlite = { version = "0.40", features = ["bundled"] }
 
 [dev-dependencies]
+uw-store.workspace = true
 tempfile = "3"

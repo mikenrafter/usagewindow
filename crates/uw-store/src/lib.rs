@@ -21,9 +21,9 @@ pub struct Store {
 impl Store {
     pub fn action_inhibits(&self) -> StoreResult<uw_core::api::ActionInhibits> {
         let mut result = uw_core::api::ActionInhibits::default();
-        let mut statement = self.connection.prepare(
-            "SELECT scope FROM action_inhibits WHERE inhibited=1 ORDER BY scope",
-        )?;
+        let mut statement = self
+            .connection
+            .prepare("SELECT scope FROM action_inhibits WHERE inhibited=1 ORDER BY scope")?;
         for scope in statement.query_map([], |row| row.get::<_, String>(0))? {
             let scope = scope?;
             if scope.is_empty() {
@@ -43,7 +43,11 @@ impl Store {
         )?)
     }
 
-    pub fn set_action_inhibit(&self, provider: Option<&Provider>, inhibited: bool) -> StoreResult<()> {
+    pub fn set_action_inhibit(
+        &self,
+        provider: Option<&Provider>,
+        inhibited: bool,
+    ) -> StoreResult<()> {
         let scope = provider.map(json).transpose()?.unwrap_or_default();
         self.connection.execute(
             "INSERT INTO action_inhibits(scope,inhibited) VALUES(?,?) ON CONFLICT(scope) DO UPDATE SET inhibited=excluded.inhibited",
@@ -141,6 +145,7 @@ impl Store {
             "ALTER TABLE sessions ADD COLUMN last_known_context_pct REAL",
             "ALTER TABLE sessions ADD COLUMN cache_ttl_seconds INTEGER",
             "ALTER TABLE session_token_usage ADD COLUMN context_pct REAL",
+            "ALTER TABLE session_token_usage ADD COLUMN call_key TEXT",
             "ALTER TABLE provider_fetch_status ADD COLUMN non_blocking INTEGER NOT NULL DEFAULT 0",
         ] {
             if let Err(err) = self.connection.execute(stmt, [])
@@ -149,10 +154,31 @@ impl Store {
                 return Err(err.into());
             }
         }
+        self.migrate_token_call_keys()?;
         self.reconcile_obsolete_usage_windows()?;
         self.reconcile_obsolete_provider_accounts()?;
         self.reconcile_session_accounts()?;
         self.reconcile_cursor_context_activity()?;
+        Ok(())
+    }
+
+    fn migrate_token_call_keys(&self) -> StoreResult<()> {
+        let definition: String = self.connection.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='session_token_usage'",
+            [],
+            |row| row.get(0),
+        )?;
+        let tx = self.connection.unchecked_transaction()?;
+        if definition.contains("UNIQUE(session_id,at,total_tokens,input_tokens,output_tokens)") {
+            tx.execute_batch("CREATE TABLE session_token_usage_new(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),at TEXT NOT NULL,model TEXT,input_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_write_input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,context_pct REAL,call_key TEXT);
+                INSERT INTO session_token_usage_new SELECT id,session_id,at,model,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,context_pct,call_key FROM session_token_usage;
+                DROP TABLE session_token_usage;
+                ALTER TABLE session_token_usage_new RENAME TO session_token_usage;")?;
+        }
+        tx.execute_batch("CREATE INDEX IF NOT EXISTS session_token_usage_session_at ON session_token_usage(session_id,at);
+            CREATE UNIQUE INDEX IF NOT EXISTS session_token_usage_call_key ON session_token_usage(session_id,call_key) WHERE call_key IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS session_token_usage_legacy_key ON session_token_usage(session_id,at,total_tokens,input_tokens,output_tokens) WHERE call_key IS NULL;")?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -648,7 +674,7 @@ impl Store {
         let tx = self.connection.unchecked_transaction()?;
         for record in records {
             tx.execute(
-                "INSERT OR IGNORE INTO session_token_usage(session_id,at,model,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,context_pct) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO session_token_usage(session_id,at,model,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,context_pct,call_key) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO UPDATE SET at=excluded.at,model=excluded.model,input_tokens=excluded.input_tokens,cached_input_tokens=excluded.cached_input_tokens,cache_write_input_tokens=excluded.cache_write_input_tokens,output_tokens=excluded.output_tokens,reasoning_output_tokens=excluded.reasoning_output_tokens,total_tokens=excluded.total_tokens,context_pct=excluded.context_pct,call_key=excluded.call_key WHERE session_token_usage.at IS NOT excluded.at OR session_token_usage.model IS NOT excluded.model OR session_token_usage.input_tokens IS NOT excluded.input_tokens OR session_token_usage.cached_input_tokens IS NOT excluded.cached_input_tokens OR session_token_usage.cache_write_input_tokens IS NOT excluded.cache_write_input_tokens OR session_token_usage.output_tokens IS NOT excluded.output_tokens OR session_token_usage.reasoning_output_tokens IS NOT excluded.reasoning_output_tokens OR session_token_usage.total_tokens IS NOT excluded.total_tokens OR session_token_usage.context_pct IS NOT excluded.context_pct OR session_token_usage.call_key IS NOT excluded.call_key",
                 params![
                     session_id.0,
                     record.at,
@@ -660,6 +686,7 @@ impl Store {
                     record.reasoning_output_tokens as i64,
                     record.total_tokens as i64,
                     record.context_pct,
+                    record.call_key,
                 ],
             )?;
         }
@@ -678,12 +705,18 @@ impl Store {
         session_id: &SessionId,
         cutoff: DateTime<Utc>,
     ) -> StoreResult<Vec<TokenUsageRecord>> {
-        let mut statement = self.connection.prepare(
-            "SELECT at,model,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,context_pct FROM session_token_usage WHERE session_id=?1 AND at>=?2 ORDER BY at",
+        // Read fallbacks may open an older database before its writer migrates it.
+        let has_call_key: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('session_token_usage') WHERE name='call_key')", [], |row| row.get(0),
         )?;
+        let call_key_column = if has_call_key { "call_key" } else { "NULL" };
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT at,model,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,context_pct,{call_key_column} FROM session_token_usage WHERE session_id=?1 AND at>=?2 ORDER BY at,id",
+        ))?;
         let rows = statement.query_map(params![session_id.0.as_str(), cutoff], |row| {
             let model: Option<String> = row.get(1)?;
             Ok(TokenUsageRecord {
+                call_key: row.get(9)?,
                 at: row.get(0)?,
                 model: model
                     .map(|value| serde_json::from_str(&value))
@@ -1418,7 +1451,7 @@ fn decode_compaction_event_row(row: &rusqlite::Row) -> rusqlite::Result<Compacti
         completed_at: row.get(9)?,
     })
 }
-const SCHEMA: &str = r#"PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS action_inhibits(scope TEXT PRIMARY KEY,inhibited INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS usage_samples(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,account TEXT,window_kind TEXT NOT NULL,window_scope_value TEXT NOT NULL,pct REAL NOT NULL,resets_at TEXT,exceeded INTEGER NOT NULL,active INTEGER NOT NULL,source TEXT NOT NULL,at TEXT NOT NULL,fetched_at TEXT,credits_json TEXT,plan TEXT);CREATE INDEX IF NOT EXISTS usage_samples_window_at ON usage_samples(provider,window_kind,window_scope_value,at);CREATE INDEX IF NOT EXISTS usage_samples_provider_source_at ON usage_samples(provider,source,at DESC,id DESC);CREATE INDEX IF NOT EXISTS usage_samples_provider_account_source_at ON usage_samples(provider,account,source,at DESC);CREATE INDEX IF NOT EXISTS usage_samples_provider_account_at ON usage_samples(provider,account,at DESC);CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,harness TEXT NOT NULL,model TEXT,account TEXT,cwd TEXT NOT NULL,state_path TEXT,context_window_size INTEGER,last_known_token_count INTEGER,launch_mode TEXT NOT NULL,pid INTEGER,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,stopped_reason TEXT,stopped_window_kind TEXT,superseded_by TEXT,reseeded_from TEXT,title TEXT,superseded_stop_reason TEXT,superseded_stop_reason_at TEXT,superseded_stop_reason_note TEXT,lineage_json TEXT,last_known_context_pct REAL,cache_ttl_seconds INTEGER);CREATE TABLE IF NOT EXISTS session_token_usage(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),at TEXT NOT NULL,model TEXT,input_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_write_input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,context_pct REAL,UNIQUE(session_id,at,total_tokens,input_tokens,output_tokens));CREATE INDEX IF NOT EXISTS session_token_usage_session_at ON session_token_usage(session_id,at);CREATE TABLE IF NOT EXISTS resume_markers(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),reason TEXT NOT NULL,resume_at TEXT,requested_at TEXT,created_at TEXT NOT NULL,status TEXT NOT NULL,status_detail TEXT,message TEXT,preempt INTEGER NOT NULL DEFAULT 1);CREATE INDEX IF NOT EXISTS resume_markers_session_status ON resume_markers(session_id,status);CREATE UNIQUE INDEX IF NOT EXISTS resume_markers_active ON resume_markers(session_id) WHERE status IN ('pending','scheduled');CREATE TABLE IF NOT EXISTS compaction_requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL,prompt TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS compaction_requests_session_status ON compaction_requests(session_id,status);CREATE TABLE IF NOT EXISTS threshold_overrides(id TEXT PRIMARY KEY,scope_kind TEXT NOT NULL,provider TEXT NOT NULL,model_value TEXT,session_value TEXT,field TEXT NOT NULL,value_json TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS threshold_overrides_key ON threshold_overrides(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field);CREATE TABLE IF NOT EXISTS idle_reseed_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,source_model TEXT NOT NULL,summary_text TEXT NOT NULL,token_count_before INTEGER NOT NULL,token_count_after INTEGER NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS keepalive_config(session_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL,last_ping_at TEXT,ping_day TEXT,ping_count INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS hook_messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,text TEXT NOT NULL,created_at TEXT NOT NULL,delivered_at TEXT);CREATE INDEX IF NOT EXISTS hook_messages_delivery ON hook_messages(session_id,event,delivered_at,created_at);CREATE TABLE IF NOT EXISTS hook_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,created_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS hook_events_session_created ON hook_events(session_id,created_at);CREATE TABLE IF NOT EXISTS provider_fetch_status(provider TEXT NOT NULL,account TEXT,last_attempt_at TEXT NOT NULL,last_success_at TEXT,last_error TEXT,consecutive_failures INTEGER NOT NULL DEFAULT 0,non_blocking INTEGER NOT NULL DEFAULT 0);CREATE UNIQUE INDEX IF NOT EXISTS provider_fetch_status_key ON provider_fetch_status(provider,COALESCE(account,''));CREATE TABLE IF NOT EXISTS compaction_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),source TEXT NOT NULL,trigger TEXT,context_pct_before REAL,usage_window_pct_before REAL,tokens_before INTEGER,tokens_after INTEGER,started_at TEXT NOT NULL,completed_at TEXT);CREATE INDEX IF NOT EXISTS compaction_events_session_started ON compaction_events(session_id,started_at);CREATE INDEX IF NOT EXISTS compaction_events_started ON compaction_events(started_at);"#;
+const SCHEMA: &str = r#"PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS action_inhibits(scope TEXT PRIMARY KEY,inhibited INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS usage_samples(id INTEGER PRIMARY KEY,provider TEXT NOT NULL,account TEXT,window_kind TEXT NOT NULL,window_scope_value TEXT NOT NULL,pct REAL NOT NULL,resets_at TEXT,exceeded INTEGER NOT NULL,active INTEGER NOT NULL,source TEXT NOT NULL,at TEXT NOT NULL,fetched_at TEXT,credits_json TEXT,plan TEXT);CREATE INDEX IF NOT EXISTS usage_samples_window_at ON usage_samples(provider,window_kind,window_scope_value,at);CREATE INDEX IF NOT EXISTS usage_samples_provider_source_at ON usage_samples(provider,source,at DESC,id DESC);CREATE INDEX IF NOT EXISTS usage_samples_provider_account_source_at ON usage_samples(provider,account,source,at DESC);CREATE INDEX IF NOT EXISTS usage_samples_provider_account_at ON usage_samples(provider,account,at DESC);CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,harness TEXT NOT NULL,model TEXT,account TEXT,cwd TEXT NOT NULL,state_path TEXT,context_window_size INTEGER,last_known_token_count INTEGER,launch_mode TEXT NOT NULL,pid INTEGER,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,stopped_reason TEXT,stopped_window_kind TEXT,superseded_by TEXT,reseeded_from TEXT,title TEXT,superseded_stop_reason TEXT,superseded_stop_reason_at TEXT,superseded_stop_reason_note TEXT,lineage_json TEXT,last_known_context_pct REAL,cache_ttl_seconds INTEGER);CREATE TABLE IF NOT EXISTS session_token_usage(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),at TEXT NOT NULL,model TEXT,input_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_write_input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,context_pct REAL,call_key TEXT);CREATE INDEX IF NOT EXISTS session_token_usage_session_at ON session_token_usage(session_id,at);CREATE TABLE IF NOT EXISTS resume_markers(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),reason TEXT NOT NULL,resume_at TEXT,requested_at TEXT,created_at TEXT NOT NULL,status TEXT NOT NULL,status_detail TEXT,message TEXT,preempt INTEGER NOT NULL DEFAULT 1);CREATE INDEX IF NOT EXISTS resume_markers_session_status ON resume_markers(session_id,status);CREATE UNIQUE INDEX IF NOT EXISTS resume_markers_active ON resume_markers(session_id) WHERE status IN ('pending','scheduled');CREATE TABLE IF NOT EXISTS compaction_requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),kind TEXT NOT NULL,prompt TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS compaction_requests_session_status ON compaction_requests(session_id,status);CREATE TABLE IF NOT EXISTS threshold_overrides(id TEXT PRIMARY KEY,scope_kind TEXT NOT NULL,provider TEXT NOT NULL,model_value TEXT,session_value TEXT,field TEXT NOT NULL,value_json TEXT NOT NULL,updated_at TEXT NOT NULL);CREATE UNIQUE INDEX IF NOT EXISTS threshold_overrides_key ON threshold_overrides(scope_kind,provider,COALESCE(model_value,''),COALESCE(session_value,''),field);CREATE TABLE IF NOT EXISTS idle_reseed_summaries(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,source_model TEXT NOT NULL,summary_text TEXT NOT NULL,token_count_before INTEGER NOT NULL,token_count_after INTEGER NOT NULL,created_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS keepalive_config(session_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL,last_ping_at TEXT,ping_day TEXT,ping_count INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS hook_messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,text TEXT NOT NULL,created_at TEXT NOT NULL,delivered_at TEXT);CREATE INDEX IF NOT EXISTS hook_messages_delivery ON hook_messages(session_id,event,delivered_at,created_at);CREATE TABLE IF NOT EXISTS hook_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,event TEXT NOT NULL,created_at TEXT NOT NULL);CREATE INDEX IF NOT EXISTS hook_events_session_created ON hook_events(session_id,created_at);CREATE TABLE IF NOT EXISTS provider_fetch_status(provider TEXT NOT NULL,account TEXT,last_attempt_at TEXT NOT NULL,last_success_at TEXT,last_error TEXT,consecutive_failures INTEGER NOT NULL DEFAULT 0,non_blocking INTEGER NOT NULL DEFAULT 0);CREATE UNIQUE INDEX IF NOT EXISTS provider_fetch_status_key ON provider_fetch_status(provider,COALESCE(account,''));CREATE TABLE IF NOT EXISTS compaction_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),source TEXT NOT NULL,trigger TEXT,context_pct_before REAL,usage_window_pct_before REAL,tokens_before INTEGER,tokens_after INTEGER,started_at TEXT NOT NULL,completed_at TEXT);CREATE INDEX IF NOT EXISTS compaction_events_session_started ON compaction_events(session_id,started_at);CREATE INDEX IF NOT EXISTS compaction_events_started ON compaction_events(started_at);"#;
 
 #[cfg(test)]
 mod tests {
@@ -1457,13 +1490,18 @@ mod tests {
         let id = SessionId("inhibited-hook".into());
         let owner = session(&id);
         store.insert_session(&owner).unwrap();
-        store.enqueue_hook_message(&id, "Stop", "compact advice").unwrap();
+        store
+            .enqueue_hook_message(&id, "Stop", "compact advice")
+            .unwrap();
         for scope in [None, Some(&owner.harness)] {
             store.set_action_inhibit(scope, true).unwrap();
             assert!(store.take_hook_messages(&id, "Stop").unwrap().is_empty());
             store.set_action_inhibit(scope, false).unwrap();
         }
-        assert_eq!(store.take_hook_messages(&id, "Stop").unwrap(), vec!["compact advice"]);
+        assert_eq!(
+            store.take_hook_messages(&id, "Stop").unwrap(),
+            vec!["compact advice"]
+        );
         assert!(store.take_hook_messages(&id, "Stop").unwrap().is_empty());
     }
 
@@ -1669,6 +1707,7 @@ mod tests {
             .insert_token_usage_records(
                 &id,
                 &[TokenUsageRecord {
+                    call_key: None,
                     at: Utc::now(),
                     model: None,
                     input_tokens: 0,
@@ -1710,6 +1749,7 @@ mod tests {
             store.insert_session(&summary).unwrap();
         }
         let context_record = |at| TokenUsageRecord {
+            call_key: None,
             at,
             model: None,
             input_tokens: 0,
@@ -1775,6 +1815,7 @@ mod tests {
         let now = Utc::now();
         let id = SessionId("cursor-recent-context-activity".into());
         let record = TokenUsageRecord {
+            call_key: None,
             at: now,
             model: None,
             input_tokens: 0,
@@ -1866,6 +1907,7 @@ mod tests {
         s.insert_session(&session(&sid)).unwrap();
         let records = vec![
             TokenUsageRecord {
+                call_key: None,
                 at: Utc::now(),
                 model: None,
                 input_tokens: 100,
@@ -1877,6 +1919,7 @@ mod tests {
                 context_pct: None,
             },
             TokenUsageRecord {
+                call_key: None,
                 at: Utc::now() + Duration::seconds(1),
                 model: None,
                 input_tokens: 0,
@@ -1998,6 +2041,7 @@ mod tests {
             .insert_token_usage_records(
                 &warm.id,
                 &[TokenUsageRecord {
+                    call_key: None,
                     at: now,
                     model: None,
                     input_tokens: 10,
@@ -2065,6 +2109,7 @@ mod tests {
         let sid = SessionId("token-session".into());
         s.insert_session(&session(&sid)).unwrap();
         let records = vec![TokenUsageRecord {
+            call_key: None,
             at: Utc::now(),
             model: Some(ModelId("gpt-5.6-luna".into())),
             input_tokens: 1000,
@@ -2081,6 +2126,100 @@ mod tests {
 
         assert_eq!(s.token_usage_for_session(&sid).unwrap(), records);
     }
+    // why: upgrading existing stores must preserve history and allow identical identified calls.
+    #[test]
+    fn fix1_call_key_migration_preserves_legacy_rows_and_read_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let sid = SessionId("legacy-call".into());
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        store.insert_session(&session(&sid)).unwrap();
+        store.connection.execute_batch("DROP TABLE session_token_usage;
+            CREATE TABLE session_token_usage(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),at TEXT NOT NULL,model TEXT,input_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_write_input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,context_pct REAL,UNIQUE(session_id,at,total_tokens,input_tokens,output_tokens));
+            INSERT INTO session_token_usage VALUES(7,'legacy-call','2026-11-21T00:00:00Z',NULL,10,4,0,2,0,12,NULL);").unwrap();
+        drop(store);
+        let reader = Store::open_read_only(path.to_str().unwrap()).unwrap();
+        let legacy = reader.token_usage_for_session(&sid).unwrap();
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].call_key, None);
+        assert_eq!(legacy[0].total_tokens, 12);
+        drop(reader);
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(store.token_usage_for_session(&sid).unwrap(), legacy);
+        let mut call = legacy[0].clone();
+        call.call_key = Some("conversation-a/request-1".into());
+        store
+            .insert_token_usage_records(&sid, std::slice::from_ref(&call))
+            .unwrap();
+        call.call_key = Some("conversation-b/request-1".into());
+        store.insert_token_usage_records(&sid, &[call]).unwrap();
+        assert_eq!(store.token_usage_for_session(&sid).unwrap().len(), 3);
+        drop(store);
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(store.token_usage_for_session(&sid).unwrap().len(), 3);
+        let legacy_id: i64 = store
+            .connection
+            .query_row(
+                "SELECT id FROM session_token_usage WHERE call_key IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_id, 7);
+    }
+
+    // why: source-call identity survives delayed timestamps and final token counts.
+    #[test]
+    fn fix1_call_keys_upsert_final_counts_without_colliding_conversations() {
+        let store = Store::open_memory().unwrap();
+        let sid = SessionId("call-key-session".into());
+        store.insert_session(&session(&sid)).unwrap();
+        let at = Utc::now();
+        let mut record = TokenUsageRecord {
+            call_key: Some("conversation-a/request/trajectory-7".into()),
+            at,
+            model: None,
+            input_tokens: 10,
+            cached_input_tokens: 4,
+            cache_write_input_tokens: 0,
+            output_tokens: 2,
+            reasoning_output_tokens: 0,
+            total_tokens: 12,
+            context_pct: None,
+        };
+        store
+            .insert_token_usage_records(&sid, std::slice::from_ref(&record))
+            .unwrap();
+        record.at = at + chrono::Duration::seconds(1);
+        store
+            .insert_token_usage_records(&sid, std::slice::from_ref(&record))
+            .unwrap();
+        assert_eq!(
+            store.token_usage_for_session(&sid).unwrap(),
+            vec![record.clone()]
+        );
+        record.input_tokens = 100;
+        record.cached_input_tokens = 40;
+        record.output_tokens = 20;
+        record.total_tokens = 120;
+        store
+            .insert_token_usage_records(&sid, std::slice::from_ref(&record))
+            .unwrap();
+        assert_eq!(
+            store.token_usage_for_session(&sid).unwrap(),
+            vec![record.clone()]
+        );
+        let mut other = record.clone();
+        other.call_key = Some("conversation-b/request/trajectory-7".into());
+        store
+            .insert_token_usage_records(&sid, std::slice::from_ref(&other))
+            .unwrap();
+        let records = store.token_usage_for_session(&sid).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records.contains(&record));
+        assert!(records.contains(&other));
+    }
+
     #[test]
     fn active_markers_are_unique() {
         let s = Store::open_memory().unwrap();
@@ -2749,6 +2888,7 @@ mod tests {
         s.insert_token_usage_records(
             &a,
             &[TokenUsageRecord {
+                call_key: None,
                 at: now - chrono::Duration::minutes(1),
                 model: None,
                 input_tokens: 1,
