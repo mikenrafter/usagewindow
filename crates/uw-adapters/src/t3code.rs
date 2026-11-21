@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use std::{path::PathBuf, sync::Arc};
-#[cfg(test)]
-use std::path::Path;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use uw_core::adapter::{
     AdapterError, AdapterResult, Capabilities, DeliveryOutcome, HarnessAdapter, SeedContext,
     SeedMode, StatusEvent,
@@ -111,6 +112,39 @@ pub struct T3CodeAdapter {
     state_db: Option<PathBuf>,
 }
 
+/// Resolves T3Code's state SQLite path inside a userdata directory, preferring
+/// the live orchestration v2 database (`statev2.sqlite`) over the legacy v1
+/// `state.sqlite`.
+pub(crate) fn resolve_state_db_in_dir(userdata_dir: &Path) -> PathBuf {
+    let v2 = userdata_dir.join("statev2.sqlite");
+    if v2.exists() {
+        return v2;
+    }
+    userdata_dir.join("state.sqlite")
+}
+
+/// Resolves T3Code's state SQLite path from `UW_T3CODE_STATE_DB` or
+/// `$HOME/.t3/userdata/{statev2,state}.sqlite`.
+pub(crate) fn default_state_db_path() -> Option<PathBuf> {
+    std::env::var_os("UW_T3CODE_STATE_DB")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| resolve_state_db_in_dir(&PathBuf::from(home).join(".t3/userdata")))
+        })
+}
+
+fn sqlite_table_exists(connection: &rusqlite::Connection, table: &str) -> AdapterResult<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|exists| exists != 0)
+        .map_err(|error| AdapterError::Other(format!("inspect T3Code schema: {error}")))
+}
+
 impl T3CodeAdapter {
     pub fn new(transport: Arc<dyn T3CodeTransport>) -> Self {
         Self {
@@ -120,12 +154,9 @@ impl T3CodeAdapter {
     }
 
     pub fn real(base_url: impl Into<String>, auth: T3CodeAuth) -> Self {
-        let state_db = std::env::var_os("UW_T3CODE_STATE_DB")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".t3/userdata/state.sqlite")));
         Self {
             transport: Arc::new(T3CodeHttpTransport::new(base_url, auth)),
-            state_db,
+            state_db: default_state_db_path(),
         }
     }
 
@@ -142,7 +173,8 @@ impl T3CodeAdapter {
             Provider::ClaudeCode => Some(("claudeAgent", "resume")),
             Provider::Cursor => Some(("cursor", "sessionId")),
             Provider::Codex => Some(("codex", "threadId")),
-            Provider::Other(_) | Provider::Gemini => None,
+            Provider::Gemini => Some(("antigravity", "conversationId")),
+            Provider::Other(_) => None,
         }
     }
 
@@ -158,6 +190,46 @@ impl T3CodeAdapter {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .map_err(|error| AdapterError::Other(format!("open T3Code state database: {error}")))?;
+        if sqlite_table_exists(&connection, "orchestration_v2_projection_provider_threads")? {
+            let mut statement = connection
+                .prepare(
+                    "SELECT thread_id, payload_json
+                     FROM orchestration_v2_projection_provider_threads
+                     WHERE provider = ?1
+                     ORDER BY updated_at DESC",
+                )
+                .map_err(|error| {
+                    AdapterError::Other(format!("read T3Code v2 ownership table: {error}"))
+                })?;
+            let rows = statement
+                .query_map([provider_name], |row| {
+                    let thread_id: String = row.get(0)?;
+                    let payload: String = row.get(1)?;
+                    Ok((thread_id, payload))
+                })
+                .map_err(|error| {
+                    AdapterError::Other(format!("scan T3Code v2 ownership table: {error}"))
+                })?;
+            for row in rows {
+                let (thread_id, payload) = row.map_err(|error| {
+                    AdapterError::Other(format!("read T3Code v2 ownership row: {error}"))
+                })?;
+                if thread_id == session.id.0 {
+                    return Ok(Some(SessionId(thread_id)));
+                }
+                if let Ok(value) = serde_json::from_str::<Value>(&payload)
+                    && value
+                        .pointer("/nativeThreadRef/nativeId")
+                        .and_then(Value::as_str)
+                        == Some(session.id.0.as_str())
+                {
+                    return Ok(Some(SessionId(thread_id)));
+                }
+            }
+        }
+        if !sqlite_table_exists(&connection, "provider_session_runtime")? {
+            return Ok(None);
+        }
         let mut statement = connection
             .prepare(
                 "SELECT thread_id, resume_cursor_json
@@ -317,6 +389,13 @@ impl HarnessAdapter for T3CodeAdapter {
         session: &SessionSummary,
         request: &CompactionRequest,
     ) -> AdapterResult<DeliveryOutcome> {
+        // CLAIM(gemini-observe-only): destructive actions must not fire for
+        // Provider::Gemini sessions [docs/research-gemini.md;
+        // gemini_sessions_are_observe_only_for_t3code_resume_and_compact].
+        // ↳ CLAIM(gemini-observe-only)
+        if session.harness == Provider::Gemini {
+            return Err(AdapterError::Unsupported);
+        }
         let thread_id = session.id.0.as_str();
         let instructions = Self::compaction_instructions(&request.prompt);
         self.transport
@@ -336,6 +415,10 @@ impl HarnessAdapter for T3CodeAdapter {
         session: &SessionSummary,
         message: Option<&str>,
     ) -> AdapterResult<()> {
+        // ↳ CLAIM(gemini-observe-only)
+        if session.harness == Provider::Gemini {
+            return Err(AdapterError::Unsupported);
+        }
         let thread_id = self.owned_thread(session).await?;
         let text = message.unwrap_or("Continue from the saved state.");
         let payload = json!({
@@ -663,5 +746,172 @@ mod tests {
     async fn stop_detection_propagates_a_transport_error_instead_of_guessing() {
         let adapter = T3CodeAdapter::new(Arc::new(FakeTransport::new()));
         assert!(adapter.detect_stop(&session().id).await.is_err());
+    }
+
+    #[test]
+    fn provider_cursor_maps_gemini_to_antigravity() {
+        // why: T3Code's provider mapping previously returned None for Provider::Gemini,
+        //      making Antigravity threads invisible to ownership lookup.
+        // catches: Provider::Gemini left in the `None` arm of `provider_cursor`.
+        assert_eq!(
+            T3CodeAdapter::provider_cursor(&Provider::Gemini),
+            Some(("antigravity", "conversationId"))
+        );
+    }
+
+    #[test]
+    fn native_owner_resolves_antigravity_and_claude_from_statev2_projection() {
+        // why: live T3Code stores Antigravity (and v2 Claude/Codex) sessions in
+        //      statev2.sqlite's orchestration_v2_projection_provider_threads table,
+        //      not the legacy v1 provider_session_runtime table.
+        // catches: querying only provider_session_runtime or ignoring nativeThreadRef.nativeId.
+        let path = std::env::temp_dir().join(format!(
+            "usagewindow-t3-v2-owner-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE orchestration_v2_projection_provider_threads (
+                    provider_thread_id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    provider_session_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+                INSERT INTO orchestration_v2_projection_provider_threads
+                    (provider_thread_id, thread_id, provider, provider_session_id, status, updated_at, payload_json)
+                VALUES
+                    ('pt-ag-1', 't3-thread-ag-001', 'antigravity', 'ps-ag-1', 'active', '2026-11-21T05:20:00Z',
+                     '{\"nativeThreadRef\":{\"driver\":\"antigravity\",\"nativeId\":\"11111111-2222-3333-4444-555555555555\",\"strength\":\"strong\"}}'),
+                    ('pt-cl-1', 't3-thread-cl-001', 'claudeAgent', 'ps-cl-1', 'idle', '2026-11-21T05:20:00Z',
+                     '{\"nativeThreadRef\":{\"driver\":\"claudeAgent\",\"nativeId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"strength\":\"strong\"}}');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let transport = std::sync::Arc::new(FakeTransport::new());
+        let adapter = T3CodeAdapter::with_state_db(transport, &path);
+
+        let by_conv_id = SessionSummary {
+            id: SessionId("11111111-2222-3333-4444-555555555555".into()),
+            harness: Provider::Gemini,
+            ..session()
+        };
+        assert_eq!(
+            adapter.native_owner(&by_conv_id).unwrap(),
+            Some(SessionId("t3-thread-ag-001".into()))
+        );
+
+        let by_thread_id = SessionSummary {
+            id: SessionId("t3-thread-ag-001".into()),
+            harness: Provider::Gemini,
+            ..session()
+        };
+        assert_eq!(
+            adapter.native_owner(&by_thread_id).unwrap(),
+            Some(SessionId("t3-thread-ag-001".into()))
+        );
+
+        let claude_v2 = SessionSummary {
+            id: SessionId("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into()),
+            harness: Provider::ClaudeCode,
+            ..session()
+        };
+        assert_eq!(
+            adapter.native_owner(&claude_v2).unwrap(),
+            Some(SessionId("t3-thread-cl-001".into()))
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn gemini_sessions_are_observe_only_for_t3code_resume_and_compact() {
+        // why: destructive actions (compaction, resume) must not fire for Gemini
+        //      sessions even when T3Code knows the owning thread.
+        // catches: T3CodeAdapter dispatching thread.turn.start or thread.turn.interrupt
+        //          for a Provider::Gemini session.
+        let path = std::env::temp_dir().join(format!(
+            "usagewindow-t3-gemini-ro-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE orchestration_v2_projection_provider_threads (
+                    provider_thread_id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    provider_session_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+                INSERT INTO orchestration_v2_projection_provider_threads
+                    (provider_thread_id, thread_id, provider, provider_session_id, status, updated_at, payload_json)
+                VALUES
+                    ('pt-ag-1', 't3-thread-ag-001', 'antigravity', 'ps-ag-1', 'idle', '2026-11-21T05:20:00Z',
+                     '{\"nativeThreadRef\":{\"driver\":\"antigravity\",\"nativeId\":\"11111111-2222-3333-4444-555555555555\",\"strength\":\"strong\"}}');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let owned_thread = serde_json::json!({
+            "thread": {
+                "id": "t3-thread-ag-001",
+                "session": {"status": "idle", "providerName": "antigravity"}
+            }
+        });
+        let transport = std::sync::Arc::new(FakeTransport::with_thread(owned_thread));
+        let adapter = T3CodeAdapter::with_state_db(transport.clone(), &path);
+        let gemini_session = SessionSummary {
+            id: SessionId("t3-thread-ag-001".into()),
+            harness: Provider::Gemini,
+            ..session()
+        };
+        let request = CompactionRequest {
+            id: uuid::Uuid::new_v4(),
+            session_id: gemini_session.id.clone(),
+            kind: CompactionKind::AgentRequested,
+            prompt: "/compact".into(),
+            reason: "test".into(),
+            status: CompactionStatus::Sending,
+            created_at: chrono::Utc::now(),
+        };
+
+        assert!(matches!(
+            adapter.resume_session(&gemini_session, Some("continue")).await,
+            Err(AdapterError::Unsupported)
+        ));
+        assert!(matches!(
+            adapter.compact(&gemini_session, &request).await,
+            Err(AdapterError::Unsupported)
+        ));
+        assert!(
+            transport.calls.lock().unwrap().is_empty(),
+            "observe-only Gemini refusal must happen before any HTTP transport call"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn default_state_db_prefers_statev2_over_legacy_state_sqlite() {
+        // why: live T3Code writes to statev2.sqlite while leaving stale state.sqlite behind.
+        // catches: hardcoding state.sqlite and missing all v2 Antigravity threads.
+        let dir = std::env::temp_dir().join(format!(
+            "usagewindow-t3-userdata-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let v1 = dir.join("state.sqlite");
+        let v2 = dir.join("statev2.sqlite");
+        fs::write(&v1, b"").unwrap();
+        assert_eq!(resolve_state_db_in_dir(&dir), v1);
+        fs::write(&v2, b"").unwrap();
+        assert_eq!(resolve_state_db_in_dir(&dir), v2);
+        fs::remove_dir_all(dir).unwrap();
     }
 }
